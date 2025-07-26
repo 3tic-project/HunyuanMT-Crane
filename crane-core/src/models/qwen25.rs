@@ -239,13 +239,17 @@ impl ModelForCausalLM for Model {
             tokens.push(next_token);
             generated_tokens += 1;
 
-            // Send token to streamer if available
-            if let Some(ref mut s) = streamer {
-                s.append(next_token)?;
+            // Handle end-of-sequence token
+            if next_token == eos_token {
+                if let Some(ref mut s) = streamer {
+                    s.finalize()?;
+                }
+                break;
             }
 
-            if next_token == eos_token {
-                break;
+            // Send token to streamer
+            if let Some(ref mut s) = streamer {
+                s.append(next_token)?;
             }
         }
         let dt = start_gen.elapsed();

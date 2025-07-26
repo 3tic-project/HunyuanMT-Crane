@@ -48,8 +48,6 @@ impl ChatCLI {
             report_speed: true,
         };
 
-        // model.warmup();
-
         Ok(Self {
             history: Vec::new(),
             tokenizer,
