@@ -1,11 +1,14 @@
-use anyhow::Error;
 use clap::Parser;
 use colored::*;
+use crane_core::generation::streamer::StreamerMessage;
 use crane_core::{
     Msg,
     autotokenizer::AutoTokenizer,
     chat::{Message, Role},
-    generation::{GenerationConfig, based::ModelForCausalLM, streamer::TextStreamer},
+    generation::{
+        GenerationConfig, based::ModelForCausalLM, streamer::AsyncTextStreamer,
+        streamer::TokenStreamer,
+    },
     models::{DType, Device, qwen25::Model as Qwen25Model},
 };
 use std::io::{self, Write};
@@ -45,8 +48,6 @@ impl ChatCLI {
             report_speed: true,
         };
 
-        // model.warmup();
-
         Ok(Self {
             history: Vec::new(),
             tokenizer,
@@ -73,47 +74,69 @@ impl ChatCLI {
         Ok(input.trim().to_string())
     }
 
-    fn generate_response(&mut self, prompt: &str) -> String {
+    fn generate_response(&mut self, prompt: &str, streamer: &mut dyn TokenStreamer) -> String {
         let input_ids = self.model.prepare_inputs(prompt).unwrap();
-
-        let mut streamer = TextStreamer {
-            tokenizer: self.tokenizer.clone(),
-            buffer: String::new(),
-        };
 
         let output_ids = self
             .model
-            .generate(&input_ids, &self.gen_config, Some(&mut streamer))
+            .generate(&input_ids, &self.gen_config, Some(streamer))
             .unwrap();
         self.tokenizer.decode(&output_ids, false).unwrap()
     }
 
     fn run(&mut self) -> anyhow::Result<()> {
         self.print_banner();
-
         loop {
             let input = self.get_user_input()?;
             if input.to_lowercase() == "exit" {
                 break;
             }
-
             self.history.push(Msg!(Role::User, &input));
             let prompt = self
                 .tokenizer
                 .apply_chat_template(&self.history, true)
                 .unwrap();
-
             print!("{} ", "AI:".bold().bright_magenta());
-            let response = self.generate_response(&prompt);
-            // println!("{}\n", response.bright_white());
 
-            self.history.push(Msg!(Role::Assistant, &response));
+            let (mut streamer, receiver) = AsyncTextStreamer::new(self.tokenizer.clone());
+
+            // Start a thread to handle streaming tokens
+            let handle = std::thread::spawn(move || {
+                let mut response_text = String::new();
+
+                for message in receiver {
+                    match message {
+                        StreamerMessage::Token(token_text) => {
+                            // Print token immediately as it arrives
+                            print!("{}", token_text);
+                            std::io::stdout().flush().unwrap();
+
+                            // Collect for final response
+                            response_text.push_str(&token_text);
+                        }
+                        StreamerMessage::End => {
+                            println!(); // New line after generation completes
+                            break;
+                        }
+                    }
+                }
+                response_text
+            });
+
+            // Generate response (this will send tokens to the streamer)
+            let _response = self.generate_response(&prompt, &mut streamer);
+
+            // Wait for streaming to complete and get the collected response text
+            let response_text = handle.join().unwrap();
+
+            // Add the response to history
+            self.history.push(Msg!(Role::Assistant, &response_text));
+
             if self.history.len() > 2 * self.max_turns {
                 self.history
                     .drain(0..(self.history.len() - 2 * self.max_turns));
             }
         }
-
         println!("{}", "\nGoodbye!".bright_cyan());
         Ok(())
     }

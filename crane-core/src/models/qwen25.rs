@@ -209,12 +209,9 @@ impl ModelForCausalLM for Model {
     ) -> Result<Vec<u32>> {
         self.tokenizer.clear();
         self.clear_kv_cache();
-
         let mut logits_processor = LogitsProcessor::new(1024, config.temperature, config.top_p);
-
         let mut tokens = input_ids.to_vec();
         std::io::stdout().flush()?;
-
         let mut generated_tokens = 0usize;
         let eos_token = match self.tokenizer.get_token("<|endoftext|>") {
             Some(token) => token,
@@ -226,7 +223,6 @@ impl ModelForCausalLM for Model {
             let start_pos = tokens.len().saturating_sub(context_size);
             let ctxt = &tokens[start_pos..];
             let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-
             let logits = self.forward(&input, start_pos)?;
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             let logits = if config.repetition_penalty == 1. {
@@ -239,23 +235,24 @@ impl ModelForCausalLM for Model {
                     &tokens[start_at..],
                 )?
             };
-
             let next_token = logits_processor.sample(&logits)?;
             tokens.push(next_token);
             generated_tokens += 1;
+
+            // Handle end-of-sequence token
             if next_token == eos_token {
+                if let Some(ref mut s) = streamer {
+                    s.finalize()?;
+                }
                 break;
             }
-            if let Some(t) = self.tokenizer.next_token(next_token)? {
-                print!("{t}");
-                std::io::stdout().flush()?;
+
+            // Send token to streamer
+            if let Some(ref mut s) = streamer {
+                s.append(next_token)?;
             }
         }
         let dt = start_gen.elapsed();
-        if let Some(rest) = self.tokenizer.decode_rest().map_err(E::msg)? {
-            print!("{rest}");
-        }
-        std::io::stdout().flush()?;
 
         if config.report_speed {
             println!(
@@ -263,7 +260,6 @@ impl ModelForCausalLM for Model {
                 generated_tokens as f64 / dt.as_secs_f64(),
             );
         }
-
         Ok(tokens)
     }
 }
