@@ -19,8 +19,11 @@ A high-performance inference framework leveraging Rust's Candle for maximum spee
 
 - [ ] [Canary-180M-flash](https://huggingface.co/nvidia/canary-180m-flash)
 - [ ] [SmolDocing-256M](https://huggingface.co/ds4sd/SmolDocling-256M-preview)
+- [x] Qwen3 VL (2B, 4B);
 
 submit your models make other users use it easier!
+
+**You can run Qwen3-VL 2B with fast speed in local, 50x faster than native PyTorch on M1/M2/M3.**
 
 **Key Advantages**:
 

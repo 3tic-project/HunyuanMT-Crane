@@ -9,3 +9,4 @@ vendor/
 outputs/
 
 *.bin
+tests/

@@ -22,9 +22,9 @@ fn test_siglip2() {
 }
 
 fn test_snac() {
-    use crane_core::models::snac;
+    use crane_core::models::snac_onnx;
 
-    let model = snac::SNAC24DecoderONNX::new(None, None).unwrap();
+    let model = snac_onnx::SNAC24DecoderONNX::new(None, None).unwrap();
 
     let inputs = load_tensors("snac_codes.bin").unwrap();
     let codec0 = inputs[0].clone();
