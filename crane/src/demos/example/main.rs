@@ -21,6 +21,7 @@ fn test_siglip2() {
     // model.forward(pixel_values, pixel_attention_mask, spatial_shapes);
 }
 
+#[cfg(feature = "onnx")]
 fn test_snac() {
     use crane_core::models::snac_onnx;
 
@@ -40,4 +41,10 @@ fn test_snac() {
 
     // saving audio tensor to wav
     let _ = model.save_audio_data_to_file(&audio, "outputs/output.wav", None);
+}
+
+#[cfg(not(feature = "onnx"))]
+fn test_snac() {
+    println!("SNAC ONNX model requires the 'onnx' feature to be enabled.");
+    println!("Please run with: cargo run --features onnx --bin example");
 }

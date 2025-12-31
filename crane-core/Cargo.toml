@@ -8,7 +8,7 @@ anyhow = "1.0.97"
 
 candle-nn = "0.8.4"
 candle-transformers = "0.8.4"
-candle-onnx = "0.8.4"
+candle-onnx = { version = "0.8.4", optional = true }
 candle-flash-attn = { version = "0.8.4", optional = true }
 clap = { version = "4.5.32", features = ["derive"] }
 hf-hub = "0.4.2"
@@ -51,3 +51,4 @@ mkl = [
     "candle-nn/mkl",
     "candle-transformers/mkl",
 ]
+onnx = ["dep:candle-onnx"]

@@ -1,5 +1,7 @@
+#[cfg(feature = "onnx")]
 use crane_core::models::{Device, moonshine_asr::MoonshineASR};
 
+#[cfg(feature = "onnx")]
 fn main() {
     let model_dir = "checkpoints/tiny-zh/float";
     let model_name = "tiny-zh";
@@ -10,4 +12,10 @@ fn main() {
     let audio_f = "data/zero_shot_prompt.wav";
     let tokens = model.generate_from_audio(audio_f.to_string()).unwrap();
     println!("{:?}", tokens);
+}
+
+#[cfg(not(feature = "onnx"))]
+fn main() {
+    println!("Moonshine ASR requires the 'onnx' feature to be enabled.");
+    println!("Please run with: cargo run --features onnx --bin moonshine_asr");
 }

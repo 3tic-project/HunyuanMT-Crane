@@ -7,9 +7,18 @@ edition = "2024"
 anyhow = "1.0.97"
 clap = {version = "4.5.32", features = ["derive"]}
 colored = "3.0.0"
+serde = {version = "1.0", features = ["derive"]}
+serde_json = "1.0"
+thiserror = "2.0"
 
 crane-core = { path = "../crane-core" }
 
+[features]
+onnx = ["crane-core/onnx"]
+
+[lib]
+name = "crane"
+path = "src/lib.rs"
 
 [[bin]]
 name = "llmbench"
@@ -26,8 +35,6 @@ path = "src/demos/qwenchat/main.rs"
 [[bin]]
 name = "example"
 path = "src/demos/example/main.rs"
-
-
 
 [[bin]]
 name = "moonshine_asr"
