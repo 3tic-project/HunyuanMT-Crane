@@ -19,23 +19,3 @@ onnx = ["crane-core/onnx"]
 [lib]
 name = "crane"
 path = "src/lib.rs"
-
-[[bin]]
-name = "llmbench"
-path = "src/demos/llmbench/main.rs"
-
-[[bin]]
-name = "sparktts"
-path = "src/demos/sparktts/main.rs"
-
-[[bin]]
-name = "qwenchat"
-path = "src/demos/qwenchat/main.rs"
-
-[[bin]]
-name = "example"
-path = "src/demos/example/main.rs"
-
-[[bin]]
-name = "moonshine_asr"
-path = "src/demos/moonshine_asr.rs"

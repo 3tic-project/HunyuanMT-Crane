@@ -8,5 +8,6 @@ pub mod qwen3;
 pub mod moonshine_asr;
 #[cfg(feature = "onnx")]
 pub mod silero_vad;
+pub mod paddleocr_vl;
 
 pub use candle_core::{DType, Device};
