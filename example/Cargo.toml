@@ -29,6 +29,11 @@ path = "src/vision_simple.rs"
 name = "bm_resize"
 path = "src/bm_resize.rs"
 
+[[bin]]
+name = "ocr_simple"
+path = "src/ocr_simple.rs"
+
+
 [features]
 default = []
 onnx = ["crane/onnx"]

@@ -12,7 +12,7 @@ use crate::utils::image_utils;
 pub struct PaddleOcrVL {
     model: PaddleOCRVLModel,
     tokenizer: Tokenizer,
-    device: Device,
+    pub device: Device,
     dtype: DType,
     config: Config,
     eos_token_id: u32,
@@ -124,6 +124,11 @@ impl PaddleOcrVL {
         let device = if cpu {
             Device::Cpu
         } else {
+            if !crate::utils::cuda_is_available() {
+                return Err(E::msg(
+                    "CUDA is not available, cannot load model on GPU".to_string(),
+                ));
+            }
             Device::cuda_if_available(0)?
         };
         let dtype = if bf16 && device.is_cuda() {
@@ -131,6 +136,7 @@ impl PaddleOcrVL {
         } else {
             DType::F32
         };
+        println!("device: {:?}, dtype: {:?}", device, dtype);
 
         let base = path.as_ref().to_path_buf();
         if !base.is_dir() {
@@ -259,38 +265,6 @@ impl PaddleOcrVL {
 // ======================== Helper functions ========================
 
 pub fn load_image(path: &Path, device: &Device, dtype: DType) -> Result<(Tensor, Tensor)> {
-    // let img = image::ImageReader::open(path)?
-    //     .decode()
-    //     .map_err(|e| E::msg(format!("Cannot decode image {}: {}", path.display(), e)))?
-    //     .to_rgb8();
-
-    // let (width, height) = (img.width() as usize, img.height() as usize);
-
-    // let resized = image::imageops::resize(
-    //     &img,
-    //     new_w as u32,
-    //     new_h as u32,
-    //     image::imageops::FilterType::CatmullRom,
-    // );
-
-    // let mut buf = vec![0f32; 3 * new_h * new_w];
-    // for c in 0..3 {
-    //     for y in 0..new_h {
-    //         for x in 0..new_w {
-    //             let idx = c * new_h * new_w + y * new_w + x;
-    //             buf[idx] = resized.get_pixel(x as u32, y as u32)[c] as f32 / 255.0 * 2.0 - 1.0;
-    //         }
-    //     }
-    // }
-
-    // let pixel_values = Tensor::from_vec(buf, (1, 3, new_h, new_w), device)?.to_dtype(dtype)?;
-
-    // let h_patches = (new_h / PATCH_SIZE) as u32;
-    // let w_patches = (new_w / PATCH_SIZE) as u32;
-    // let grid_thw = Tensor::new(&[[1u32, h_patches, w_patches]], device)?;
-
-    // Ok((pixel_values, grid_thw))
-
     image_utils::load_image_and_smart_resize(path, device, dtype, image_utils::ResizeMode::Bilinear)
 }
 

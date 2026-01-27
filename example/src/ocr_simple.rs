@@ -1,0 +1,30 @@
+use crane::common::config::{CommonConfig, DataType, DeviceConfig};
+use crane::llm::GenerationConfig;
+use crane::prelude::*;
+use std::env;
+
+fn main() -> CraneResult<()> {
+    let args: Vec<String> = env::args().collect();
+    let image_path = args
+        .get(1)
+        .map(|s| s.as_str())
+        .unwrap_or("data/images/test_chart.png");
+
+    let config = CommonConfig {
+        model_path: "checkpoints/PaddleOCR-VL".to_string(), // Update this path to your model
+        // device: DeviceConfig::Cpu, // Use DeviceConfig::Cuda(0) for GPU
+        device: DeviceConfig::Cuda(0), // Use DeviceConfig::Cuda(0) for GPU
+        // dtype: DataType::BF16,
+        dtype: DataType::F32,
+        max_memory: None,
+    };
+
+    let mut ocr_client = OcrClient::new(config)?;
+
+    println!("Performing OCR on image: {}", image_path);
+
+    let response = ocr_client.extract_text_from_image(image_path)?;
+    println!("OCR result: {}", response);
+
+    Ok(())
+}

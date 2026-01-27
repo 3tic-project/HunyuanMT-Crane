@@ -108,13 +108,11 @@ pub fn load_image_and_smart_resize(
     tensor = match mode {
         ResizeMode::Bilinear => {
             let t = tensor.unsqueeze(0)?;
-            let t = t.upsample_bilinear2d(resized_h, resized_w, false)?;
-            t.squeeze(0)?
+            t.upsample_bilinear2d(resized_h, resized_w, false)?
         }
         ResizeMode::Nearest => {
             let t = tensor.unsqueeze(0)?;
-            let t = t.upsample_nearest2d(resized_h, resized_w)?;
-            t.squeeze(0)?
+            t.upsample_nearest2d(resized_h, resized_w)?
         }
         ResizeMode::Bicubic => {
             return Err(E::msg("Bicubic resize not implemented yet"));

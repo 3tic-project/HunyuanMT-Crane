@@ -11,13 +11,15 @@ A high-performance inference framework leveraging Rust's Candle for maximum spee
 **Supported Models**:
 
 
-- [ ] [Canary-180M-flash](https://huggingface.co/nvidia/canary-180m-flash)
-- [ ] [SmolDocing-256M](https://huggingface.co/ds4sd/SmolDocling-256M-preview)
+- [ ] ~~[Canary-180M-flash](https://huggingface.co/nvidia/canary-180m-flash)~~
+- [ ] ~~[SmolDocing-256M](https://huggingface.co/ds4sd/SmolDocling-256M-preview)~~
 - [x] Qwen3 VL (2B, 4B);
 - [x] Qwen3
 - [x] Moonshine ASR model;
 - [ ] 🎙️ TTS Systems:[Spark-TTS](https://github.com/SparkAudio/Spark-TTS) | [Orpheus-TTS](https://github.com/canopyai/Orpheus-TTS) (WIP)
 - [x] Silero VAD model;
+- [x] PaddleOCR VL 0.9B;
+- [ ] Qwen3-TTS (Highest Priority, PR welcomed);
 
 
 submit your models make other users use it easier!
@@ -31,6 +33,24 @@ submit your models make other users use it easier!
 - 🦀 **Rust-Powered**: Eliminate C++ complexity while maintaining native performance;
 - 🍎 **Apple Silicon Optimized**: Achieve GPU acceleration via Metal on macOS devices;
 - 🤖 **Hardware Agnostic**: Unified codebase for CPU/CUDA/Metal execution;
+
+
+**Crane maybe the fastest (both speed and develop speed) framework you can use to build your AI applications!**
+
+Crane using candle as the only dependencies, inference with **fastest** speed cross CPUs and GPUs, while your code can be compiled into binary same as llama.cpp does but much more clean and simpler.
+
+**Most important!!!**
+*Crane is not a low-level SDK, you can call AI abilities out-of-box with ease*.
+
+We include:
+- Basic LLM chat;
+- VLM chat;
+- OCR with VLM;
+- VLA (on the way);
+- TTS;
+- ASR;
+- VAD;
+- .... (Any AI ability you want power with AI.)
 
 
 ## 🔥 Updates

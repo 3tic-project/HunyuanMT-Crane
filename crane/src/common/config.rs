@@ -1,3 +1,5 @@
+use std::fmt::write;
+
 use serde::{Deserialize, Serialize};
 
 /// Common configuration for Crane SDK
@@ -5,13 +7,13 @@ use serde::{Deserialize, Serialize};
 pub struct CommonConfig {
     /// Path to model checkpoints
     pub model_path: String,
-    
+
     /// Device to run models on (CPU/GPU)
     pub device: DeviceConfig,
-    
+
     /// Data type for computations
     pub dtype: DataType,
-    
+
     /// Maximum memory usage
     pub max_memory: Option<usize>,
 }
@@ -33,6 +35,16 @@ pub enum DeviceConfig {
     Cpu,
     Cuda(u32), // GPU ID
     Metal,
+}
+
+impl std::fmt::Display for DeviceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeviceConfig::Cpu => write!(f, "Cpu"),
+            DeviceConfig::Cuda(gpu_id) => write!(f, "Cuda({})", gpu_id),
+            DeviceConfig::Metal => write!(f, "Metal"),
+        }
+    }
 }
 
 /// Data type configuration
