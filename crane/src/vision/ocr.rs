@@ -51,6 +51,15 @@ impl OcrClient {
         self.extract_with_task(image_path, OcrTask::Ocr, 896)
     }
 
+    pub fn extract_text_from_image_stream<P: AsRef<Path>>(
+        &mut self,
+        image_path: P,
+    ) -> CraneResult<String> {
+        self.extract_with_task_stream(image_path, OcrTask::Ocr, 896, |token| {
+            print!("{}", token);
+        })
+    }
+
     pub fn extract_with_task<P: AsRef<Path>>(
         &mut self,
         image_path: P,
@@ -60,6 +69,25 @@ impl OcrClient {
         let result = self
             .model
             .recognize(image_path.as_ref(), task, max_new_tokens)
+            .map_err(|e| CraneError::ModelError(format!("PaddleOCR-VL failed: {}", e)))?;
+
+        Ok(result.text.trim().to_string())
+    }
+
+    pub fn extract_with_task_stream<P: AsRef<Path>, F>(
+        &mut self,
+        image_path: P,
+        task: OcrTask,
+        max_new_tokens: usize,
+        callback: F,
+    ) -> CraneResult<String>
+    where
+        P: AsRef<Path>,
+        F: Fn(&str),
+    {
+        let result = self
+            .model
+            .recognize_stream(image_path.as_ref(), task, max_new_tokens, callback)
             .map_err(|e| CraneError::ModelError(format!("PaddleOCR-VL failed: {}", e)))?;
 
         Ok(result.text.trim().to_string())

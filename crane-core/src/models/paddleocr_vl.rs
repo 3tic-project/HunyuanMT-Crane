@@ -1,16 +1,17 @@
 use anyhow::{Error as E, Result};
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, Tensor, D};
 use candle_nn::VarBuilder;
 use candle_transformers::models::paddleocr_vl::{Config, PaddleOCRVLModel};
 use hf_hub::{api::sync::Api, Repo, RepoType};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 use tokenizers::Tokenizer;
 
 use crate::utils::image_utils;
 
 pub struct PaddleOcrVL {
-    model: PaddleOCRVLModel,
+    model: Arc<PaddleOCRVLModel>,
     tokenizer: Tokenizer,
     pub device: Device,
     dtype: DType,
@@ -19,7 +20,6 @@ pub struct PaddleOcrVL {
     image_token_id: u32,
     vision_start_token_id: u32,
     vision_end_token_id: u32,
-    // video_token_id: u32,  // 目前 PaddleOCR-VL video 支援仍實驗性，先註解
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -48,6 +48,76 @@ pub struct OcrResult {
     pub duration_secs: f32,
 }
 
+pub trait PaddleOCRVLGenerateStream {
+    fn generate_stream<F>(
+        &mut self,
+        input_ids: &Tensor,
+        pixel_values: &Tensor,
+        grid_thw: &Tensor,
+        max_new_tokens: usize,
+        eos_token_id: u32,
+        on_token: F,
+    ) -> Result<Vec<u32>>
+    where
+        F: FnMut(u32);
+}
+
+impl PaddleOCRVLGenerateStream for PaddleOCRVLModel {
+    fn generate_stream<F>(
+        &mut self,
+        input_ids: &Tensor,
+        pixel_values: &Tensor,
+        grid_thw: &Tensor,
+        max_new_tokens: usize,
+        eos_token_id: u32,
+        mut on_token: F,
+    ) -> Result<Vec<u32>>
+    where
+        F: FnMut(u32),
+    {
+        self.clear_kv_cache();
+
+        let mut generated_tokens = Vec::new();
+        let mut current_ids = input_ids.clone();
+
+        let logits = self.forward(&current_ids, Some(pixel_values), Some(grid_thw), 0)?;
+        let next_token = logits
+            .argmax(D::Minus1)?
+            .to_dtype(DType::U32)?
+            .to_vec1::<u32>()?[0];
+
+        on_token(next_token);
+        generated_tokens.push(next_token);
+
+        if next_token == eos_token_id {
+            return Ok(generated_tokens);
+        }
+
+        let mut seqlen_offset = current_ids.dim(1)?;
+        current_ids = Tensor::new(&[next_token], current_ids.device())?.unsqueeze(0)?;
+
+        for _ in 1..max_new_tokens {
+            let logits = self.forward(&current_ids, None, None, seqlen_offset)?;
+            let next_token = logits
+                .argmax(D::Minus1)?
+                .to_dtype(DType::U32)?
+                .to_vec1::<u32>()?[0];
+
+            on_token(next_token);
+            generated_tokens.push(next_token);
+
+            if next_token == eos_token_id {
+                break;
+            }
+
+            seqlen_offset += 1;
+            current_ids = Tensor::new(&[next_token], current_ids.device())?.unsqueeze(0)?;
+        }
+
+        Ok(generated_tokens)
+    }
+}
+
 impl PaddleOcrVL {
     pub fn from_pretrained(
         model_id: &str,
@@ -67,12 +137,6 @@ impl PaddleOcrVL {
             DType::F32
         };
 
-        println!(
-            "Loading PaddleOCR-VL from HF: {} @ {}",
-            model_id,
-            revision.unwrap_or("main")
-        );
-
         let api = Api::new()?;
         let repo = api.repo(Repo::with_revision(
             model_id.to_string(),
@@ -80,20 +144,16 @@ impl PaddleOcrVL {
             revision.unwrap_or("main").to_string(),
         ));
 
-        let config_path = repo.get("config.json")?;
-        let config: Config = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
+        let config: Config =
+            serde_json::from_str(&std::fs::read_to_string(repo.get("config.json")?)?)?;
 
-        let tokenizer_path = repo.get("tokenizer.json")?;
-        let tokenizer = Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| E::msg(format!("Failed to load tokenizer: {}", e)))?;
+        let tokenizer = Tokenizer::from_file(repo.get("tokenizer.json")?).map_err(E::msg)?;
 
         let model_file = repo
             .get("model.safetensors")
             .or_else(|_| repo.get("pytorch_model.bin"))?;
 
-        println!("Loading weights from: {:?}", model_file.display());
-
-        let vb = if model_file.extension().map_or(false, |ext| ext == "bin") {
+        let vb = if model_file.extension().map_or(false, |e| e == "bin") {
             VarBuilder::from_pth(&model_file, dtype, &device)?
         } else {
             unsafe { VarBuilder::from_mmaped_safetensors(&[&model_file], dtype, &device)? }
@@ -108,7 +168,7 @@ impl PaddleOcrVL {
             .unwrap_or(2);
 
         Ok(Self {
-            model,
+            model: Arc::new(model),
             tokenizer,
             device,
             dtype,
@@ -124,41 +184,25 @@ impl PaddleOcrVL {
         let device = if cpu {
             Device::Cpu
         } else {
-            if !crate::utils::cuda_is_available() {
-                return Err(E::msg(
-                    "CUDA is not available, cannot load model on GPU".to_string(),
-                ));
-            }
             Device::cuda_if_available(0)?
         };
+
         let dtype = if bf16 && device.is_cuda() {
             DType::BF16
         } else {
             DType::F32
         };
-        println!("device: {:?}, dtype: {:?}", device, dtype);
 
-        let base = path.as_ref().to_path_buf();
-        if !base.is_dir() {
-            return Err(E::msg(format!("Not a directory: {:?}", base)));
-        }
-
+        let base = path.as_ref();
         let config: Config =
             serde_json::from_str(&std::fs::read_to_string(base.join("config.json"))?)?;
         let tokenizer = Tokenizer::from_file(base.join("tokenizer.json")).map_err(E::msg)?;
 
-        let safetensors_path = base.join("model.safetensors");
-        let vb = if safetensors_path.exists() {
-            unsafe { VarBuilder::from_mmaped_safetensors(&[&safetensors_path], dtype, &device)? }
+        let safetensors = base.join("model.safetensors");
+        let vb = if safetensors.exists() {
+            unsafe { VarBuilder::from_mmaped_safetensors(&[&safetensors], dtype, &device)? }
         } else {
-            let pth_path = base.join("pytorch_model.bin");
-            if pth_path.exists() {
-                VarBuilder::from_pth(&pth_path, dtype, &device)?
-            } else {
-                return Err(E::msg(
-                    "Neither model.safetensors nor pytorch_model.bin found",
-                ));
-            }
+            VarBuilder::from_pth(&base.join("pytorch_model.bin"), dtype, &device)?
         };
 
         let model = PaddleOCRVLModel::new(&config, vb)?;
@@ -169,7 +213,7 @@ impl PaddleOcrVL {
             .unwrap_or(2);
 
         Ok(Self {
-            model,
+            model: Arc::new(model),
             tokenizer,
             device,
             dtype,
@@ -193,8 +237,8 @@ impl PaddleOcrVL {
 
         let grid_vec: Vec<Vec<u32>> = grid_thw.to_vec2().map_err(|e| E::msg(e.to_string()))?;
         let g = &grid_vec[0];
-        let spatial_merge = self.config.vision_config.spatial_merge_size as usize;
-        let num_image_tokens = (g[1] as usize / spatial_merge) * (g[2] as usize / spatial_merge);
+        let merge = self.config.vision_config.spatial_merge_size as usize;
+        let num_image_tokens = (g[1] as usize / merge) * (g[2] as usize / merge);
 
         let input_ids = build_input_tokens(
             &self.tokenizer,
@@ -206,9 +250,10 @@ impl PaddleOcrVL {
             &self.device,
         )?;
 
-        self.model.clear_kv_cache();
+        let model = Arc::get_mut(&mut self.model).expect("recognize called while model is shared");
+        model.clear_kv_cache();
 
-        let generated = self.model.generate(
+        let generated = model.generate(
             &input_ids,
             &pixel_values,
             &grid_thw,
@@ -216,53 +261,98 @@ impl PaddleOcrVL {
             self.eos_token_id,
         )?;
 
-        let output_tokens: Vec<u32> = generated
+        let output: Vec<u32> = generated
             .into_iter()
             .take_while(|&t| t != self.eos_token_id)
             .collect();
 
         let mut text = self
             .tokenizer
-            .decode(&output_tokens, true)
-            .map_err(|e| anyhow::anyhow!("Tokenizer decode failed: {}", e))?;
-        text = text.trim().to_string();
+            .decode(&output, true)
+            .map_err(|e| anyhow::anyhow!("{}", e))?
+            .trim()
+            .to_string();
 
         if text.is_empty() {
             text = "[no text recognized]".to_string();
         }
 
-        let duration = start.elapsed().as_secs_f32();
-
         Ok(OcrResult {
             text,
-            tokens_generated: output_tokens.len(),
-            duration_secs: duration,
+            tokens_generated: output.len(),
+            duration_secs: start.elapsed().as_secs_f32(),
         })
     }
 
-    pub fn recognize_and_print(
+    pub fn recognize_stream<F>(
         &mut self,
         image_path: impl AsRef<Path>,
         task: OcrTask,
         max_new_tokens: usize,
-    ) -> Result<()> {
-        let result = self.recognize(image_path, task, max_new_tokens)?;
-        println!("\n{}", "=".repeat(70));
-        println!("Task          : {:?}", task);
-        println!("Duration      : {:.2} s", result.duration_secs);
-        println!(
-            "Tokens        : {} ({:.1} tok/s)",
-            result.tokens_generated,
-            result.tokens_generated as f32 / result.duration_secs.max(0.01)
-        );
-        println!("{}", "=".repeat(70));
-        println!("{}", result.text);
-        println!("{}", "=".repeat(70));
-        Ok(())
+        mut callback: F,
+    ) -> Result<OcrResult>
+    where
+        F: FnMut(&str),
+    {
+        let start = Instant::now();
+
+        let (pixel_values, grid_thw) = load_image(image_path.as_ref(), &self.device, self.dtype)?;
+
+        let grid: Vec<Vec<u32>> = grid_thw.to_vec2().map_err(|e| E::msg(e.to_string()))?;
+        let g = &grid[0];
+        let merge = self.config.vision_config.spatial_merge_size as usize;
+        let num_image_tokens = (g[1] as usize / merge) * (g[2] as usize / merge);
+
+        let input_ids = build_input_tokens(
+            &self.tokenizer,
+            task,
+            num_image_tokens,
+            self.image_token_id,
+            self.vision_start_token_id,
+            self.vision_end_token_id,
+            &self.device,
+        )?;
+
+        let eos_token_id = self.eos_token_id;
+        let tokenizer = self.tokenizer.clone();
+
+        let mut text = String::new();
+        let mut tokens_generated = 0usize;
+
+        let model =
+            Arc::get_mut(&mut self.model).expect("recognize_stream called while model is shared");
+
+        let tokens = model.generate_stream(
+            &input_ids,
+            &pixel_values,
+            &grid_thw,
+            max_new_tokens,
+            eos_token_id,
+            |tok_id| {
+                tokens_generated += 1;
+
+                if tok_id == eos_token_id {
+                    return;
+                }
+
+                if let Ok(s) = tokenizer.decode(&[tok_id], false) {
+                    callback(&s);
+                    text.push_str(&s);
+                }
+            },
+        )?;
+
+        if text.trim().is_empty() {
+            text = "[no text recognized]".to_string();
+        }
+
+        Ok(OcrResult {
+            text,
+            tokens_generated: tokens.len(),
+            duration_secs: start.elapsed().as_secs_f32(),
+        })
     }
 }
-
-// ======================== Helper functions ========================
 
 pub fn load_image(path: &Path, device: &Device, dtype: DType) -> Result<(Tensor, Tensor)> {
     image_utils::load_image_and_smart_resize(path, device, dtype, image_utils::ResizeMode::Bilinear)

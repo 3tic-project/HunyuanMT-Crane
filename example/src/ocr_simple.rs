@@ -22,8 +22,12 @@ fn main() -> CraneResult<()> {
 
     println!("Performing OCR on image: {}", image_path);
 
-    let response = ocr_client.extract_text_from_image(image_path)?;
-    println!("OCR result: {}", response);
+    // let response = ocr_client.extract_text_from_image(image_path)?;
+    // println!("OCR result: {}", response);
+
+    // streaming way
+    let _ = ocr_client.extract_text_from_image_stream(image_path)?;
+    println!("");
 
     Ok(())
 }

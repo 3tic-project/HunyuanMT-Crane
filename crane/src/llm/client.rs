@@ -1,7 +1,10 @@
-use crate::common::{CraneResult, CraneError, config::{CommonConfig, DataType, DeviceConfig}};
+use crate::common::{
+    CraneError, CraneResult,
+    config::{CommonConfig, DataType, DeviceConfig},
+};
 use crate::llm::GenerationConfig;
-use std::sync::Arc;
 use crane_core::generation::based::ModelForCausalLM;
+use std::sync::Arc;
 
 /// LLM client for various language models
 pub struct LlmClient {
@@ -15,19 +18,19 @@ impl LlmClient {
     pub fn new(config: CommonConfig) -> CraneResult<Self> {
         // Initialize the appropriate model based on configuration
         // For now, we'll just store the config and return
-        Ok(Self {
-            config,
-        })
+        Ok(Self { config })
     }
-    
+
     /// Generate text using the model
     pub fn generate(&self, prompt: &str, config: &GenerationConfig) -> CraneResult<String> {
         // This is a simplified implementation
         // In reality, we would use the appropriate model based on the config
         let device = match &self.config.device {
             DeviceConfig::Cpu => crane_core::models::Device::Cpu,
-            DeviceConfig::Cuda(gpu_id) => crane_core::models::Device::cuda_if_available(*gpu_id as usize)
-                .map_err(|e| CraneError::ModelError(e.to_string()))?,
+            DeviceConfig::Cuda(gpu_id) => {
+                crane_core::models::Device::cuda_if_available(*gpu_id as usize)
+                    .map_err(|e| CraneError::ModelError(e.to_string()))?
+            }
             DeviceConfig::Metal => {
                 #[cfg(target_os = "macos")]
                 {
@@ -36,7 +39,9 @@ impl LlmClient {
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    return Err(CraneError::ConfigError("Metal device not available on this platform".to_string()));
+                    return Err(CraneError::ConfigError(
+                        "Metal device not available on this platform".to_string(),
+                    ));
                 }
             }
         };
@@ -51,14 +56,13 @@ impl LlmClient {
         // For now, let's use Qwen2.5 as an example
         let tokenizer = crane_core::autotokenizer::AutoTokenizer::from_pretrained(
             &self.config.model_path,
-            None
-        ).map_err(|e| CraneError::TokenizationError(e.to_string()))?;
+            None,
+        )
+        .map_err(|e| CraneError::TokenizationError(e.to_string()))?;
 
-        let mut model = crane_core::models::qwen25::Model::new(
-            &self.config.model_path,
-            &device,
-            &dtype
-        ).map_err(|e| CraneError::ModelError(e.to_string()))?;
+        let mut model =
+            crane_core::models::qwen25::Model::new(&self.config.model_path, &device, &dtype)
+                .map_err(|e| CraneError::ModelError(e.to_string()))?;
 
         let gen_config = crane_core::generation::GenerationConfig {
             max_new_tokens: config.max_new_tokens,
@@ -72,7 +76,8 @@ impl LlmClient {
             report_speed: config.report_speed,
         };
 
-        let input_ids = model.prepare_inputs(prompt)
+        let input_ids = model
+            .prepare_inputs(prompt)
             .map_err(|e| CraneError::ModelError(e.to_string()))?;
 
         model.warmup();
@@ -86,21 +91,29 @@ impl LlmClient {
             .generate(&input_ids, &gen_config, Some(&mut streamer))
             .map_err(|e| CraneError::ModelError(e.to_string()))?;
 
-        let result = tokenizer.decode(&output_ids, false)
+        let result = tokenizer
+            .decode(&output_ids, false)
             .map_err(|e| CraneError::TokenizationError(e.to_string()))?;
 
         Ok(result)
     }
 
     /// Generate text with streaming support
-    pub fn generate_streaming<F>(&self, prompt: &str, config: &GenerationConfig, callback: F) -> CraneResult<String>
+    pub fn generate_streaming<F>(
+        &self,
+        prompt: &str,
+        config: &GenerationConfig,
+        callback: F,
+    ) -> CraneResult<String>
     where
         F: Fn(&str),
     {
         let device = match &self.config.device {
             DeviceConfig::Cpu => crane_core::models::Device::Cpu,
-            DeviceConfig::Cuda(gpu_id) => crane_core::models::Device::cuda_if_available(*gpu_id as usize)
-                .map_err(|e| CraneError::ModelError(e.to_string()))?,
+            DeviceConfig::Cuda(gpu_id) => {
+                crane_core::models::Device::cuda_if_available(*gpu_id as usize)
+                    .map_err(|e| CraneError::ModelError(e.to_string()))?
+            }
             DeviceConfig::Metal => {
                 #[cfg(target_os = "macos")]
                 {
@@ -109,7 +122,9 @@ impl LlmClient {
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    return Err(CraneError::ConfigError("Metal device not available on this platform".to_string()));
+                    return Err(CraneError::ConfigError(
+                        "Metal device not available on this platform".to_string(),
+                    ));
                 }
             }
         };
@@ -122,14 +137,13 @@ impl LlmClient {
 
         let tokenizer = crane_core::autotokenizer::AutoTokenizer::from_pretrained(
             &self.config.model_path,
-            None
-        ).map_err(|e| CraneError::TokenizationError(e.to_string()))?;
+            None,
+        )
+        .map_err(|e| CraneError::TokenizationError(e.to_string()))?;
 
-        let mut model = crane_core::models::qwen25::Model::new(
-            &self.config.model_path,
-            &device,
-            &dtype
-        ).map_err(|e| CraneError::ModelError(e.to_string()))?;
+        let mut model =
+            crane_core::models::qwen25::Model::new(&self.config.model_path, &device, &dtype)
+                .map_err(|e| CraneError::ModelError(e.to_string()))?;
 
         let gen_config = crane_core::generation::GenerationConfig {
             max_new_tokens: config.max_new_tokens,
@@ -143,17 +157,18 @@ impl LlmClient {
             report_speed: config.report_speed,
         };
 
-        let input_ids = model.prepare_inputs(prompt)
+        let input_ids = model
+            .prepare_inputs(prompt)
             .map_err(|e| CraneError::ModelError(e.to_string()))?;
 
         model.warmup();
 
-        let (mut streamer, receiver) = crane_core::generation::streamer::AsyncTextStreamer::new(tokenizer.clone());
+        let (mut streamer, receiver) =
+            crane_core::generation::streamer::AsyncTextStreamer::with_tokenizer(tokenizer);
 
         // Start the generation in a separate thread
         let generate_handle = std::thread::spawn(move || {
-            let _output_ids = model
-                .generate(&input_ids, &gen_config, Some(&mut streamer));
+            let _output_ids = model.generate(&input_ids, &gen_config, Some(&mut streamer));
             _output_ids
         });
 
@@ -175,12 +190,10 @@ impl LlmClient {
         generate_handle.join().unwrap()?;
         Ok(response_text)
     }
-    
+
     /// Get the tokenizer for this client
     pub fn get_tokenizer(&self) -> CraneResult<crane_core::autotokenizer::AutoTokenizer> {
-        crane_core::autotokenizer::AutoTokenizer::from_pretrained(
-            &self.config.model_path, 
-            None
-        ).map_err(|e| CraneError::TokenizationError(e.to_string()))
+        crane_core::autotokenizer::AutoTokenizer::from_pretrained(&self.config.model_path, None)
+            .map_err(|e| CraneError::TokenizationError(e.to_string()))
     }
 }

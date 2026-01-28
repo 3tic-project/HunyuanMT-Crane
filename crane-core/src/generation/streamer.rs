@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::sync::mpsc;
+use tokenizers::Tokenizer;
 
 use crate::autotokenizer::AutoTokenizer;
 
@@ -36,28 +37,54 @@ pub enum StreamerMessage {
 }
 
 pub struct AsyncTextStreamer {
-    tokenizer: AutoTokenizer,
+    decode: Box<dyn Fn(u32) -> Result<String> + Send + Sync>,
     sender: mpsc::Sender<StreamerMessage>,
 }
 
 impl AsyncTextStreamer {
-    pub fn new(tokenizer: AutoTokenizer) -> (Self, mpsc::Receiver<StreamerMessage>) {
+    pub fn new(
+        decode: Box<dyn Fn(u32) -> Result<String> + Send + Sync>,
+    ) -> (Self, mpsc::Receiver<StreamerMessage>) {
         let (sender, receiver) = mpsc::channel();
-        let streamer = Self { tokenizer, sender };
-        (streamer, receiver)
+        (Self { decode, sender }, receiver)
+    }
+
+    pub fn with_tokenizer<T: TokenDecode + Send + Sync + 'static>(
+        tokenizer: T,
+    ) -> (Self, mpsc::Receiver<StreamerMessage>) {
+        let (sender, receiver) = mpsc::channel();
+
+        let decode = Box::new(move |token_id: u32| tokenizer.decode_token(token_id));
+
+        (Self { decode, sender }, receiver)
+    }
+}
+
+pub trait TokenDecode {
+    fn decode_token(&self, token_id: u32) -> anyhow::Result<String>;
+}
+
+impl TokenDecode for Tokenizer {
+    fn decode_token(&self, token_id: u32) -> anyhow::Result<String> {
+        self.decode(&[token_id], true)
+            .map_err(|e| anyhow::anyhow!("Decode failed: {}", e))
+    }
+}
+
+impl TokenDecode for AutoTokenizer {
+    fn decode_token(&self, token_id: u32) -> anyhow::Result<String> {
+        self.decode(&[token_id], true)
+            .map_err(|e| anyhow::anyhow!("Decode failed: {}", e))
     }
 }
 
 impl TokenStreamer for AsyncTextStreamer {
     fn append(&mut self, token_id: u32) -> Result<()> {
-        let token = self
-            .tokenizer
-            .decode(&[token_id], true)
-            .map_err(|e| anyhow::anyhow!("Decode failed: {}", e))?;
+        let token = (self.decode)(token_id)?;
 
         self.sender
             .send(StreamerMessage::Token(token))
-            .map_err(|e| anyhow::anyhow!("Failed to send token through channel: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Channel send failed: {}", e))?;
 
         Ok(())
     }
