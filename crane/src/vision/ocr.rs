@@ -13,10 +13,21 @@ pub struct OcrClient {
 
 impl OcrClient {
     pub fn new(config: CommonConfig) -> CraneResult<Self> {
-        let use_cpu = matches!(config.device, DeviceConfig::Cpu);
-        let use_bf16 = matches!(config.dtype, DataType::BF16) && !use_cpu;
+        let mut use_cpu = matches!(config.device, DeviceConfig::Cpu);
+        let mut use_bf16 = matches!(config.dtype, DataType::BF16) && !use_cpu;
 
         ribo::utils::log::init_log(ribo::utils::log::LogLevel::INFO);
+
+        if crane_core::utils::cuda_is_available() && use_cpu {
+            info!("Warning: CUDA is available but CPU device is selected.");
+        }
+        if !crane_core::utils::cuda_is_available() && !use_cpu {
+            info!(
+                "Warning: CUDA is not available but a GPU device is selected. Falling back to CPU."
+            );
+            use_cpu = true;
+            use_bf16 = false;
+        }
 
         info!(
             "cuda available: {}, use_cpu: {}, use_bf16: {}",
@@ -25,6 +36,13 @@ impl OcrClient {
             use_bf16
         );
         info!("device: {}, dtype: {}", config.device, config.dtype);
+
+        if std::path::Path::new(&config.model_path).exists() == false {
+            return Err(CraneError::ConfigError(format!(
+                "Model path does not exist: {}",
+                config.model_path
+            )));
+        }
 
         let model = PaddleOcrVL::from_local(&config.model_path, use_cpu, use_bf16)
             .map_err(|e| CraneError::ModelError(format!("Failed to load model: {}", e)))?;

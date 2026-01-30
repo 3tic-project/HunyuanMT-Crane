@@ -10,7 +10,8 @@ fn main() -> CraneResult<()> {
         .unwrap_or("data/images/test_chart.png");
 
     let config = CommonConfig {
-        model_path: "checkpoints/PaddleOCR-VL".to_string(),
+        // model_path: "checkpoints/PaddleOCR-VL".to_string(),
+        model_path: "checkpoints/PaddleOCR-VL-1.5".to_string(),
         // device: DeviceConfig::Cpu,
         device: DeviceConfig::Cuda(0),
         // dtype: DataType::BF16,

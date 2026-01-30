@@ -19,6 +19,7 @@ A high-performance inference framework leveraging Rust's Candle for maximum spee
 - [ ] 🎙️ TTS Systems:[Spark-TTS](https://github.com/SparkAudio/Spark-TTS) | [Orpheus-TTS](https://github.com/canopyai/Orpheus-TTS) (WIP)
 - [x] Silero VAD model;
 - [x] PaddleOCR VL 0.9B;
+- [x] PaddleOCR VL 1.5 0.9B;
 - [ ] Qwen3-TTS (Highest Priority, PR welcomed);
 
 
@@ -55,6 +56,7 @@ We include:
 
 ## 🔥 Updates
 
+- **`2026.01.30`**: PaddleOCR-VL-1.5 supported now! model: https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.5/;
 - **`2025.03.21`**: 🔥 Qwen2.5 a more transformers liked Rust interface were supported, you now use Crane just like in your python;
 - **`2025.03.19`**: 🔥 project initialized;
 
