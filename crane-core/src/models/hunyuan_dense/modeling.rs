@@ -16,11 +16,17 @@ pub struct Gguf<R: Read + Seek> {
     ct: gguf_file::Content,
     reader: R,
     device: Device,
+    /// Target compute dtype. Dequantized tensors (norms, embeddings) are
+    /// cast to this dtype so they match the activations flowing through the
+    /// model (e.g. BF16 on CUDA). Quantized linear layers (QMatMul) handle
+    /// their own internal dtype and the `LinearLayer` wrapper casts their
+    /// output to the input's dtype.
+    dtype: DType,
 }
 
 impl<R: Read + Seek> Gguf<R> {
-    pub fn new(ct: gguf_file::Content, reader: R, device: Device) -> Self {
-        Self { ct, reader, device }
+    pub fn new(ct: gguf_file::Content, reader: R, device: Device, dtype: DType) -> Self {
+        Self { ct, reader, device, dtype }
     }
 
     /// Load a quantized tensor and wrap as a LinearLayer (QMatMul).
@@ -31,16 +37,19 @@ impl<R: Read + Seek> Gguf<R> {
     }
 
     /// Load a tensor, dequantize, and create an RmsNorm.
+    /// The weight is cast to the target `dtype` so it matches activations.
     pub fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
         let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
-        let weight = ws.dequantize(&self.device)?;
+        let weight = ws.dequantize(&self.device)?.to_dtype(self.dtype)?;
         Ok(RmsNorm::new(weight, eps))
     }
 
     /// Load a tensor, dequantize, and create an Embedding.
+    /// The weight is cast to the target `dtype` so lookups produce
+    /// tensors in the expected compute precision.
     pub fn embedding(&mut self, name: &str, hidden_size: usize) -> Result<candle_nn::Embedding> {
         let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
-        let weight = ws.dequantize(&self.device)?;
+        let weight = ws.dequantize(&self.device)?.to_dtype(self.dtype)?;
         Ok(candle_nn::Embedding::new(weight, hidden_size))
     }
 
@@ -70,7 +79,26 @@ impl Module for LinearLayer {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
             Self::Standard(l) => l.forward(xs),
-            Self::Quantized(q) => q.forward(xs),
+            Self::Quantized(q) => {
+                // candle's QMatMul internally dequantizes weights to F32
+                // and requires F32 input. When the activation pipeline
+                // runs in BF16/F16 we must:
+                //   1. Cast input to F32 for the quantized matmul
+                //   2. Cast output back to the original dtype for
+                //      downstream binary ops (residual adds, etc.)
+                let input_dtype = xs.dtype();
+                let xs_f32 = if input_dtype != DType::F32 {
+                    xs.to_dtype(DType::F32)?
+                } else {
+                    xs.clone()
+                };
+                let out = q.forward(&xs_f32)?;
+                if input_dtype != DType::F32 {
+                    out.to_dtype(input_dtype)
+                } else {
+                    Ok(out)
+                }
+            }
         }
     }
 }
@@ -798,7 +826,9 @@ impl HunYuanDenseV1 {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        let mut gg = Gguf::new(ct, reader, device.clone());
+        // Determine compute dtype early so Gguf can dequantize to it.
+        let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+        let mut gg = Gguf::new(ct, reader, device.clone(), dtype);
         let md_get = |s: &str| match gg.metadata().get(s) {
             None => candle_core::bail!("cannot find {s} in GGUF metadata"),
             Some(v) => Ok(v.clone()),
@@ -864,9 +894,6 @@ impl HunYuanDenseV1 {
             use_cla: None,
             cla_share_factor: None,
         };
-
-        // Use F16 as the compute dtype for CUDA, F32 for CPU
-        let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
 
         // Load embedding
         let embed_tokens = gg.embedding("token_embd.weight", hidden_size)?;
