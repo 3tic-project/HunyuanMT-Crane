@@ -838,14 +838,6 @@ impl HunYuanDenseV1 {
             .and_then(|v| v.to_f32().ok())
             .unwrap_or(10_000.0) as f64;
 
-        // Vocab size from embedding tensor
-        let vocab_size = {
-            let emb_info = gg.metadata(); // metadata doesn't have this; infer from tensor
-            drop(emb_info);
-            // We'll infer from the embedding tensor after loading
-            0usize // placeholder, updated below
-        };
-
         // Check for QK norm by probing tensor existence
         let use_qk_norm = gg.ct.tensor_infos.contains_key("blk.0.attn_q_norm.weight");
 
