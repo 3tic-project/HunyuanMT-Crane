@@ -217,6 +217,11 @@ pub struct InferenceEngine {
     start_time: Instant,
     /// Step counter for periodic stats logging.
     step_counter: u64,
+    /// CUDA graph capturer for decode acceleration (CUDA-only).
+    #[cfg(feature = "cuda")]
+    graph_capturer: Option<crane_core::cuda_graph::DecodeGraphCapturer>,
+    /// Whether CUDA graphs are enabled.
+    use_cuda_graph: bool,
 }
 
 impl InferenceEngine {
@@ -241,6 +246,9 @@ impl InferenceEngine {
             decode_tokens_per_seq: decode_tokens_per_seq.max(1),
             start_time: Instant::now(),
             step_counter: 0,
+            #[cfg(feature = "cuda")]
+            graph_capturer: None,
+            use_cuda_graph: false,
         };
         let handle = EngineHandle {
             request_tx,
@@ -476,6 +484,383 @@ impl InferenceEngine {
         }
     }
 
+    // ── CUDA Graph setup ──
+
+    /// Enable CUDA graphs for the decode path. Call after model is loaded.
+    ///
+    /// Pre-allocates permanent KV buffers and captures graphs at planned
+    /// batch sizes. The `max_kv_len` should cover the longest expected
+    /// context (prompt + generation).
+    #[cfg(feature = "cuda")]
+    pub fn enable_cuda_graphs(&mut self, max_kv_len: usize) {
+        let max_batch = self.scheduler.max_running;
+        let half_head_dim = self.model.half_head_dim();
+        let dtype = self.model.dtype;
+
+        info!(
+            max_batch,
+            max_kv_len,
+            "Pre-allocating KV buffers for CUDA graph mode"
+        );
+
+        // 1. Pre-allocate permanent KV buffers.
+        if let Err(e) = self.model.preallocate_graph_kv(max_batch, max_kv_len) {
+            error!("Failed to preallocate graph KV buffers: {e}");
+            return;
+        }
+
+        // 2. Get the CudaDevice for graph capture.
+        let cuda_device = match &self.model.device {
+            candle_core::Device::Cuda(d) => d.clone(),
+            _ => {
+                warn!("CUDA graphs require a CUDA device; skipping");
+                return;
+            }
+        };
+
+        let mut capturer =
+            crane_core::cuda_graph::DecodeGraphCapturer::new(std::sync::Arc::new(cuda_device));
+
+        // 3. Capture graphs.
+        info!("Capturing decode CUDA graphs...");
+        let capture_result = capturer.capture(
+            max_batch,
+            max_kv_len,
+            half_head_dim,
+            dtype,
+            |input_ids, cos, sin, mask, write_pos| {
+                self.model
+                    .step_batch_decode_graph(input_ids, cos, sin, mask, write_pos)
+            },
+        );
+
+        match capture_result {
+            Ok(()) => {
+                info!("CUDA graph capture complete");
+                self.graph_capturer = Some(capturer);
+                self.use_cuda_graph = true;
+            }
+            Err(e) => {
+                error!("CUDA graph capture failed: {e}");
+                // Fall back to non-graph mode. Clear the pre-allocated buffers.
+                self.model.clear_kv_cache();
+            }
+        }
+    }
+
+    /// Decode step using CUDA graphs. Returns `true` if graphs were used,
+    /// `false` if we should fall back to the non-graph path.
+    #[cfg(feature = "cuda")]
+    fn step_decode_batch_graph(&mut self, batch: &[String]) -> bool {
+        // Take the capturer out of self so we don't hold an immutable
+        // borrow on self while calling &mut self methods (sample, send_*).
+        let capturer = match self.graph_capturer.take() {
+            Some(c) => c,
+            None => return false,
+        };
+
+        let result = self.step_decode_batch_graph_body(&capturer, batch);
+
+        // Always put the capturer back.
+        self.graph_capturer = Some(capturer);
+        result
+    }
+
+    /// Inner body of graph decode, separated to allow `capturer` to be
+    /// borrowed independently from `self`.
+    #[cfg(feature = "cuda")]
+    fn step_decode_batch_graph_body(
+        &mut self,
+        capturer: &crane_core::cuda_graph::DecodeGraphCapturer,
+        batch: &[String],
+    ) -> bool {
+        let batch_size = batch.len();
+        if !capturer.is_captured(batch_size) {
+            debug!(batch_size, "No graph captured for this batch size, falling back");
+            return false;
+        }
+
+        let t0 = Instant::now();
+
+        // ── 1. Load per-sequence KV into permanent buffers ──
+        let kv_caches: Vec<Vec<Option<(Tensor, Tensor)>>> = batch
+            .iter()
+            .map(|id| self.sequences.get(id).unwrap().kv_caches.clone())
+            .collect();
+
+        let (kv_lens, _max_kv_len) = match self.model.load_kv_for_graph(&kv_caches) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Graph KV load failed: {e}");
+                return false;
+            }
+        };
+        drop(kv_caches);
+
+        let t_setup = t0.elapsed();
+
+        // ── 2. Build full-width mask for the graph buffer ──
+        let graph_kv_width = capturer.max_kv_len;
+        let full_mask = match build_batch_decode_mask(
+            &kv_lens,
+            graph_kv_width, // treat entire buffer as "original_max_kv"
+            graph_kv_width,
+            &self.model.device,
+            self.model.dtype,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                error!("Graph mask build failed: {e}");
+                return false;
+            }
+        };
+
+        // If no mask needed (all same length), create an all-zeros mask
+        // since graph mode always requires a mask.
+        let full_mask = match full_mask {
+            Some(m) => m,
+            None => {
+                match Tensor::zeros(
+                    (batch_size, 1, 1, graph_kv_width),
+                    self.model.dtype,
+                    &self.model.device,
+                ) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        error!("Graph zero mask failed: {e}");
+                        return false;
+                    }
+                }
+            }
+        };
+
+        // ── 3. Multi-round decode with graph replay ──
+        let mut total_tokens = 0u64;
+        let mut rounds_done = 0usize;
+        let mut alive = vec![true; batch.len()];
+        let mut pending_finish: Vec<String> = Vec::new();
+        let mut pending_cancel: Vec<String> = Vec::new();
+
+        let mut positions: Vec<usize> = batch
+            .iter()
+            .map(|id| self.sequences.get(id).unwrap().start_pos())
+            .collect();
+
+        let mut last_tokens: Vec<u32> = batch
+            .iter()
+            .map(|id| *self.sequences.get(id).unwrap().tokens.last().unwrap())
+            .collect();
+
+        for round in 0..self.decode_tokens_per_seq {
+            if alive.iter().all(|a| !a) {
+                break;
+            }
+
+            // Build input tokens.
+            let tokens: Vec<u32> = (0..batch.len())
+                .map(|i| {
+                    if alive[i] {
+                        *self.sequences.get(&batch[i]).unwrap().tokens.last().unwrap()
+                    } else {
+                        last_tokens[i]
+                    }
+                })
+                .collect();
+
+            // Compute rotary embeddings.
+            let (cos, sin) = match self.model.compute_rotary(&positions) {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("Graph rotary computation failed: {e}");
+                    return false;
+                }
+            };
+
+            // Build write_pos (the KV buffer position for this round's token).
+            // For graph mode with scatter_set, write_pos is the logical position
+            // which is the same as positions[i] (the token position in the sequence).
+            let write_pos_data: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+            let write_pos = match Tensor::new(write_pos_data.as_slice(), &self.model.device) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("Graph write_pos creation failed: {e}");
+                    return false;
+                }
+            };
+
+            // Update mask: unmask position `positions[i]` for each sequence
+            // (newly written KV should be attendable). The mask was built for
+            // the initial kv_lens; after each round, one more position is valid.
+            // For simplicity, we rebuild a narrowed mask each round.
+            // Actually, the full_mask already has the right structure — positions
+            // 0..kv_lens[i] are unmasked, kv_lens[i]..graph_kv_width are masked.
+            // After round r, position (kv_lens[i]+r) should also be unmasked.
+            // We handle this by building a mask per round.
+            let current_mask = {
+                let kv_lens_after: Vec<usize> = kv_lens.iter()
+                    .map(|&l| l + round + 1) // +1 because this round's write_pos is at position l+round
+                    .collect();
+                match build_batch_decode_mask(
+                    &kv_lens_after,
+                    graph_kv_width,
+                    graph_kv_width,
+                    &self.model.device,
+                    self.model.dtype,
+                ) {
+                    Ok(Some(m)) => m,
+                    Ok(None) => {
+                        match Tensor::zeros(
+                            (batch_size, 1, 1, graph_kv_width),
+                            self.model.dtype,
+                            &self.model.device,
+                        ) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                error!("Graph mask rebuild failed: {e}");
+                                return false;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Graph mask rebuild failed: {e}");
+                        return false;
+                    }
+                }
+            };
+
+            // Build input_ids tensor.
+            let input_ids = match Tensor::new(tokens.as_slice(), &self.model.device) {
+                Ok(t) => match t.reshape((batch_size, 1)) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!("Graph input_ids reshape failed: {e}");
+                        return false;
+                    }
+                },
+                Err(e) => {
+                    error!("Graph input_ids creation failed: {e}");
+                    return false;
+                }
+            };
+
+            // ── Graph replay ──
+            let logits = match capturer.replay(&input_ids, &cos, &sin, &current_mask, &write_pos)
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    error!("CUDA graph replay failed (round {round}): {e}");
+                    return false;
+                }
+            };
+
+            rounds_done += 1;
+
+            // Sample alive sequences.
+            for (i, seq_id) in batch.iter().enumerate() {
+                if !alive[i] {
+                    continue;
+                }
+
+                let seq_logits = match logits.narrow(0, i, 1) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        self.send_error(seq_id, &format!("Logits extraction failed: {e}"));
+                        alive[i] = false;
+                        continue;
+                    }
+                };
+
+                let next_token = match self.sample(seq_id, &seq_logits) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        self.send_error(seq_id, &format!("Sampling failed: {e}"));
+                        alive[i] = false;
+                        continue;
+                    }
+                };
+
+                if let Some(seq) = self.sequences.get_mut(seq_id) {
+                    seq.tokens.push(next_token);
+                }
+                last_tokens[i] = next_token;
+                total_tokens += 1;
+                self.stats.total_decode_steps.fetch_add(1, Ordering::Relaxed);
+                self.send_token(seq_id, next_token);
+
+                if self.sequences.get(seq_id).map_or(true, |s| s.should_stop()) {
+                    alive[i] = false;
+                    pending_finish.push(seq_id.clone());
+                } else if self
+                    .sequences
+                    .get(seq_id)
+                    .map_or(true, |s| s.response_tx.is_closed())
+                {
+                    alive[i] = false;
+                    pending_cancel.push(seq_id.clone());
+                }
+            }
+
+            for p in positions.iter_mut() {
+                *p += 1;
+            }
+        }
+
+        // ── 4. Extract per-sequence KV from graph buffers ──
+        if rounds_done > 0 {
+            match self.model.extract_graph_kv(&kv_lens, rounds_done) {
+                Ok(extracted) => {
+                    for (i, seq_id) in batch.iter().enumerate() {
+                        if alive[i] {
+                            if let Some(seq) = self.sequences.get_mut(seq_id) {
+                                if i < extracted.len() {
+                                    seq.kv_caches = extracted[i].clone();
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Graph KV extraction failed: {e}");
+                }
+            }
+        }
+
+        // ── 5. Finish / cancel sequences ──
+        for id in &pending_finish {
+            self.finish_sequence(id);
+        }
+        for id in &pending_cancel {
+            self.stats.cancelled_requests.fetch_add(1, Ordering::Relaxed);
+            self.cleanup_sequence(id);
+        }
+
+        let decode_us = t0.elapsed().as_micros() as u64;
+        self.stats
+            .total_decode_time_us
+            .fetch_add(decode_us, Ordering::Relaxed);
+
+        if total_tokens > 0 {
+            let tok_s = if decode_us > 0 {
+                (total_tokens as f64) / (decode_us as f64 / 1_000_000.0)
+            } else {
+                0.0
+            };
+            debug!(
+                batch_size,
+                tokens = total_tokens,
+                rounds = rounds_done,
+                finished = pending_finish.len(),
+                setup_ms = t_setup.as_millis() as u64,
+                decode_ms = decode_us / 1000,
+                tok_s = format!("{:.1}", tok_s),
+                "Graph batched decode step complete",
+            );
+        }
+
+        // Put the capturer back.
+        true
+    }
+
     /// Decode step for all running sequences — TRUE BATCHED forward.
     ///
     /// Uses **lazy eviction**: when a sequence completes or is cancelled
@@ -509,6 +894,29 @@ impl InferenceEngine {
         }
 
         let batch_size = batch.len();
+
+        // ── Try CUDA graph decode path ──
+        #[cfg(feature = "cuda")]
+        if self.use_cuda_graph {
+            // Flush stale KV from prior prefill before graph mode.
+            if let Some(ref prev_id) = self.active_seq_id.take() {
+                if self.sequences.contains_key(prev_id) {
+                    let caches = self.model.get_kv_caches();
+                    if let Some(seq) = self.sequences.get_mut(prev_id) {
+                        seq.kv_caches = caches;
+                    }
+                }
+                // Don't clear KV cache — graph mode uses permanent buffers.
+            }
+
+            if self.step_decode_batch_graph(&batch) {
+                self.drain_requests();
+                self.check_cancelled();
+                return;
+            }
+            // Graph failed — fall through to non-graph path.
+            warn!("CUDA graph decode failed, falling back to non-graph path");
+        }
 
         // 2. Flush model's internal KV cache state (stale from prior prefill).
         if let Some(ref prev_id) = self.active_seq_id.take() {
@@ -610,6 +1018,7 @@ impl InferenceEngine {
                 &tokens,
                 &positions,
                 mask_for_round.as_ref(),
+                Some((&kv_lens, original_max_kv)),
             ) {
                 Ok(l) => l,
                 Err(e) => {

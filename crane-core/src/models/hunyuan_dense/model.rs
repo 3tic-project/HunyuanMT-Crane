@@ -127,10 +127,11 @@ impl Model {
         tokens: &[u32],
         positions: &[usize],
         attention_mask: Option<&Tensor>,
+        batch_kv_info: Option<(&[usize], usize)>,
     ) -> candle_core::Result<Tensor> {
         let n = positions.len();
         let input = Tensor::new(tokens, &self.device)?.reshape((n, 1))?;
-        self.inner.step_batch_decode(&input, positions, attention_mask)
+        self.inner.step_batch_decode(&input, positions, attention_mask, batch_kv_info)
     }
 
     /// Extract per-sequence KV caches from the model's batched state,
@@ -142,6 +143,58 @@ impl Model {
         rounds_done: usize,
     ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
         self.inner.extract_batch_kv(kv_lens, original_max_kv, rounds_done)
+    }
+
+    /// Graph-compatible decode step. All inputs are pre-allocated tensors;
+    /// caller updates contents before each graph replay.
+    pub fn step_batch_decode_graph(
+        &mut self,
+        input_ids: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention_mask: &Tensor,
+        write_pos: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        self.inner.step_batch_decode_graph(input_ids, cos, sin, attention_mask, write_pos)
+    }
+
+    /// Pre-allocate permanent KV cache buffers for graph mode.
+    pub fn preallocate_graph_kv(
+        &mut self,
+        max_batch: usize,
+        max_kv_len: usize,
+    ) -> candle_core::Result<()> {
+        self.inner.preallocate_graph_kv(max_batch, max_kv_len)
+    }
+
+    /// Load per-sequence KV caches into the permanent graph buffers.
+    pub fn load_kv_for_graph(
+        &mut self,
+        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+    ) -> candle_core::Result<(Vec<usize>, usize)> {
+        self.inner.load_kv_for_graph(seq_kv_caches)
+    }
+
+    /// Compute rotary embeddings for the given positions.
+    pub fn compute_rotary(
+        &mut self,
+        positions: &[usize],
+    ) -> candle_core::Result<(Tensor, Tensor)> {
+        self.inner.compute_rotary(positions)
+    }
+
+    /// Extract per-sequence KV from the permanent graph buffers.
+    pub fn extract_graph_kv(
+        &self,
+        kv_lens: &[usize],
+        rounds_done: usize,
+    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        self.inner.extract_graph_kv(kv_lens, rounds_done)
+    }
+
+    /// Access the model's half-head-dim for rotary embedding.
+    pub fn half_head_dim(&self) -> usize {
+        self.inner.config().head_dim() / 2
     }
 
     /// Number of transformer layers.

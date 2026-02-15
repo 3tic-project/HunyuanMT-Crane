@@ -4,7 +4,20 @@ use candle_nn::rotary_emb::rope;
 use serde::Deserialize;
 
 #[cfg(feature = "flash-attn")]
-use candle_flash_attn::flash_attn;
+use candle_flash_attn::{flash_attn, flash_attn_varlen};
+
+/// Pre-computed metadata for flash_attn_varlen in batched decode.
+///
+/// Built once per decode round in `step_batch_decode` and shared across
+/// all 28 transformer layers, eliminating 84 redundant CPU→GPU tensor
+/// transfers per round (3 per layer × 28 layers → just 3 total).
+#[allow(dead_code)]
+pub(crate) struct VarlenContext {
+    pub seqlens_q: Tensor,
+    pub seqlens_k: Tensor,
+    pub gather_index: Tensor,
+    pub max_seqlen_k: usize,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeScaling {
@@ -151,6 +164,10 @@ struct Attention {
     kv_cache: Option<(Tensor, Tensor)>,
     /// Number of valid (filled) positions in the KV cache buffer.
     cache_seq_len: usize,
+    /// When true, the KV cache covers the full pre-allocated buffer and
+    /// attention operates on the full width (masked). Used for CUDA-graph
+    /// compatible decode where tensor shapes must be fixed.
+    full_buffer_attn: bool,
     #[cfg(feature = "flash-attn")]
     use_flash_attn: bool,
 }
@@ -204,6 +221,7 @@ impl Attention {
             head_dim,
             kv_cache: None,
             cache_seq_len: 0,
+            full_buffer_attn: false,
             #[cfg(feature = "flash-attn")]
             use_flash_attn: true,
         })
@@ -272,14 +290,58 @@ impl Attention {
         }
     }
 
+    /// Scatter-based KV cache write using a position tensor.
+    ///
+    /// Writes new K/V at positions specified by `write_pos` using `scatter_set`.
+    /// Returns the **full** pre-allocated buffer (not narrowed), suitable for
+    /// attention with a mask. This makes the output shape fixed and compatible
+    /// with CUDA graph capture.
+    ///
+    /// # Arguments
+    /// - `k`, `v`: new data `[B, H, 1, D]`
+    /// - `write_pos`: `[B]` tensor of u32 write positions
+    fn update_kv_cache_scatter(
+        &mut self,
+        k: Tensor,
+        v: Tensor,
+        write_pos: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+        let (b, h, _one, d) = k.dims4()?;
+
+        match self.kv_cache {
+            Some((ref buf_k, ref buf_v)) => {
+                // Build scatter index: expand [B] → [B, H, 1, D]
+                let idx = write_pos
+                    .reshape((b, 1, 1, 1))?
+                    .expand((b, h, 1, d))?
+                    .contiguous()?;
+                buf_k.scatter_set(&idx, &k, 2)?;
+                buf_v.scatter_set(&idx, &v, 2)?;
+                // Return full buffer — caller uses mask for invalid positions.
+                Ok((buf_k.clone(), buf_v.clone()))
+            }
+            None => {
+                candle_core::bail!(
+                    "update_kv_cache_scatter called without pre-allocated buffer; \
+                     call setup_batch_decode first"
+                )
+            }
+        }
+    }
+
     fn forward(
         &mut self,
         hidden_states: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        write_pos: Option<&Tensor>,
+        varlen_ctx: Option<&VarlenContext>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = hidden_states.dims3()?;
+        let _ = &varlen_ctx; // suppress unused warning when flash-attn is off
 
         let q = self.q_proj.forward(hidden_states)?;
         let k = self.k_proj.forward(hidden_states)?;
@@ -313,22 +375,24 @@ impl Attention {
             k
         };
 
-        // KV cache — pre-allocated buffer with slice_set
-        let (k, v) = self.update_kv_cache(k, v)?;
+        // KV cache update — scatter-based (graph-compatible) or slice_set.
+        let (k, v) = if let Some(wp) = write_pos {
+            self.update_kv_cache_scatter(k, v, wp)?
+        } else {
+            self.update_kv_cache(k, v)?
+        };
 
         // ── Attention computation ──
         // Try flash attention first (eliminates repeat_kv + fuses SDPA into 1 kernel).
         // flash_attn handles GQA natively (num_heads_q != num_heads_kv).
         // Fall back to manual SDPA when a custom attention mask is needed
         // (e.g., batched decode with padding) since flash_attn only supports causal masking.
+        // When write_pos is Some (graph-capture mode), K/V are the full pre-allocated
+        // buffer — flash_attn cannot be used (it assumes valid-length data), so we
+        // always fall through to mask-based SDPA.
         #[cfg(feature = "flash-attn")]
         {
-            if self.use_flash_attn {
-                // flash_attn can replace the custom mask only when:
-                //   - No mask needed (decode, seq_len=1, no padding), OR
-                //   - Standard causal mask (prefill, seq_len>1)
-                // When attention_mask is Some AND seq_len==1, it means batched
-                // decode with padding — must fall back to manual SDPA.
+            if self.use_flash_attn && write_pos.is_none() {
                 let can_use_flash = attention_mask.is_none() || seq_len > 1;
                 if can_use_flash {
                     let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
@@ -338,16 +402,93 @@ impl Attention {
                     let k_fa = k.transpose(1, 2)?.contiguous()?;
                     let v_fa = v.transpose(1, 2)?.contiguous()?;
                     let attn_output = flash_attn(&q_fa, &k_fa, &v_fa, softmax_scale, causal)?;
-                    // attn_output: (B, S, num_heads, head_dim) → (B, S, hidden)
                     let attn_output = attn_output.reshape((b_sz, seq_len, ()))?;
                     return self.o_proj.forward(&attn_output);
+                }
+
+                // ── flash_attn_varlen for batched decode with heterogeneous KV lengths ──
+                // KV cache is RIGHT-ALIGNED: [padding | prefill_data | decode_data].
+                // Valid data per sequence is contiguous. We use the pre-computed
+                // VarlenContext (built once per round in step_batch_decode) to
+                // avoid redundant CPU→GPU transfers across the 28 layers.
+                if seq_len == 1 {
+                    if let Some(ctx) = varlen_ctx {
+                        let total_s = k.dim(2)?;
+
+                        // Q: [B, num_heads, 1, D] → [B, num_heads, D] (total_q = B)
+                        let q_packed = q.squeeze(2)?.contiguous()?;
+
+                        // K/V: [B, kv_heads, S, D] → [total_kv, kv_heads, D] via pre-computed index.
+                        let k_perm = k.transpose(1, 2)?.contiguous()?;
+                        let v_perm = v.transpose(1, 2)?.contiguous()?;
+                        let k_flat = k_perm.reshape((b_sz * total_s, self.num_kv_heads, self.head_dim))?;
+                        let v_flat = v_perm.reshape((b_sz * total_s, self.num_kv_heads, self.head_dim))?;
+                        let k_packed = k_flat.index_select(&ctx.gather_index, 0)?;
+                        let v_packed = v_flat.index_select(&ctx.gather_index, 0)?;
+
+                        let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
+
+                        let attn_output = flash_attn_varlen(
+                            &q_packed, &k_packed, &v_packed,
+                            &ctx.seqlens_q, &ctx.seqlens_k,
+                            1, ctx.max_seqlen_k,
+                            softmax_scale, false,
+                        )?;
+                        // [B, num_heads, D] → [B, 1, hidden_size]
+                        let attn_output = attn_output
+                            .reshape((b_sz, 1, self.num_heads * self.head_dim))?;
+                        return self.o_proj.forward(&attn_output);
+                    }
                 }
             }
         }
 
         // ── Manual SDPA fallback (with mask support) ──
-        // Expand KV heads for GQA
+        // Use grouped query attention: reshape Q into [B*kv_heads, n_rep, S, D]
+        // and use broadcasting with K/V [B*kv_heads, S, D] to avoid the expensive
+        // 7x KV head expansion (repeat_kv).
         let n_rep = self.num_heads / self.num_kv_heads;
+        let kv_s = k.dim(2)?;
+
+        if n_rep > 1 && seq_len == 1 {
+            // ── GQA-grouped SDPA for decode (seq_len=1) ──
+            // Q: [B, 28, 1, D] → [B, 4, 7, D] → [B*4, 7, D]
+            let q_g = q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))?
+                       .reshape((b_sz * self.num_kv_heads, n_rep, self.head_dim))?
+                       .contiguous()?;
+            // K: [B, 4, S, D] → [B*4, D, S]
+            let k_g = k.reshape((b_sz * self.num_kv_heads, kv_s, self.head_dim))?
+                       .transpose(D::Minus2, D::Minus1)?
+                       .contiguous()?;
+            // V: [B, 4, S, D] → [B*4, S, D]
+            let v_g = v.reshape((b_sz * self.num_kv_heads, kv_s, self.head_dim))?
+                       .contiguous()?;
+
+            let scale = 1.0 / (self.head_dim as f64).sqrt();
+            let attn_weights = (q_g.matmul(&k_g)? * scale)?; // [B*4, 7, S]
+
+            let attn_weights = match attention_mask {
+                Some(mask) => {
+                    // mask: [B, 1, 1, S] → [B, 4, 1, S] → [B*4, 1, S]
+                    let mask_g = mask
+                        .expand((b_sz, self.num_kv_heads, 1, kv_s))?
+                        .reshape((b_sz * self.num_kv_heads, 1, kv_s))?
+                        .contiguous()?;
+                    attn_weights.broadcast_add(&mask_g)?
+                }
+                None => attn_weights,
+            };
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_output = attn_weights.matmul(&v_g)?; // [B*4, 7, D]
+
+            // Reshape back: [B*4, 7, D] → [B, 28, D] → [B, 1, 28*D]
+            let attn_output = attn_output
+                .reshape((b_sz, self.num_heads, self.head_dim))?
+                .reshape((b_sz, 1, self.num_heads * self.head_dim))?;
+            return self.o_proj.forward(&attn_output);
+        }
+
+        // ── Standard SDPA for prefill or when n_rep == 1 ──
         let k = if n_rep > 1 {
             let (b, kv_heads, s, d) = k.dims4()?;
             k.unsqueeze(2)?
@@ -448,10 +589,12 @@ impl DecoderLayer {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
+        write_pos: Option<&Tensor>,
+        varlen_ctx: Option<&VarlenContext>,
     ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
-        let hidden_states = self.self_attn.forward(&hidden_states, cos, sin, attention_mask)?;
+        let hidden_states = self.self_attn.forward(&hidden_states, cos, sin, attention_mask, write_pos, varlen_ctx)?;
         let hidden_states = (residual + hidden_states)?;
 
         let residual = &hidden_states;
@@ -548,7 +691,7 @@ impl HunYuanDenseV1 {
 
         let mut hidden_states = hidden_states;
         for layer in self.layers.iter_mut() {
-            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref(), None, None)?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -692,6 +835,7 @@ impl HunYuanDenseV1 {
         input_ids: &Tensor,
         positions: &[usize],
         attention_mask: Option<&Tensor>,
+        batch_kv_info: Option<(&[usize], usize)>,
     ) -> Result<Tensor> {
         let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
 
@@ -712,9 +856,91 @@ impl HunYuanDenseV1 {
             .to_dtype(self.dtype)?
             .unsqueeze(1)?;
 
+        // Pre-compute varlen metadata ONCE per round, shared across all layers.
+        // This eliminates 84 redundant CPU→GPU transfers per round (3 per layer × 28).
+        #[cfg(feature = "flash-attn")]
+        let varlen_ctx = if let Some((kv_lens, max_kv)) = batch_kv_info {
+            let b_sz = kv_lens.len();
+            let cache_s = self.layers[0].self_attn.cache_seq_len;
+            let total_s = cache_s + 1; // after update_kv_cache appends 1 token
+            let decode_tokens = total_s - max_kv;
+
+            let seqlens_q_data: Vec<u32> = (0..=b_sz).map(|i| i as u32).collect();
+            let seqlens_q = Tensor::new(seqlens_q_data.as_slice(), device)?;
+
+            let valid_kv_lens: Vec<usize> = kv_lens.iter().map(|&l| l + decode_tokens).collect();
+            let mut seqlens_k_data = vec![0u32; b_sz + 1];
+            for i in 0..b_sz {
+                seqlens_k_data[i + 1] = seqlens_k_data[i] + valid_kv_lens[i] as u32;
+            }
+            let seqlens_k = Tensor::new(seqlens_k_data.as_slice(), device)?;
+
+            let total_kv: usize = valid_kv_lens.iter().sum();
+            let mut indices: Vec<i64> = Vec::with_capacity(total_kv);
+            for i in 0..b_sz {
+                let row_base = i * total_s;
+                let start = max_kv - kv_lens[i];
+                for j in start..total_s {
+                    indices.push((row_base + j) as i64);
+                }
+            }
+            let gather_index = Tensor::new(indices.as_slice(), device)?;
+            let max_seqlen_k = valid_kv_lens.iter().copied().max().unwrap_or(1);
+
+            Some(VarlenContext { seqlens_q, seqlens_k, gather_index, max_seqlen_k })
+        } else {
+            None
+        };
+
+        #[cfg(not(feature = "flash-attn"))]
+        let _ = batch_kv_info;
+
         let mut hidden_states = hidden_states;
         for layer in self.layers.iter_mut() {
-            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
+            #[cfg(feature = "flash-attn")]
+            {
+                hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask, None, varlen_ctx.as_ref())?;
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            {
+                hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask, None, None)?;
+            }
+        }
+
+        let hidden_states = self.norm.forward(&hidden_states)?;
+        self.lm_head.forward(&hidden_states) // [N, 1, vocab]
+    }
+
+    /// Graph-compatible batched decode step.
+    ///
+    /// Unlike `step_batch_decode`, all inputs are **pre-allocated tensors** —
+    /// no CPU→GPU copies happen inside this function. The caller updates the
+    /// tensors' contents (via `slice_set` / `copy_`) between graph replays.
+    ///
+    /// # Arguments
+    /// - `input_ids`: `[N, 1]` token IDs (u32)
+    /// - `cos`, `sin`: `[N, 1, dim/2]` rotary-embedding vectors
+    /// - `attention_mask`: `[N, 1, 1, max_kv_len]` mask (0.0 = attend, -1e9 = ignore)
+    /// - `write_pos`: `[N]` u32 positions to write into the KV buffer
+    ///
+    /// # Returns
+    /// Logits tensor `[N, 1, vocab_size]`.
+    pub fn step_batch_decode_graph(
+        &mut self,
+        input_ids: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention_mask: &Tensor,
+        write_pos: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
+
+        let mut hidden_states = hidden_states;
+        for layer in self.layers.iter_mut() {
+            hidden_states = layer.forward(
+                &hidden_states, cos, sin,
+                Some(attention_mask), Some(write_pos), None,
+            )?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -747,25 +973,15 @@ impl HunYuanDenseV1 {
                     let row_k = full_k.narrow(0, i, 1)?;
                     let row_v = full_v.narrow(0, i, 1)?;
 
-                    let clean = if kv_lens[i] == original_max_kv || rounds_done == 0 {
-                        // No padding gap to remove — contiguous data.
-                        let total = kv_lens[i] + rounds_done;
-                        Some((
-                            row_k.narrow(2, 0, total)?,
-                            row_v.narrow(2, 0, total)?,
-                        ))
-                    } else {
-                        // Padding at kv_lens[i]..original_max_kv.
-                        // Real data: 0..kv_lens[i]  +  original_max_kv..original_max_kv+rounds_done.
-                        let prefix_k = row_k.narrow(2, 0, kv_lens[i])?;
-                        let prefix_v = row_v.narrow(2, 0, kv_lens[i])?;
-                        let new_k = row_k.narrow(2, original_max_kv, rounds_done)?;
-                        let new_v = row_v.narrow(2, original_max_kv, rounds_done)?;
-                        Some((
-                            Tensor::cat(&[&prefix_k, &new_k], 2)?,
-                            Tensor::cat(&[&prefix_v, &new_v], 2)?,
-                        ))
-                    };
+                    // Right-aligned layout: valid data is always contiguous.
+                    // Prefill at [max_kv - kv_lens[i] .. max_kv],
+                    // decode at [max_kv .. max_kv + rounds_done].
+                    let total = kv_lens[i] + rounds_done;
+                    let offset = original_max_kv - kv_lens[i];
+                    let clean = Some((
+                        row_k.narrow(2, offset, total)?,
+                        row_v.narrow(2, offset, total)?,
+                    ));
                     result[i].push(clean);
                 }
             } else {
@@ -778,6 +994,166 @@ impl HunYuanDenseV1 {
         }
 
         Ok(result)
+    }
+
+    // ── CUDA Graph mode infrastructure ──
+
+    /// Pre-allocate PERMANENT KV cache buffers for all layers.
+    ///
+    /// These buffers have fixed shape `[max_batch, kv_heads, max_kv_len, head_dim]`
+    /// and their device-memory addresses are baked into CUDA graphs during
+    /// capture. Call this once at startup before `capture_decode_graph`.
+    pub fn preallocate_graph_kv(
+        &mut self,
+        max_batch: usize,
+        max_kv_len: usize,
+    ) -> candle_core::Result<()> {
+        let kv_heads = self.config.num_key_value_heads;
+        let head_dim = self.config.head_dim();
+        let device = self.embed_tokens.embeddings().device();
+        for layer in self.layers.iter_mut() {
+            let buf_k =
+                Tensor::zeros((max_batch, kv_heads, max_kv_len, head_dim), self.dtype, device)?;
+            let buf_v =
+                Tensor::zeros((max_batch, kv_heads, max_kv_len, head_dim), self.dtype, device)?;
+            layer.self_attn.kv_cache = Some((buf_k, buf_v));
+            layer.self_attn.cache_seq_len = 0;
+            layer.self_attn.full_buffer_attn = true;
+        }
+        Ok(())
+    }
+
+    /// Load per-sequence KV caches into the permanent graph buffers.
+    ///
+    /// Zeroes the entire permanent buffer, then writes each sequence's cached
+    /// KV data at batch-row `i` starting at seq-position 0.
+    ///
+    /// # Returns
+    /// `(kv_lens, max_kv_len)` — same semantics as `setup_batch_decode`.
+    pub fn load_kv_for_graph(
+        &mut self,
+        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+    ) -> candle_core::Result<(Vec<usize>, usize)> {
+        let n_seqs = seq_kv_caches.len();
+
+        // Compute per-sequence KV lengths from the first layer's cache.
+        let kv_lens: Vec<usize> = seq_kv_caches
+            .iter()
+            .map(|caches| {
+                caches
+                    .first()
+                    .and_then(|c| c.as_ref())
+                    .map(|(k, _)| k.dim(2).unwrap_or(0))
+                    .unwrap_or(0)
+            })
+            .collect();
+        let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0);
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let (ref buf_k, ref buf_v) = layer.self_attn.kv_cache.as_ref().ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "load_kv_for_graph: no pre-allocated KV buffer; \
+                     call preallocate_graph_kv first"
+                        .into(),
+                )
+            })?;
+            // Zero the entire buffer so dead/padding regions are clean.
+            buf_k.zero_set()?;
+            buf_v.zero_set()?;
+
+            // Write each sequence's KV at its batch row.
+            for (seq_idx, seq_caches) in seq_kv_caches.iter().enumerate() {
+                if let Some((ref k, ref v)) = seq_caches[layer_idx] {
+                    // k: [1, kv_heads, seq_len, head_dim]
+                    // Write into buf[seq_idx, :, 0..seq_len, :]
+                    // narrow(0, seq_idx, 1) gives a view of that batch row.
+                    let dest_k = buf_k.narrow(0, seq_idx, 1)?;
+                    let dest_v = buf_v.narrow(0, seq_idx, 1)?;
+                    dest_k.slice_set(&k.contiguous()?, 2, 0)?;
+                    dest_v.slice_set(&v.contiguous()?, 2, 0)?;
+                }
+            }
+            layer.self_attn.cache_seq_len = max_kv_len;
+        }
+
+        Ok((kv_lens, max_kv_len))
+    }
+
+    /// Compute rotary embeddings for given positions.
+    ///
+    /// Returns `(cos, sin)` with shape `[N, 1, head_dim/2]` in model dtype,
+    /// suitable for passing to `step_batch_decode_graph`.
+    pub fn compute_rotary(
+        &mut self,
+        positions: &[usize],
+    ) -> candle_core::Result<(Tensor, Tensor)> {
+        let device = self.embed_tokens.embeddings().device();
+        let max_pos = positions.iter().copied().max().unwrap_or(0) + 1;
+        let (full_cos, full_sin) = self.rotary_emb.forward(max_pos, device)?;
+
+        let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+        let pos_tensor = Tensor::new(pos_ids.as_slice(), device)?;
+        let cos = full_cos
+            .index_select(&pos_tensor, 0)?
+            .to_dtype(self.dtype)?
+            .unsqueeze(1)?;
+        let sin = full_sin
+            .index_select(&pos_tensor, 0)?
+            .to_dtype(self.dtype)?
+            .unsqueeze(1)?;
+        Ok((cos, sin))
+    }
+
+    /// Extract per-sequence KV caches from the graph buffers without
+    /// deallocating them. The permanent buffers remain intact for the
+    /// next graph replay batch.
+    ///
+    /// Unlike `extract_batch_kv`, this does NOT clear the model's KV cache.
+    pub fn extract_graph_kv(
+        &self,
+        kv_lens: &[usize],
+        rounds_done: usize,
+    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        let n_seqs = kv_lens.len();
+        let num_layers = self.layers.len();
+        let mut result: Vec<Vec<Option<(Tensor, Tensor)>>> =
+            (0..n_seqs).map(|_| Vec::with_capacity(num_layers)).collect();
+
+        for layer in self.layers.iter() {
+            if let Some((ref full_k, ref full_v)) = layer.self_attn.kv_cache {
+                for i in 0..n_seqs {
+                    let total = kv_lens[i] + rounds_done;
+                    let row_k = full_k.narrow(0, i, 1)?;
+                    let row_v = full_v.narrow(0, i, 1)?;
+                    // In graph mode, data is written contiguously at positions
+                    // 0..kv_lens[i] (from load_kv_for_graph) then at
+                    // kv_lens[i]..kv_lens[i]+rounds_done (from scatter_set during decode).
+                    // Wait — scatter_set writes at the POSITION specified, which
+                    // is the logical position (varies per sequence). So the data
+                    // IS at 0..total contiguously.
+                    result[i].push(Some((
+                        row_k.narrow(2, 0, total)?.contiguous()?,
+                        row_v.narrow(2, 0, total)?.contiguous()?,
+                    )));
+                }
+            } else {
+                for i in 0..n_seqs {
+                    result[i].push(None);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Access the model config.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Access the model dtype.
+    pub fn model_dtype(&self) -> DType {
+        self.dtype
     }
 }
 
@@ -800,7 +1176,9 @@ pub fn build_batch_decode_mask(
     let n = kv_lens.len();
     let mut mask_data = vec![0f32; n * total_width];
     for i in 0..n {
-        for j in kv_lens[i]..original_max_kv.min(total_width) {
+        // Right-aligned layout: padding at positions 0..pad_end.
+        let pad_end = (original_max_kv - kv_lens[i]).min(total_width);
+        for j in 0..pad_end {
             mask_data[i * total_width + j] = -1e9;
         }
     }
@@ -854,9 +1232,12 @@ fn pad_and_stack_kv_caches(
                 let cur_len = k.dim(2)?;
                 let pad_len = max_len - cur_len;
                 if pad_len > 0 {
+                    // Right-align: [padding | real_data] so that decode tokens
+                    // appended after max_kv form a contiguous valid range with
+                    // the pre-existing data, enabling flash_attn_varlen.
                     let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
-                    padded_ks.push(Tensor::cat(&[k.as_ref(), &pad], 2)?);
-                    padded_vs.push(Tensor::cat(&[v.as_ref(), &pad], 2)?);
+                    padded_ks.push(Tensor::cat(&[&pad, k.as_ref()], 2)?);
+                    padded_vs.push(Tensor::cat(&[&pad, v.as_ref()], 2)?);
                 } else {
                     padded_ks.push(k.clone());
                     padded_vs.push(v.clone());

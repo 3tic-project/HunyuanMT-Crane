@@ -20,7 +20,7 @@ use clap::Parser;
 use futures::stream::Stream;
 use serde_json::json;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crane_core::models::hunyuan_dense::Model;
 
@@ -62,6 +62,15 @@ struct Args {
     /// Tokens to decode per sequence before switching (higher = fewer KV swaps)
     #[arg(long, default_value_t = 16)]
     decode_tokens_per_seq: usize,
+
+    /// Enable CUDA graph capture for the decode path (reduces CPU dispatch overhead)
+    #[arg(long)]
+    cuda_graph: bool,
+
+    /// Maximum KV cache length for CUDA graph mode (prompt + generation).
+    /// Only used when --cuda-graph is set.
+    #[arg(long, default_value_t = 4096)]
+    max_kv_len: usize,
 }
 
 // ── App state ──
@@ -379,11 +388,23 @@ async fn main() -> Result<()> {
 
     // ── Start engine on dedicated thread ──
 
-    let (engine, handle) = InferenceEngine::new(
+    let (mut engine, handle) = InferenceEngine::new(
         model,
         args.max_concurrent,
         args.decode_tokens_per_seq,
     );
+
+    // ── CUDA graph warmup (if requested) ──
+    #[cfg(feature = "cuda")]
+    if args.cuda_graph && !args.cpu {
+        info!("Enabling CUDA graph capture (max_kv_len={})", args.max_kv_len);
+        engine.enable_cuda_graphs(args.max_kv_len);
+    }
+    #[cfg(not(feature = "cuda"))]
+    if args.cuda_graph {
+        warn!("--cuda-graph requires the 'cuda' feature; ignoring");
+    }
+
     std::thread::Builder::new()
         .name("inference-engine".into())
         .spawn(move || engine.run())
