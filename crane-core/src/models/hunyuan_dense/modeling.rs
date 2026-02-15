@@ -1,10 +1,79 @@
 use candle_core::{DType, Device, Module, Result, Tensor, D};
+use candle_core::quantized::{gguf_file, QTensor};
 use candle_nn::{linear_no_bias, Linear, RmsNorm, VarBuilder};
 use candle_nn::rotary_emb::rope;
 use serde::Deserialize;
+use std::io::{Read, Seek};
+use std::sync::Arc;
 
 #[cfg(feature = "flash-attn")]
 use candle_flash_attn::{flash_attn, flash_attn_varlen};
+
+// ── GGUF loading helper ──
+
+/// Wraps a parsed GGUF file + reader for convenient tensor loading.
+pub struct Gguf<R: Read + Seek> {
+    ct: gguf_file::Content,
+    reader: R,
+    device: Device,
+}
+
+impl<R: Read + Seek> Gguf<R> {
+    pub fn new(ct: gguf_file::Content, reader: R, device: Device) -> Self {
+        Self { ct, reader, device }
+    }
+
+    /// Load a quantized tensor and wrap as a LinearLayer (QMatMul).
+    pub fn linear(&mut self, name: &str) -> Result<LinearLayer> {
+        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
+        let qmm = candle_core::quantized::QMatMul::from_arc(Arc::new(ws))?;
+        Ok(LinearLayer::Quantized(qmm))
+    }
+
+    /// Load a tensor, dequantize, and create an RmsNorm.
+    pub fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
+        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
+        let weight = ws.dequantize(&self.device)?;
+        Ok(RmsNorm::new(weight, eps))
+    }
+
+    /// Load a tensor, dequantize, and create an Embedding.
+    pub fn embedding(&mut self, name: &str, hidden_size: usize) -> Result<candle_nn::Embedding> {
+        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
+        let weight = ws.dequantize(&self.device)?;
+        Ok(candle_nn::Embedding::new(weight, hidden_size))
+    }
+
+    /// Load a raw QTensor by name.
+    pub fn tensor(&mut self, name: &str) -> Result<QTensor> {
+        self.ct.tensor(&mut self.reader, name, &self.device)
+    }
+
+    /// Access GGUF metadata.
+    pub fn metadata(&self) -> &std::collections::HashMap<String, gguf_file::Value> {
+        &self.ct.metadata
+    }
+}
+
+// ── Polymorphic linear layer ──
+
+/// A linear layer that can be either a standard (f16/f32) Linear or a
+/// quantized QMatMul. Both implement Module::forward identically from the
+/// caller's perspective. This allows the same model code to serve both
+/// safetensors and GGUF weights with zero duplication.
+pub enum LinearLayer {
+    Standard(Linear),
+    Quantized(candle_core::quantized::QMatMul),
+}
+
+impl Module for LinearLayer {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Standard(l) => l.forward(xs),
+            Self::Quantized(q) => q.forward(xs),
+        }
+    }
+}
 
 /// Pre-computed metadata for flash_attn_varlen in batched decode.
 ///
@@ -150,10 +219,10 @@ impl RotaryEmbedding {
 }
 
 struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: LinearLayer,
+    k_proj: LinearLayer,
+    v_proj: LinearLayer,
+    o_proj: LinearLayer,
     query_layernorm: Option<RmsNorm>,
     key_layernorm: Option<RmsNorm>,
     num_heads: usize,
@@ -180,30 +249,73 @@ impl Attention {
         let bias = config.attention_bias();
 
         let q_proj = if bias {
-            candle_nn::linear(config.hidden_size, num_heads * head_dim, vb.pp("q_proj"))?
+            LinearLayer::Standard(candle_nn::linear(config.hidden_size, num_heads * head_dim, vb.pp("q_proj"))?)
         } else {
-            linear_no_bias(config.hidden_size, num_heads * head_dim, vb.pp("q_proj"))?
+            LinearLayer::Standard(linear_no_bias(config.hidden_size, num_heads * head_dim, vb.pp("q_proj"))?)
         };
         let k_proj = if bias {
-            candle_nn::linear(config.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?
+            LinearLayer::Standard(candle_nn::linear(config.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?)
         } else {
-            linear_no_bias(config.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?
+            LinearLayer::Standard(linear_no_bias(config.hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?)
         };
         let v_proj = if bias {
-            candle_nn::linear(config.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?
+            LinearLayer::Standard(candle_nn::linear(config.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?)
         } else {
-            linear_no_bias(config.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?
+            LinearLayer::Standard(linear_no_bias(config.hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?)
         };
         let o_proj = if bias {
-            candle_nn::linear(num_heads * head_dim, config.hidden_size, vb.pp("o_proj"))?
+            LinearLayer::Standard(candle_nn::linear(num_heads * head_dim, config.hidden_size, vb.pp("o_proj"))?)
         } else {
-            linear_no_bias(num_heads * head_dim, config.hidden_size, vb.pp("o_proj"))?
+            LinearLayer::Standard(linear_no_bias(num_heads * head_dim, config.hidden_size, vb.pp("o_proj"))?)
         };
 
         let (query_layernorm, key_layernorm) = if config.use_qk_norm {
             (
                 Some(candle_nn::rms_norm(head_dim, config.rms_norm_eps, vb.pp("query_layernorm"))?),
                 Some(candle_nn::rms_norm(head_dim, config.rms_norm_eps, vb.pp("key_layernorm"))?),
+            )
+        } else {
+            (None, None)
+        };
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            query_layernorm,
+            key_layernorm,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_cache: None,
+            cache_seq_len: 0,
+            full_buffer_attn: false,
+            #[cfg(feature = "flash-attn")]
+            use_flash_attn: true,
+        })
+    }
+
+    /// Construct from GGUF quantized weights.
+    fn new_from_gguf<R: Read + Seek>(
+        config: &Config,
+        gg: &mut Gguf<R>,
+        layer_idx: usize,
+    ) -> Result<Self> {
+        let head_dim = config.head_dim();
+        let num_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
+        let prefix = format!("blk.{layer_idx}");
+
+        let q_proj = gg.linear(&format!("{prefix}.attn_q.weight"))?;
+        let k_proj = gg.linear(&format!("{prefix}.attn_k.weight"))?;
+        let v_proj = gg.linear(&format!("{prefix}.attn_v.weight"))?;
+        let o_proj = gg.linear(&format!("{prefix}.attn_output.weight"))?;
+
+        let (query_layernorm, key_layernorm) = if config.use_qk_norm {
+            (
+                Some(gg.rms_norm(&format!("{prefix}.attn_q_norm.weight"), config.rms_norm_eps)?),
+                Some(gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), config.rms_norm_eps)?),
             )
         } else {
             (None, None)
@@ -532,16 +644,28 @@ impl Attention {
 }
 
 struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: LinearLayer,
+    up_proj: LinearLayer,
+    down_proj: LinearLayer,
 }
 
 impl Mlp {
     fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = linear_no_bias(config.hidden_size, config.intermediate_size, vb.pp("gate_proj"))?;
-        let up_proj = linear_no_bias(config.hidden_size, config.intermediate_size, vb.pp("up_proj"))?;
-        let down_proj = linear_no_bias(config.intermediate_size, config.hidden_size, vb.pp("down_proj"))?;
+        let gate_proj = LinearLayer::Standard(linear_no_bias(config.hidden_size, config.intermediate_size, vb.pp("gate_proj"))?);
+        let up_proj = LinearLayer::Standard(linear_no_bias(config.hidden_size, config.intermediate_size, vb.pp("up_proj"))?);
+        let down_proj = LinearLayer::Standard(linear_no_bias(config.intermediate_size, config.hidden_size, vb.pp("down_proj"))?);
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
+    }
+
+    fn new_from_gguf<R: Read + Seek>(gg: &mut Gguf<R>, layer_idx: usize) -> Result<Self> {
+        let prefix = format!("blk.{layer_idx}");
+        let gate_proj = gg.linear(&format!("{prefix}.ffn_gate.weight"))?;
+        let up_proj = gg.linear(&format!("{prefix}.ffn_up.weight"))?;
+        let down_proj = gg.linear(&format!("{prefix}.ffn_down.weight"))?;
         Ok(Self {
             gate_proj,
             up_proj,
@@ -583,6 +707,20 @@ impl DecoderLayer {
         })
     }
 
+    fn new_from_gguf<R: Read + Seek>(config: &Config, gg: &mut Gguf<R>, layer_idx: usize) -> Result<Self> {
+        let self_attn = Attention::new_from_gguf(config, gg, layer_idx)?;
+        let mlp = Mlp::new_from_gguf(gg, layer_idx)?;
+        let prefix = format!("blk.{layer_idx}");
+        let input_layernorm = gg.rms_norm(&format!("{prefix}.attn_norm.weight"), config.rms_norm_eps)?;
+        let post_attention_layernorm = gg.rms_norm(&format!("{prefix}.ffn_norm.weight"), config.rms_norm_eps)?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        })
+    }
+
     fn forward(
         &mut self,
         hidden_states: &Tensor,
@@ -612,7 +750,7 @@ pub struct HunYuanDenseV1 {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
-    lm_head: Linear,
+    lm_head: LinearLayer,
     rotary_emb: RotaryEmbedding,
     config: Config,
     dtype: DType,
@@ -634,9 +772,9 @@ impl HunYuanDenseV1 {
         let norm = candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, model_vb.pp("norm"))?;
 
         let lm_head = if config.tie_word_embeddings {
-            Linear::new(embed_tokens.embeddings().clone(), None)
+            LinearLayer::Standard(Linear::new(embed_tokens.embeddings().clone(), None))
         } else {
-            linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?
+            LinearLayer::Standard(linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?)
         };
 
         let rotary_emb = RotaryEmbedding::new(config, vb.device())?;
@@ -648,6 +786,131 @@ impl HunYuanDenseV1 {
             lm_head,
             rotary_emb,
             config: config.clone(),
+            dtype,
+        })
+    }
+
+    /// Construct from a GGUF file. Reads config from GGUF metadata and loads
+    /// all weights as quantized tensors (QMatMul for linear layers, dequantized
+    /// for embeddings and norms).
+    pub fn from_gguf<R: Read + Seek>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+    ) -> Result<Self> {
+        let mut gg = Gguf::new(ct, reader, device.clone());
+        let md_get = |s: &str| match gg.metadata().get(s) {
+            None => candle_core::bail!("cannot find {s} in GGUF metadata"),
+            Some(v) => Ok(v.clone()),
+        };
+
+        // Detect architecture prefix (e.g. "qwen2", "qwen3", "llama")
+        let arch = gg
+            .metadata()
+            .get("general.architecture")
+            .and_then(|v| v.to_string().ok())
+            .map(|s| s.clone())
+            .unwrap_or_else(|| "qwen2".to_string());
+
+        let num_attention_heads = md_get(&format!("{arch}.attention.head_count"))?.to_u32()? as usize;
+        let num_kv_heads = md_get(&format!("{arch}.attention.head_count_kv"))?.to_u32()? as usize;
+        let head_dim = gg
+            .metadata()
+            .get(&format!("{arch}.attention.key_length"))
+            .and_then(|v| v.to_u32().ok())
+            .unwrap_or(128) as usize;
+        let num_hidden_layers = md_get(&format!("{arch}.block_count"))?.to_u32()? as usize;
+        let hidden_size = md_get(&format!("{arch}.embedding_length"))?.to_u32()? as usize;
+        let intermediate_size = md_get(&format!("{arch}.feed_forward_length"))?.to_u32()? as usize;
+        let max_position_embeddings = gg
+            .metadata()
+            .get(&format!("{arch}.context_length"))
+            .and_then(|v| v.to_u32().ok())
+            .unwrap_or(32768) as usize;
+        let rms_norm_eps = gg
+            .metadata()
+            .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
+            .and_then(|v| v.to_f32().ok())
+            .unwrap_or(1e-6) as f64;
+        let rope_theta = gg
+            .metadata()
+            .get(&format!("{arch}.rope.freq_base"))
+            .and_then(|v| v.to_f32().ok())
+            .unwrap_or(10_000.0) as f64;
+
+        // Vocab size from embedding tensor
+        let vocab_size = {
+            let emb_info = gg.metadata(); // metadata doesn't have this; infer from tensor
+            drop(emb_info);
+            // We'll infer from the embedding tensor after loading
+            0usize // placeholder, updated below
+        };
+
+        // Check for QK norm by probing tensor existence
+        let use_qk_norm = gg.ct.tensor_infos.contains_key("blk.0.attn_q_norm.weight");
+
+        // Check for tied embeddings
+        let tie_word_embeddings = !gg.ct.tensor_infos.contains_key("output.weight");
+
+        // Build config
+        let config = Config {
+            vocab_size: 0, // updated below
+            hidden_size,
+            intermediate_size,
+            num_hidden_layers,
+            num_attention_heads: num_attention_heads,
+            num_key_value_heads: num_kv_heads,
+            head_dim: Some(head_dim),
+            hidden_act: "silu".to_string(),
+            max_position_embeddings,
+            rms_norm_eps,
+            rope_theta: Some(rope_theta),
+            rope_scaling: None,
+            attention_bias: Some(false),
+            use_qk_norm,
+            tie_word_embeddings,
+            use_cla: None,
+            cla_share_factor: None,
+        };
+
+        // Use F16 as the compute dtype for CUDA, F32 for CPU
+        let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+
+        // Load embedding
+        let embed_tokens = gg.embedding("token_embd.weight", hidden_size)?;
+        let actual_vocab_size = embed_tokens.embeddings().dim(0)?;
+
+        // Update config with actual vocab size
+        let config = Config {
+            vocab_size: actual_vocab_size,
+            ..config
+        };
+
+        // Build layers
+        let mut layers = Vec::with_capacity(num_hidden_layers);
+        for i in 0..num_hidden_layers {
+            layers.push(DecoderLayer::new_from_gguf(&config, &mut gg, i)?);
+        }
+
+        // Final norm
+        let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
+
+        // LM head (may be tied to embeddings)
+        let lm_head = if tie_word_embeddings {
+            LinearLayer::Standard(Linear::new(embed_tokens.embeddings().clone(), None))
+        } else {
+            gg.linear("output.weight")?
+        };
+
+        let rotary_emb = RotaryEmbedding::new(&config, device)?;
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            rotary_emb,
+            config,
             dtype,
         })
     }

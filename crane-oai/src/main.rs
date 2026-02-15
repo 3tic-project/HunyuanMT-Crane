@@ -22,7 +22,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crane_core::models::hunyuan_dense::Model;
+use crane_core::models::hunyuan_dense::{Model, ModelFormat};
 
 use engine::{EngineHandle, EngineResponse, InferenceEngine, StatsSnapshot};
 use openai_api::*;
@@ -71,6 +71,10 @@ struct Args {
     /// Only used when --cuda-graph is set.
     #[arg(long, default_value_t = 4096)]
     max_kv_len: usize,
+
+    /// Model weight format: auto (detect from path), safetensors, or gguf
+    #[arg(long, default_value = "auto")]
+    format: String,
 }
 
 // ── App state ──
@@ -377,8 +381,13 @@ async fn main() -> Result<()> {
 
     // ── Load model ──
 
-    let mut model = Model::new(&args.model_path, &device, &dtype)?;
-    info!("Model loaded successfully");
+    let format = match args.format.as_str() {
+        "safetensors" => ModelFormat::Safetensors,
+        "gguf" => ModelFormat::Gguf,
+        _ => ModelFormat::Auto,
+    };
+    let mut model = Model::new_with_format(&args.model_path, &device, &dtype, format)?;
+    info!("Model loaded successfully (format: {:?})", format);
 
     model.warmup();
     info!("Model warmed up");
