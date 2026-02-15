@@ -233,11 +233,11 @@ impl Attention {
             .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // Apply rotary embeddings
-        // cos/sin: [total_len, head_dim] -> need to broadcast to [1, 1, seq_len, head_dim]
-        let cos = cos.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, seq_len, head_dim]
-        let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
-        let (q, k) = apply_rotary_pos_emb(&q, &k, &cos, &sin)?;
+        // Apply rotary embeddings.
+        // cos/sin are pre-shaped by the caller:
+        //   Single-sequence: [1, 1, seq_len, head_dim]
+        //   Batched decode:  [N, 1, 1, head_dim]
+        let (q, k) = apply_rotary_pos_emb(&q, &k, cos, sin)?;
 
         // Apply QK norm after RoPE
         let q = if let Some(ref norm) = self.query_layernorm {
@@ -435,6 +435,9 @@ impl HunYuanDenseV1 {
         // Slice for current positions; cast to model dtype (RoPE computes in F32)
         let cos = full_cos.narrow(0, start_pos, seq_len)?.to_dtype(self.dtype)?;
         let sin = full_sin.narrow(0, start_pos, seq_len)?.to_dtype(self.dtype)?;
+        // Shape for attention: [1, 1, seq_len, head_dim]
+        let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
+        let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
 
         // Build causal mask
         let attention_mask = if seq_len > 1 {
@@ -498,4 +501,203 @@ impl HunYuanDenseV1 {
             layer.self_attn.kv_cache = cache;
         }
     }
+
+    /// Batched decode forward: process N sequences in ONE forward pass.
+    ///
+    /// Each sequence contributes exactly 1 new token. KV caches are padded
+    /// and stacked so the GPU processes all sequences in parallel, giving
+    /// much higher utilization than N sequential single-token forward passes.
+    ///
+    /// # Arguments
+    /// - `input_ids` — `[N, 1]` tensor (one token per sequence)
+    /// - `positions` — start position for each sequence (= cached KV length)
+    /// - `seq_kv_caches` — per-sequence, per-layer KV caches `[n_seqs][n_layers]`
+    ///
+    /// # Returns
+    /// `(logits, updated_seq_kv_caches)` where logits is `[N, 1, vocab]`.
+    pub fn forward_batch_decode(
+        &mut self,
+        input_ids: &Tensor,
+        positions: &[usize],
+        seq_kv_caches: Vec<Vec<Option<(Tensor, Tensor)>>>,
+    ) -> Result<(Tensor, Vec<Vec<Option<(Tensor, Tensor)>>>)> {
+        let n_seqs = positions.len();
+        let device = input_ids.device();
+        let head_dim = self.config.head_dim();
+        let kv_heads = self.config.num_key_value_heads;
+
+        // 1. Embed: [N, 1] → [N, 1, hidden]
+        let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
+
+        // 2. RoPE: gather cos/sin for each sequence's position
+        let max_pos = positions.iter().copied().max().unwrap_or(0) + 1;
+        let (full_cos, full_sin) = self.rotary_emb.forward(max_pos, device)?;
+
+        let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+        let pos_tensor = Tensor::new(pos_ids.as_slice(), device)?;
+        // [N, head_dim] → [N, 1, 1, head_dim] for broadcasting in attention
+        let cos = full_cos
+            .index_select(&pos_tensor, 0)?
+            .to_dtype(self.dtype)?
+            .unsqueeze(1)?
+            .unsqueeze(1)?;
+        let sin = full_sin
+            .index_select(&pos_tensor, 0)?
+            .to_dtype(self.dtype)?
+            .unsqueeze(1)?
+            .unsqueeze(1)?;
+
+        // 3. Build attention mask for KV padding
+        let kv_lens: &[usize] = positions; // cached length = start_pos
+        let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0);
+        let total_kv = max_kv_len + 1; // cached + new token
+
+        let attention_mask = if max_kv_len > 0 {
+            let has_padding = kv_lens.iter().any(|&l| l < max_kv_len);
+            if has_padding {
+                // Mask layout per sequence i: positions 0..kv_lens[i] are real,
+                // kv_lens[i]..max_kv_len are padding (→ -1e9), max_kv_len is new token (→ 0).
+                let mut mask_data = vec![0f32; n_seqs * total_kv];
+                for i in 0..n_seqs {
+                    for j in kv_lens[i]..max_kv_len {
+                        mask_data[i * total_kv + j] = -1e9;
+                    }
+                }
+                let mask = Tensor::from_vec(mask_data, (n_seqs, total_kv), device)?
+                    .to_dtype(self.dtype)?;
+                Some(mask.unsqueeze(1)?.unsqueeze(1)?) // [N, 1, 1, total_kv]
+            } else {
+                None // All same length, no padding needed
+            }
+        } else {
+            None // No cached data (shouldn't happen in decode)
+        };
+
+        // 4. Process each layer
+        let num_layers = self.layers.len();
+        let mut updated_seq_caches: Vec<Vec<Option<(Tensor, Tensor)>>> =
+            (0..n_seqs).map(|_| Vec::with_capacity(num_layers)).collect();
+
+        let mut hidden_states = hidden_states;
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            // Gather per-sequence caches for this layer
+            let layer_caches: Vec<&Option<(Tensor, Tensor)>> =
+                seq_kv_caches.iter().map(|seq| &seq[layer_idx]).collect();
+
+            // Pad and stack into batched KV cache
+            let batched_kv = pad_and_stack_kv_caches(
+                &layer_caches, max_kv_len, kv_heads, head_dim, device, self.dtype,
+            )?;
+
+            // Set batched KV cache in the attention layer
+            layer.self_attn.kv_cache = batched_kv;
+
+            // Forward (attention automatically concatenates new K,V to cache)
+            hidden_states =
+                layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+
+            // Extract new KV entries and append to each sequence's original cache.
+            // After the concat in attention, the batched cache is:
+            //   [N, kv_heads, max_kv_len+1, head_dim]
+            // The NEW token's K,V is at position max_kv_len (the last one appended).
+            if let Some((ref full_k, ref full_v)) = layer.self_attn.kv_cache {
+                let new_k_all = full_k.narrow(2, max_kv_len, 1)?; // [N, kv_heads, 1, d]
+                let new_v_all = full_v.narrow(2, max_kv_len, 1)?;
+
+                for i in 0..n_seqs {
+                    let new_k_i = new_k_all.narrow(0, i, 1)?; // [1, kv_heads, 1, d]
+                    let new_v_i = new_v_all.narrow(0, i, 1)?;
+
+                    let updated = match &layer_caches[i] {
+                        Some((old_k, old_v)) => Some((
+                            Tensor::cat(&[old_k.as_ref(), &new_k_i], 2)?,
+                            Tensor::cat(&[old_v.as_ref(), &new_v_i], 2)?,
+                        )),
+                        None => Some((new_k_i, new_v_i)),
+                    };
+                    updated_seq_caches[i].push(updated);
+                }
+            } else {
+                for i in 0..n_seqs {
+                    updated_seq_caches[i].push(None);
+                }
+            }
+
+            // Free batched KV to release memory
+            layer.self_attn.kv_cache = None;
+        }
+
+        // 5. Final norm + lm_head
+        let hidden_states = self.norm.forward(&hidden_states)?;
+        let logits = self.lm_head.forward(&hidden_states)?; // [N, 1, vocab]
+
+        Ok((logits, updated_seq_caches))
+    }
+}
+
+/// Pad per-sequence KV caches to `max_len` and stack into a batched tensor.
+///
+/// Returns `Some((K, V))` with shape `[N, kv_heads, max_len, head_dim]`,
+/// or `None` if `max_len == 0`.
+fn pad_and_stack_kv_caches(
+    caches: &[&Option<(Tensor, Tensor)>],
+    max_len: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Option<(Tensor, Tensor)>> {
+    if max_len == 0 {
+        return Ok(None);
+    }
+
+    let n = caches.len();
+    let mut padded_ks = Vec::with_capacity(n);
+    let mut padded_vs = Vec::with_capacity(n);
+
+    // Pre-allocate a zero tensor for padding (shared across sequences)
+    let max_pad_needed = caches
+        .iter()
+        .map(|c| match c {
+            Some((k, _)) => max_len.saturating_sub(k.dim(2).unwrap_or(0)),
+            None => max_len,
+        })
+        .max()
+        .unwrap_or(0);
+    let zero_pad = if max_pad_needed > 0 {
+        Some(Tensor::zeros(
+            (1, kv_heads, max_pad_needed, head_dim),
+            dtype,
+            device,
+        )?)
+    } else {
+        None
+    };
+
+    for cache in caches {
+        match cache {
+            Some((k, v)) => {
+                let cur_len = k.dim(2)?;
+                let pad_len = max_len - cur_len;
+                if pad_len > 0 {
+                    let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
+                    padded_ks.push(Tensor::cat(&[k.as_ref(), &pad], 2)?);
+                    padded_vs.push(Tensor::cat(&[v.as_ref(), &pad], 2)?);
+                } else {
+                    padded_ks.push(k.clone());
+                    padded_vs.push(v.clone());
+                }
+            }
+            None => {
+                let zeros = Tensor::zeros((1, kv_heads, max_len, head_dim), dtype, device)?;
+                padded_ks.push(zeros.clone());
+                padded_vs.push(zeros);
+            }
+        }
+    }
+
+    let stacked_k = Tensor::cat(&padded_ks, 0)?; // [N, kv_heads, max_len, head_dim]
+    let stacked_v = Tensor::cat(&padded_vs, 0)?;
+    Ok(Some((stacked_k, stacked_v)))
 }

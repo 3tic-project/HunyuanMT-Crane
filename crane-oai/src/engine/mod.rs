@@ -184,28 +184,22 @@ pub struct StatsSnapshot {
 ///   2. Detect & cancel disconnected clients
 ///   3. Scheduler picks next batch (prefill > decode)
 ///   4. Prefill step: run full prompt for ONE new sequence
-///      - Single sequence, no KV swap needed
-///   5. Decode step: iterate running sequences
-///      - Prioritize the currently-loaded sequence to avoid KV swaps
-///      - Swap KV caches only when switching sequences
-///      - Produce one token per sequence per round
-///      - Check for cancellations between sequences
+///      - Single sequence, uses model's internal KV cache
+///   5. Decode step: TRUE BATCHED forward for ALL running sequences
+///      - Collect all sequences' KV caches
+///      - Pad + stack into batched tensors
+///      - ONE forward pass with batch dim N
+///      - Sample per-sequence, distribute updated KV caches
 ///   6. If idle → blocking wait for new request
 /// ```
 ///
 /// # GPU utilization strategy
 ///
-/// Without paged attention, true batched decode (concatenating multiple
-/// sequences into one forward pass) is not feasible with candle's
-/// concat-based KV cache. Instead, we maximize GPU utilization by:
-///
-/// - **Minimizing KV cache swaps**: Decode multiple tokens for the
-///   currently-loaded sequence before switching to the next one
-///   (controlled by `decode_tokens_per_seq`).
-/// - **Prefill priority**: New sequences get prefilled immediately,
-///   which is a large compute-bound operation that utilizes the GPU well.
-/// - **Cancellation detection**: Freed GPU time from cancelled requests
-///   is immediately available for other sequences.
+/// Decode uses `Model::forward_batch_decode` which pads all sequences'
+/// KV caches to the same length, stacks them into `[N, kv_heads, max_len,
+/// head_dim]`, and runs ONE forward pass through the entire model. This
+/// gives the GPU a much larger workload per kernel launch compared to N
+/// sequential single-token forward passes.
 pub struct InferenceEngine {
     model: Model,
     sequences: HashMap<String, Sequence>,
@@ -481,59 +475,111 @@ impl InferenceEngine {
         }
     }
 
-    /// Decode step for all running sequences.
+    /// Decode step for all running sequences — TRUE BATCHED forward.
     ///
-    /// Key optimization: for each sequence, decode `decode_tokens_per_seq`
-    /// tokens before moving to the next, reducing KV cache swap overhead.
-    /// Between sequences, check for new requests and cancellations.
+    /// Instead of N sequential single-token forward passes with KV swapping,
+    /// this collects all sequences' KV caches, pads + stacks them into batched
+    /// tensors, and runs ONE forward pass through the model with batch dim N.
+    /// This dramatically improves GPU utilization.
     fn step_decode_batch(&mut self, batch: Vec<String>) {
-        let batch_size = batch.len();
         let t0 = Instant::now();
+
+        // 1. Filter cancelled sequences before the expensive forward pass.
+        let cancelled: Vec<String> = batch
+            .iter()
+            .filter(|id| {
+                self.sequences
+                    .get(id.as_str())
+                    .map_or(true, |s| s.response_tx.is_closed())
+            })
+            .cloned()
+            .collect();
+        for id in &cancelled {
+            warn!(id = %id, "Client disconnected before decode batch");
+            self.stats.cancelled_requests.fetch_add(1, Ordering::Relaxed);
+            self.cleanup_sequence(id);
+        }
+        let batch: Vec<String> = batch
+            .into_iter()
+            .filter(|id| !cancelled.contains(id))
+            .collect();
+        if batch.is_empty() {
+            return;
+        }
+
+        let batch_size = batch.len();
+
+        // 2. Flush model's internal KV cache state (stale from prior prefill).
+        if let Some(ref prev_id) = self.active_seq_id.take() {
+            // swap_out already saved the cache during prefill; just clear model state.
+            if self.sequences.contains_key(prev_id) {
+                let caches = self.model.get_kv_caches();
+                if let Some(seq) = self.sequences.get_mut(prev_id) {
+                    seq.kv_caches = caches;
+                }
+            }
+            self.model.clear_kv_cache();
+        }
+
+        // 3. Run `decode_tokens_per_seq` rounds of batched forward.
         let mut total_tokens_this_step = 0u64;
-        let mut finished_ids = Vec::new();
+        let mut live_batch = batch.clone();
 
-        for seq_id in &batch {
-            // Check for cancellation before processing.
-            if !self.sequences.contains_key(seq_id) {
-                continue; // Already cleaned up.
-            }
-            if self.sequences[seq_id].response_tx.is_closed() {
-                warn!(id = %seq_id, "Client disconnected during decode batch");
-                self.stats.cancelled_requests.fetch_add(1, Ordering::Relaxed);
-                self.cleanup_sequence(seq_id);
-                continue;
+        for _round in 0..self.decode_tokens_per_seq {
+            if live_batch.is_empty() {
+                break;
             }
 
-            // Swap in this sequence's KV cache.
-            self.swap_in(seq_id);
+            // Collect input tokens, positions, and KV caches.
+            let mut tokens = Vec::with_capacity(live_batch.len());
+            let mut positions = Vec::with_capacity(live_batch.len());
+            let mut kv_caches = Vec::with_capacity(live_batch.len());
 
-            // Decode multiple tokens for this sequence before switching.
-            for _tok_idx in 0..self.decode_tokens_per_seq {
-                let (input_ids, start_pos) = {
-                    let seq = self.sequences.get(seq_id).unwrap();
-                    (seq.next_input_ids().to_vec(), seq.start_pos())
-                };
+            for seq_id in &live_batch {
+                let seq = self.sequences.get(seq_id).unwrap();
+                tokens.push(*seq.tokens.last().unwrap());
+                positions.push(seq.start_pos());
+                kv_caches.push(seq.kv_caches.clone()); // Arc-based, cheap
+            }
 
-                let logits = match self.model.forward_step(&input_ids, start_pos) {
-                    Ok(l) => l,
+            // ONE batched forward pass for ALL sequences.
+            let (logits, updated_caches) =
+                match self.model.forward_batch_decode(&tokens, &positions, kv_caches) {
+                    Ok(r) => r,
                     Err(e) => {
-                        self.send_error(seq_id, &format!("Decode forward failed: {e}"));
-                        break;
+                        error!("Batched decode forward failed: {e}");
+                        for seq_id in &live_batch {
+                            self.send_error(seq_id, &format!("Batched decode failed: {e}"));
+                        }
+                        return;
                     }
                 };
 
-                let next_token = match self.sample(seq_id, &logits) {
+            // Sample and update each sequence.
+            let mut finished_ids = Vec::new();
+
+            for (i, seq_id) in live_batch.iter().enumerate() {
+                // Extract this sequence's logits: [1, 1, vocab]
+                let seq_logits = match logits.narrow(0, i, 1) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        self.send_error(seq_id, &format!("Logits extraction failed: {e}"));
+                        continue;
+                    }
+                };
+
+                let next_token = match self.sample(seq_id, &seq_logits) {
                     Ok(t) => t,
                     Err(e) => {
                         self.send_error(seq_id, &format!("Sampling failed: {e}"));
-                        break;
+                        continue;
                     }
                 };
 
-                // Update sequence.
-                {
-                    let seq = self.sequences.get_mut(seq_id).unwrap();
+                // Update sequence state and KV caches.
+                if let Some(seq) = self.sequences.get_mut(seq_id) {
                     seq.tokens.push(next_token);
+                    seq.kv_caches = updated_caches[i].clone();
                 }
 
                 total_tokens_this_step += 1;
@@ -544,25 +590,26 @@ impl InferenceEngine {
                 // Check termination.
                 if self.sequences.get(seq_id).map_or(true, |s| s.should_stop()) {
                     finished_ids.push(seq_id.clone());
-                    break;
                 }
-
-                // Check for client disconnect mid-generation.
-                if self.sequences.get(seq_id).map_or(true, |s| s.response_tx.is_closed()) {
-                    warn!(id = %seq_id, "Client disconnected mid-decode");
+                // Check disconnect.
+                else if self
+                    .sequences
+                    .get(seq_id)
+                    .map_or(true, |s| s.response_tx.is_closed())
+                {
+                    warn!(id = %seq_id, "Client disconnected mid-batch-decode");
                     self.stats.cancelled_requests.fetch_add(1, Ordering::Relaxed);
                     self.cleanup_sequence(seq_id);
-                    break;
                 }
             }
 
-            // Swap out before moving to next sequence.
-            self.swap_out(seq_id);
-        }
+            // Finish completed sequences.
+            for id in &finished_ids {
+                self.finish_sequence(id);
+            }
 
-        // Finish completed sequences.
-        for id in &finished_ids {
-            self.finish_sequence(id);
+            // Remove finished/cancelled from live_batch for next round.
+            live_batch.retain(|id| self.sequences.contains_key(id));
         }
 
         let decode_us = t0.elapsed().as_micros() as u64;
@@ -581,7 +628,7 @@ impl InferenceEngine {
                 tokens = total_tokens_this_step,
                 decode_ms = decode_us / 1000,
                 tok_s = format!("{:.1}", tok_s),
-                "Decode step complete",
+                "Batched decode step complete",
             );
         }
 

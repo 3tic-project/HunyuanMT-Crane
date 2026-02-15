@@ -103,6 +103,21 @@ impl Model {
         self.inner.forward(&input, start_pos)
     }
 
+    /// Batched decode: run N sequences in ONE forward pass, each producing 1 token.
+    ///
+    /// Returns (logits `[N, 1, vocab]`, updated per-sequence KV caches).
+    pub fn forward_batch_decode(
+        &mut self,
+        tokens: &[u32],          // N tokens, one per sequence
+        positions: &[usize],     // start_pos for each sequence
+        seq_kv_caches: Vec<Vec<Option<(Tensor, Tensor)>>>,
+    ) -> candle_core::Result<(Tensor, Vec<Vec<Option<(Tensor, Tensor)>>>)> {
+        let n = positions.len();
+        // Build [N, 1] input tensor
+        let input = Tensor::new(tokens, &self.device)?.reshape((n, 1))?;
+        self.inner.forward_batch_decode(&input, positions, seq_kv_caches)
+    }
+
     /// Number of transformer layers.
     pub fn num_layers(&self) -> usize {
         self.inner.num_layers()
