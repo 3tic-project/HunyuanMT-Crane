@@ -107,11 +107,15 @@ impl Model {
     /// as a batched `[N, kv_heads, max_kv_len, head_dim]` tensor.
     ///
     /// Returns `(kv_lens, max_kv_len)` for building masks and later extraction.
+    ///
+    /// `extra_room`: number of decode tokens to pre-allocate in the KV buffer
+    /// (avoids `Tensor::cat` reallocation during multi-round decode).
     pub fn setup_batch_decode(
         &mut self,
         seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        extra_room: usize,
     ) -> candle_core::Result<(Vec<usize>, usize)> {
-        self.inner.setup_batch_decode(seq_kv_caches)
+        self.inner.setup_batch_decode(seq_kv_caches, extra_room)
     }
 
     /// Run one batched decode step using the model's existing batched KV cache.

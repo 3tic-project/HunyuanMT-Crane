@@ -2,6 +2,9 @@ use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{linear_no_bias, Linear, RmsNorm, VarBuilder};
 use serde::Deserialize;
 
+#[cfg(feature = "flash-attn")]
+use candle_flash_attn::flash_attn;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeScaling {
     pub alpha: Option<f64>,
@@ -151,7 +154,11 @@ struct Attention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    /// Pre-allocated KV cache buffer. May be larger than `cache_seq_len` to
+    /// allow in-place `slice_set` writes without reallocation.
     kv_cache: Option<(Tensor, Tensor)>,
+    /// Number of valid (filled) positions in the KV cache buffer.
+    cache_seq_len: usize,
     #[cfg(feature = "flash-attn")]
     use_flash_attn: bool,
 }
@@ -204,9 +211,73 @@ impl Attention {
             num_kv_heads,
             head_dim,
             kv_cache: None,
+            cache_seq_len: 0,
             #[cfg(feature = "flash-attn")]
-            use_flash_attn: false,
+            use_flash_attn: true,
         })
+    }
+
+    /// Update the pre-allocated KV cache with new K,V tensors.
+    ///
+    /// Uses `slice_set` for O(1) in-place writes when the buffer has room.
+    /// Falls back to cat + reallocate when the buffer is full.
+    /// Returns (k_full, v_full) views covering all valid cached data.
+    fn update_kv_cache(&mut self, k: Tensor, v: Tensor) -> Result<(Tensor, Tensor)> {
+        // slice_set requires contiguous tensors; K/V after transpose(1,2) are strided.
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+        let new_seq_len = k.dim(2)?;
+        let cache_seq_len = self.cache_seq_len;
+
+        match self.kv_cache.take() {
+            Some((buf_k, buf_v)) => {
+                let buf_len = buf_k.dim(2)?;
+                let new_total = cache_seq_len + new_seq_len;
+
+                if new_total <= buf_len {
+                    // In-place write: O(new_seq_len) instead of O(cache_len)
+                    buf_k.slice_set(&k, 2, cache_seq_len)?;
+                    buf_v.slice_set(&v, 2, cache_seq_len)?;
+                    let k_view = buf_k.narrow(2, 0, new_total)?;
+                    let v_view = buf_v.narrow(2, 0, new_total)?;
+                    self.kv_cache = Some((buf_k, buf_v));
+                    self.cache_seq_len = new_total;
+                    Ok((k_view, v_view))
+                } else {
+                    // Buffer too small: grow with extra room.
+                    let cur_k = buf_k.narrow(2, 0, cache_seq_len)?;
+                    let cur_v = buf_v.narrow(2, 0, cache_seq_len)?;
+                    drop(buf_k);
+                    drop(buf_v);
+                    let full_k = Tensor::cat(&[&cur_k, &k], 2)?;
+                    let full_v = Tensor::cat(&[&cur_v, &v], 2)?;
+                    drop(cur_k);
+                    drop(cur_v);
+                    let total = full_k.dim(2)?;
+                    let room = total.max(256);
+                    let (b, h, _, d) = full_k.dims4()?;
+                    let new_buf_k = Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
+                    let new_buf_v = Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
+                    new_buf_k.slice_set(&full_k, 2, 0)?;
+                    new_buf_v.slice_set(&full_v, 2, 0)?;
+                    self.kv_cache = Some((new_buf_k, new_buf_v));
+                    self.cache_seq_len = total;
+                    Ok((full_k, full_v))
+                }
+            }
+            None => {
+                // First use: allocate buffer with extra room.
+                let (b, h, s, d) = k.dims4()?;
+                let room = s.max(256);
+                let buf_k = Tensor::zeros((b, h, s + room, d), k.dtype(), k.device())?;
+                let buf_v = Tensor::zeros((b, h, s + room, d), v.dtype(), v.device())?;
+                buf_k.slice_set(&k, 2, 0)?;
+                buf_v.slice_set(&v, 2, 0)?;
+                self.kv_cache = Some((buf_k, buf_v));
+                self.cache_seq_len = s;
+                Ok((k, v))
+            }
+        }
     }
 
     fn forward(
@@ -251,17 +322,39 @@ impl Attention {
             k
         };
 
-        // KV cache
-        let (k, v) = match &self.kv_cache {
-            Some((prev_k, prev_v)) => {
-                let k = Tensor::cat(&[prev_k, &k], 2)?;
-                let v = Tensor::cat(&[prev_v, &v], 2)?;
-                (k, v)
-            }
-            None => (k, v),
-        };
-        self.kv_cache = Some((k.clone(), v.clone()));
+        // KV cache — pre-allocated buffer with slice_set
+        let (k, v) = self.update_kv_cache(k, v)?;
 
+        // ── Attention computation ──
+        // Try flash attention first (eliminates repeat_kv + fuses SDPA into 1 kernel).
+        // flash_attn handles GQA natively (num_heads_q != num_heads_kv).
+        // Fall back to manual SDPA when a custom attention mask is needed
+        // (e.g., batched decode with padding) since flash_attn only supports causal masking.
+        #[cfg(feature = "flash-attn")]
+        {
+            if self.use_flash_attn {
+                // flash_attn can replace the custom mask only when:
+                //   - No mask needed (decode, seq_len=1, no padding), OR
+                //   - Standard causal mask (prefill, seq_len>1)
+                // When attention_mask is Some AND seq_len==1, it means batched
+                // decode with padding — must fall back to manual SDPA.
+                let can_use_flash = attention_mask.is_none() || seq_len > 1;
+                if can_use_flash {
+                    let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
+                    let causal = seq_len > 1;
+                    // flash_attn expects layout (B, S, H, D)
+                    let q_fa = q.transpose(1, 2)?.contiguous()?;
+                    let k_fa = k.transpose(1, 2)?.contiguous()?;
+                    let v_fa = v.transpose(1, 2)?.contiguous()?;
+                    let attn_output = flash_attn(&q_fa, &k_fa, &v_fa, softmax_scale, causal)?;
+                    // attn_output: (B, S, num_heads, head_dim) → (B, S, hidden)
+                    let attn_output = attn_output.reshape((b_sz, seq_len, ()))?;
+                    return self.o_proj.forward(&attn_output);
+                }
+            }
+        }
+
+        // ── Manual SDPA fallback (with mask support) ──
         // Expand KV heads for GQA
         let n_rep = self.num_heads / self.num_kv_heads;
         let k = if n_rep > 1 {
@@ -302,6 +395,7 @@ impl Attention {
 
     fn clear_kv_cache(&mut self) {
         self.kv_cache = None;
+        self.cache_seq_len = 0;
     }
 }
 
@@ -487,18 +581,39 @@ impl HunYuanDenseV1 {
         self.layers.len()
     }
 
-    /// Extract per-layer KV caches (cheap: Tensor is Arc-based).
+    /// Extract per-layer KV caches. Returns only the valid (filled) portion,
+    /// **not** the pre-allocated buffer. Per-sequence storage should keep these
+    /// compactly; `setup_batch_decode` will re-create a pre-allocated buffer.
     pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
         self.layers
             .iter()
-            .map(|l| l.self_attn.kv_cache.clone())
+            .map(|l| {
+                l.self_attn.kv_cache.as_ref().map(|(k, v)| {
+                    let len = l.self_attn.cache_seq_len;
+                    if len > 0 && len < k.dim(2).unwrap_or(0) {
+                        // Narrow to valid data — still a zero-copy view.
+                        (
+                            k.narrow(2, 0, len).unwrap_or_else(|_| k.clone()),
+                            v.narrow(2, 0, len).unwrap_or_else(|_| v.clone()),
+                        )
+                    } else {
+                        (k.clone(), v.clone())
+                    }
+                })
+            })
             .collect()
     }
 
     /// Restore per-layer KV caches (e.g. after swapping sequences).
+    /// The tensors are stored as-is; `cache_seq_len` is set to their dim(2).
     pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
         for (layer, cache) in self.layers.iter_mut().zip(caches.into_iter()) {
+            let seq_len = cache
+                .as_ref()
+                .map(|(k, _)| k.dim(2).unwrap_or(0))
+                .unwrap_or(0);
             layer.self_attn.kv_cache = cache;
+            layer.self_attn.cache_seq_len = seq_len;
         }
     }
 
@@ -511,9 +626,12 @@ impl HunYuanDenseV1 {
     ///
     /// After calling this, use `step_batch_decode` for each decode round,
     /// then `extract_batch_kv` to get clean per-sequence caches back.
+    /// `extra_room`: number of decode tokens to pre-allocate in the buffer
+    /// (avoids `Tensor::cat` reallocation during multi-round decode).
     pub fn setup_batch_decode(
         &mut self,
         seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        extra_room: usize,
     ) -> Result<(Vec<usize>, usize)> {
         let kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim();
@@ -540,7 +658,24 @@ impl HunYuanDenseV1 {
             let batched_kv = pad_and_stack_kv_caches(
                 &layer_caches, max_kv_len, kv_heads, head_dim, device, self.dtype,
             )?;
-            layer.self_attn.kv_cache = batched_kv;
+
+            if let Some((k, v)) = batched_kv {
+                if extra_room > 0 {
+                    // Pre-allocate buffer with room for decode rounds.
+                    let (b, h, s, d) = k.dims4()?;
+                    let buf_k = Tensor::zeros((b, h, s + extra_room, d), k.dtype(), k.device())?;
+                    let buf_v = Tensor::zeros((b, h, s + extra_room, d), v.dtype(), v.device())?;
+                    buf_k.slice_set(&k, 2, 0)?;
+                    buf_v.slice_set(&v, 2, 0)?;
+                    layer.self_attn.kv_cache = Some((buf_k, buf_v));
+                } else {
+                    layer.self_attn.kv_cache = Some((k, v));
+                }
+                layer.self_attn.cache_seq_len = max_kv_len;
+            } else {
+                layer.self_attn.kv_cache = None;
+                layer.self_attn.cache_seq_len = 0;
+            }
         }
 
         Ok((kv_lens, max_kv_len))
@@ -646,6 +781,7 @@ impl HunYuanDenseV1 {
                 }
             }
             layer.self_attn.kv_cache = None;
+            layer.self_attn.cache_seq_len = 0;
         }
 
         Ok(result)

@@ -527,7 +527,7 @@ impl InferenceEngine {
             .map(|id| self.sequences.get(id).unwrap().kv_caches.clone())
             .collect();
 
-        let (kv_lens, original_max_kv) = match self.model.setup_batch_decode(&kv_caches) {
+        let (kv_lens, original_max_kv) = match self.model.setup_batch_decode(&kv_caches, self.decode_tokens_per_seq) {
             Ok(r) => r,
             Err(e) => {
                 error!("Batch decode setup failed: {e}");

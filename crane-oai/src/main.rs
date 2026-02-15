@@ -56,7 +56,7 @@ struct Args {
     cpu: bool,
 
     /// Max concurrent sequences in decode phase
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 32)]
     max_concurrent: usize,
 
     /// Tokens to decode per sequence before switching (higher = fewer KV swaps)
