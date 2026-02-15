@@ -22,7 +22,7 @@ use crate::utils::utils;
 pub struct Model {
     pub tokenizer: TokenOutputStream,
     pub device: Device,
-    dtype: DType,
+    pub dtype: DType,
     inner: HunYuanDenseV1,
 }
 
@@ -103,19 +103,41 @@ impl Model {
         self.inner.forward(&input, start_pos)
     }
 
-    /// Batched decode: run N sequences in ONE forward pass, each producing 1 token.
+    /// Pad per-sequence KV caches and load them into the model's attention layers
+    /// as a batched `[N, kv_heads, max_kv_len, head_dim]` tensor.
     ///
-    /// Returns (logits `[N, 1, vocab]`, updated per-sequence KV caches).
-    pub fn forward_batch_decode(
+    /// Returns `(kv_lens, max_kv_len)` for building masks and later extraction.
+    pub fn setup_batch_decode(
         &mut self,
-        tokens: &[u32],          // N tokens, one per sequence
-        positions: &[usize],     // start_pos for each sequence
-        seq_kv_caches: Vec<Vec<Option<(Tensor, Tensor)>>>,
-    ) -> candle_core::Result<(Tensor, Vec<Vec<Option<(Tensor, Tensor)>>>)> {
+        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+    ) -> candle_core::Result<(Vec<usize>, usize)> {
+        self.inner.setup_batch_decode(seq_kv_caches)
+    }
+
+    /// Run one batched decode step using the model's existing batched KV cache.
+    ///
+    /// Builds the `[N, 1]` input tensor from `tokens` (one per sequence).
+    /// Returns logits `[N, 1, vocab]`.
+    pub fn step_batch_decode(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        attention_mask: Option<&Tensor>,
+    ) -> candle_core::Result<Tensor> {
         let n = positions.len();
-        // Build [N, 1] input tensor
         let input = Tensor::new(tokens, &self.device)?.reshape((n, 1))?;
-        self.inner.forward_batch_decode(&input, positions, seq_kv_caches)
+        self.inner.step_batch_decode(&input, positions, attention_mask)
+    }
+
+    /// Extract per-sequence KV caches from the model's batched state,
+    /// removing padding. Clears model KV cache afterward.
+    pub fn extract_batch_kv(
+        &mut self,
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        rounds_done: usize,
+    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        self.inner.extract_batch_kv(kv_lens, original_max_kv, rounds_done)
     }
 
     /// Number of transformer layers.

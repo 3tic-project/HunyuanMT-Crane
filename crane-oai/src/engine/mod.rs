@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crane_core::models::hunyuan_dense::Model;
+use crane_core::models::hunyuan_dense::modeling::build_batch_decode_mask;
 use crane_core::utils::token_output_stream::TokenOutputStream;
 
 use scheduler::{Scheduler, SchedulerOutput};
@@ -477,10 +478,10 @@ impl InferenceEngine {
 
     /// Decode step for all running sequences — TRUE BATCHED forward.
     ///
-    /// Instead of N sequential single-token forward passes with KV swapping,
-    /// this collects all sequences' KV caches, pads + stacks them into batched
-    /// tensors, and runs ONE forward pass through the model with batch dim N.
-    /// This dramatically improves GPU utilization.
+    /// Uses **lazy eviction**: when a sequence completes or is cancelled
+    /// mid-loop, it stays in the batch tensor (wasting trivial compute)
+    /// rather than triggering an expensive extract→re-setup cycle.
+    /// KV caches are extracted exactly ONCE at the end.
     fn step_decode_batch(&mut self, batch: Vec<String>) {
         let t0 = Instant::now();
 
@@ -511,7 +512,6 @@ impl InferenceEngine {
 
         // 2. Flush model's internal KV cache state (stale from prior prefill).
         if let Some(ref prev_id) = self.active_seq_id.take() {
-            // swap_out already saved the cache during prefill; just clear model state.
             if self.sequences.contains_key(prev_id) {
                 let caches = self.model.get_kv_caches();
                 if let Some(seq) = self.sequences.get_mut(prev_id) {
@@ -521,49 +521,122 @@ impl InferenceEngine {
             self.model.clear_kv_cache();
         }
 
-        // 3. Run `decode_tokens_per_seq` rounds of batched forward.
-        let mut total_tokens_this_step = 0u64;
-        let mut live_batch = batch.clone();
+        // 3. Collect KV caches and SETUP batched decode (pad+stack — done ONCE).
+        let kv_caches: Vec<Vec<Option<(candle_core::Tensor, candle_core::Tensor)>>> = batch
+            .iter()
+            .map(|id| self.sequences.get(id).unwrap().kv_caches.clone())
+            .collect();
 
-        for _round in 0..self.decode_tokens_per_seq {
-            if live_batch.is_empty() {
+        let (kv_lens, original_max_kv) = match self.model.setup_batch_decode(&kv_caches) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Batch decode setup failed: {e}");
+                for seq_id in &batch {
+                    self.send_error(seq_id, &format!("Batch decode setup failed: {e}"));
+                }
+                return;
+            }
+        };
+        drop(kv_caches); // Free per-sequence cache references.
+
+        let t_setup = t0.elapsed();
+
+        // 4. Pre-build attention mask at maximum width.
+        let max_total_width = original_max_kv + self.decode_tokens_per_seq;
+        let full_mask = match build_batch_decode_mask(
+            &kv_lens,
+            original_max_kv,
+            max_total_width,
+            &self.model.device,
+            self.model.dtype,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                error!("Mask build failed: {e}");
+                self.model.clear_kv_cache();
+                return;
+            }
+        };
+
+        // 5. Multi-round decode loop with LAZY EVICTION.
+        //    When a sequence finishes or is cancelled, we mark it as dead but
+        //    keep it in the batch tensor. We feed dummy tokens for dead slots
+        //    and skip sampling. This avoids the costly extract→re-setup cycle.
+        let mut total_tokens_this_step = 0u64;
+        let mut rounds_done = 0usize;
+        let mut alive = vec![true; batch.len()]; // track which slots are still active
+        let mut pending_finish: Vec<String> = Vec::new();
+        let mut pending_cancel: Vec<String> = Vec::new();
+
+        // Track per-sequence positions (grows by 1 each round for ALL slots).
+        let mut positions: Vec<usize> = batch
+            .iter()
+            .map(|id| self.sequences.get(id).unwrap().start_pos())
+            .collect();
+
+        // Remember last token for each slot (used as dummy input for dead slots).
+        let mut last_tokens: Vec<u32> = batch
+            .iter()
+            .map(|id| *self.sequences.get(id).unwrap().tokens.last().unwrap())
+            .collect();
+
+        for round in 0..self.decode_tokens_per_seq {
+            // If all sequences are dead, no point continuing.
+            if alive.iter().all(|a| !a) {
                 break;
             }
 
-            // Collect input tokens, positions, and KV caches.
-            let mut tokens = Vec::with_capacity(live_batch.len());
-            let mut positions = Vec::with_capacity(live_batch.len());
-            let mut kv_caches = Vec::with_capacity(live_batch.len());
+            // Collect input tokens — alive slots use their last generated token,
+            // dead slots reuse their last known token (output will be discarded).
+            let tokens: Vec<u32> = (0..batch.len())
+                .map(|i| {
+                    if alive[i] {
+                        *self.sequences.get(&batch[i]).unwrap().tokens.last().unwrap()
+                    } else {
+                        last_tokens[i]
+                    }
+                })
+                .collect();
 
-            for seq_id in &live_batch {
-                let seq = self.sequences.get(seq_id).unwrap();
-                tokens.push(*seq.tokens.last().unwrap());
-                positions.push(seq.start_pos());
-                kv_caches.push(seq.kv_caches.clone()); // Arc-based, cheap
-            }
+            // Narrow the pre-built mask to correct width for this round.
+            let mask_width = original_max_kv + round + 1;
+            let mask_for_round = match &full_mask {
+                Some(full) => full.narrow(3, 0, mask_width).ok(),
+                None => None,
+            };
 
-            // ONE batched forward pass for ALL sequences.
-            let (logits, updated_caches) =
-                match self.model.forward_batch_decode(&tokens, &positions, kv_caches) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        error!("Batched decode forward failed: {e}");
-                        for seq_id in &live_batch {
+            // ONE batched forward pass (includes dead slots — trivial waste).
+            let logits = match self.model.step_batch_decode(
+                &tokens,
+                &positions,
+                mask_for_round.as_ref(),
+            ) {
+                Ok(l) => l,
+                Err(e) => {
+                    error!("Batched decode forward failed (round {round}): {e}");
+                    for (i, seq_id) in batch.iter().enumerate() {
+                        if alive[i] {
                             self.send_error(seq_id, &format!("Batched decode failed: {e}"));
                         }
-                        return;
                     }
-                };
+                    self.model.clear_kv_cache();
+                    return;
+                }
+            };
 
-            // Sample and update each sequence.
-            let mut finished_ids = Vec::new();
+            rounds_done += 1;
 
-            for (i, seq_id) in live_batch.iter().enumerate() {
-                // Extract this sequence's logits: [1, 1, vocab]
+            // Sample and update only ALIVE sequences.
+            for (i, seq_id) in batch.iter().enumerate() {
+                if !alive[i] {
+                    continue;
+                }
+
                 let seq_logits = match logits.narrow(0, i, 1) {
                     Ok(l) => l,
                     Err(e) => {
                         self.send_error(seq_id, &format!("Logits extraction failed: {e}"));
+                        alive[i] = false;
                         continue;
                     }
                 };
@@ -572,44 +645,72 @@ impl InferenceEngine {
                     Ok(t) => t,
                     Err(e) => {
                         self.send_error(seq_id, &format!("Sampling failed: {e}"));
+                        alive[i] = false;
                         continue;
                     }
                 };
 
-                // Update sequence state and KV caches.
                 if let Some(seq) = self.sequences.get_mut(seq_id) {
                     seq.tokens.push(next_token);
-                    seq.kv_caches = updated_caches[i].clone();
                 }
+                last_tokens[i] = next_token;
 
                 total_tokens_this_step += 1;
                 self.stats.total_decode_steps.fetch_add(1, Ordering::Relaxed);
 
                 self.send_token(seq_id, next_token);
 
-                // Check termination.
+                // Check completion.
                 if self.sequences.get(seq_id).map_or(true, |s| s.should_stop()) {
-                    finished_ids.push(seq_id.clone());
-                }
-                // Check disconnect.
-                else if self
+                    alive[i] = false;
+                    pending_finish.push(seq_id.clone());
+                } else if self
                     .sequences
                     .get(seq_id)
                     .map_or(true, |s| s.response_tx.is_closed())
                 {
                     warn!(id = %seq_id, "Client disconnected mid-batch-decode");
-                    self.stats.cancelled_requests.fetch_add(1, Ordering::Relaxed);
-                    self.cleanup_sequence(seq_id);
+                    alive[i] = false;
+                    pending_cancel.push(seq_id.clone());
                 }
             }
 
-            // Finish completed sequences.
-            for id in &finished_ids {
-                self.finish_sequence(id);
+            // Advance positions for ALL slots (KV cache grows uniformly).
+            for p in positions.iter_mut() {
+                *p += 1;
             }
+        }
 
-            // Remove finished/cancelled from live_batch for next round.
-            live_batch.retain(|id| self.sequences.contains_key(id));
+        // 6. Extract per-sequence KV caches (done ONCE, regardless of how many
+        //    sequences finished mid-loop).
+        if rounds_done > 0 {
+            match self.model.extract_batch_kv(&kv_lens, original_max_kv, rounds_done) {
+                Ok(extracted) => {
+                    // Save KV only for sequences that are still alive (not finished/cancelled).
+                    for (i, seq_id) in batch.iter().enumerate() {
+                        if alive[i] {
+                            if let Some(seq) = self.sequences.get_mut(seq_id) {
+                                if i < extracted.len() {
+                                    seq.kv_caches = extracted[i].clone();
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Final KV extraction failed: {e}");
+                    self.model.clear_kv_cache();
+                }
+            }
+        }
+
+        // 7. Now finish/cancel sequences AFTER KV is safely extracted.
+        for id in &pending_finish {
+            self.finish_sequence(id);
+        }
+        for id in &pending_cancel {
+            self.stats.cancelled_requests.fetch_add(1, Ordering::Relaxed);
+            self.cleanup_sequence(id);
         }
 
         let decode_us = t0.elapsed().as_micros() as u64;
@@ -618,6 +719,7 @@ impl InferenceEngine {
             .fetch_add(decode_us, Ordering::Relaxed);
 
         if total_tokens_this_step > 0 {
+            let alive_count = alive.iter().filter(|a| **a).count();
             let tok_s = if decode_us > 0 {
                 (total_tokens_this_step as f64) / (decode_us as f64 / 1_000_000.0)
             } else {
@@ -626,6 +728,9 @@ impl InferenceEngine {
             debug!(
                 batch_size,
                 tokens = total_tokens_this_step,
+                rounds = rounds_done,
+                finished = pending_finish.len(),
+                setup_ms = t_setup.as_millis() as u64,
                 decode_ms = decode_us / 1000,
                 tok_s = format!("{:.1}", tok_s),
                 "Batched decode step complete",

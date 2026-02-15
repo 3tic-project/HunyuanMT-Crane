@@ -60,7 +60,7 @@ struct Args {
     max_concurrent: usize,
 
     /// Tokens to decode per sequence before switching (higher = fewer KV swaps)
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 16)]
     decode_tokens_per_seq: usize,
 }
 

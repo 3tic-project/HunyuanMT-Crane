@@ -502,40 +502,77 @@ impl HunYuanDenseV1 {
         }
     }
 
-    /// Batched decode forward: process N sequences in ONE forward pass.
+    /// Pad per-sequence KV caches to the same length and load into model's
+    /// attention layers, preparing for batched decode.
     ///
-    /// Each sequence contributes exactly 1 new token. KV caches are padded
-    /// and stacked so the GPU processes all sequences in parallel, giving
-    /// much higher utilization than N sequential single-token forward passes.
+    /// Returns `(kv_lens, max_kv_len)` where `kv_lens[i]` is the original
+    /// number of cached tokens for sequence i, and `max_kv_len` is the
+    /// padded length.
+    ///
+    /// After calling this, use `step_batch_decode` for each decode round,
+    /// then `extract_batch_kv` to get clean per-sequence caches back.
+    pub fn setup_batch_decode(
+        &mut self,
+        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+    ) -> Result<(Vec<usize>, usize)> {
+        let kv_heads = self.config.num_key_value_heads;
+        let head_dim = self.config.head_dim();
+        let device = self.embed_tokens.embeddings().device();
+
+        // Compute per-sequence KV lengths from the first layer's cache.
+        let kv_lens: Vec<usize> = seq_kv_caches
+            .iter()
+            .map(|caches| {
+                caches
+                    .first()
+                    .and_then(|c| c.as_ref())
+                    .map(|(k, _)| k.dim(2).unwrap_or(0))
+                    .unwrap_or(0)
+            })
+            .collect();
+        let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0);
+
+        // For each layer, pad and stack KV caches.
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let layer_caches: Vec<&Option<(Tensor, Tensor)>> =
+                seq_kv_caches.iter().map(|seq| &seq[layer_idx]).collect();
+
+            let batched_kv = pad_and_stack_kv_caches(
+                &layer_caches, max_kv_len, kv_heads, head_dim, device, self.dtype,
+            )?;
+            layer.self_attn.kv_cache = batched_kv;
+        }
+
+        Ok((kv_lens, max_kv_len))
+    }
+
+    /// Run one batched decode step using the model's existing (batched) KV cache.
+    ///
+    /// Call `setup_batch_decode` first, then call this repeatedly for each
+    /// decode round. The KV cache grows by 1 column each round (via the
+    /// attention layer's internal concat).
     ///
     /// # Arguments
     /// - `input_ids` — `[N, 1]` tensor (one token per sequence)
-    /// - `positions` — start position for each sequence (= cached KV length)
-    /// - `seq_kv_caches` — per-sequence, per-layer KV caches `[n_seqs][n_layers]`
+    /// - `positions` — logical position for each sequence's new token
+    /// - `attention_mask` — optional `[N, 1, 1, total_kv_after_concat]` mask
     ///
     /// # Returns
-    /// `(logits, updated_seq_kv_caches)` where logits is `[N, 1, vocab]`.
-    pub fn forward_batch_decode(
+    /// Logits tensor `[N, 1, vocab_size]`.
+    pub fn step_batch_decode(
         &mut self,
         input_ids: &Tensor,
         positions: &[usize],
-        seq_kv_caches: Vec<Vec<Option<(Tensor, Tensor)>>>,
-    ) -> Result<(Tensor, Vec<Vec<Option<(Tensor, Tensor)>>>)> {
-        let n_seqs = positions.len();
-        let device = input_ids.device();
-        let head_dim = self.config.head_dim();
-        let kv_heads = self.config.num_key_value_heads;
-
-        // 1. Embed: [N, 1] → [N, 1, hidden]
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
 
-        // 2. RoPE: gather cos/sin for each sequence's position
         let max_pos = positions.iter().copied().max().unwrap_or(0) + 1;
+        let device = input_ids.device();
         let (full_cos, full_sin) = self.rotary_emb.forward(max_pos, device)?;
 
         let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         let pos_tensor = Tensor::new(pos_ids.as_slice(), device)?;
-        // [N, head_dim] → [N, 1, 1, head_dim] for broadcasting in attention
         let cos = full_cos
             .index_select(&pos_tensor, 0)?
             .to_dtype(self.dtype)?
@@ -547,93 +584,100 @@ impl HunYuanDenseV1 {
             .unsqueeze(1)?
             .unsqueeze(1)?;
 
-        // 3. Build attention mask for KV padding
-        let kv_lens: &[usize] = positions; // cached length = start_pos
-        let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0);
-        let total_kv = max_kv_len + 1; // cached + new token
+        let mut hidden_states = hidden_states;
+        for layer in self.layers.iter_mut() {
+            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
+        }
 
-        let attention_mask = if max_kv_len > 0 {
-            let has_padding = kv_lens.iter().any(|&l| l < max_kv_len);
-            if has_padding {
-                // Mask layout per sequence i: positions 0..kv_lens[i] are real,
-                // kv_lens[i]..max_kv_len are padding (→ -1e9), max_kv_len is new token (→ 0).
-                let mut mask_data = vec![0f32; n_seqs * total_kv];
-                for i in 0..n_seqs {
-                    for j in kv_lens[i]..max_kv_len {
-                        mask_data[i * total_kv + j] = -1e9;
-                    }
-                }
-                let mask = Tensor::from_vec(mask_data, (n_seqs, total_kv), device)?
-                    .to_dtype(self.dtype)?;
-                Some(mask.unsqueeze(1)?.unsqueeze(1)?) // [N, 1, 1, total_kv]
-            } else {
-                None // All same length, no padding needed
-            }
-        } else {
-            None // No cached data (shouldn't happen in decode)
-        };
+        let hidden_states = self.norm.forward(&hidden_states)?;
+        self.lm_head.forward(&hidden_states) // [N, 1, vocab]
+    }
 
-        // 4. Process each layer
+    /// Extract per-sequence KV caches from the batched state, removing padding.
+    ///
+    /// Call this after all decode rounds are done to get clean per-sequence
+    /// caches for storage. Clears the model's KV cache afterward.
+    ///
+    /// # Arguments
+    /// - `kv_lens` — original per-sequence KV lengths (from `setup_batch_decode`)
+    /// - `original_max_kv` — max KV length at setup time (from `setup_batch_decode`)
+    /// - `rounds_done` — number of `step_batch_decode` calls completed
+    pub fn extract_batch_kv(
+        &mut self,
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        rounds_done: usize,
+    ) -> Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        let n_seqs = kv_lens.len();
         let num_layers = self.layers.len();
-        let mut updated_seq_caches: Vec<Vec<Option<(Tensor, Tensor)>>> =
+        let mut result: Vec<Vec<Option<(Tensor, Tensor)>>> =
             (0..n_seqs).map(|_| Vec::with_capacity(num_layers)).collect();
 
-        let mut hidden_states = hidden_states;
-
-        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            // Gather per-sequence caches for this layer
-            let layer_caches: Vec<&Option<(Tensor, Tensor)>> =
-                seq_kv_caches.iter().map(|seq| &seq[layer_idx]).collect();
-
-            // Pad and stack into batched KV cache
-            let batched_kv = pad_and_stack_kv_caches(
-                &layer_caches, max_kv_len, kv_heads, head_dim, device, self.dtype,
-            )?;
-
-            // Set batched KV cache in the attention layer
-            layer.self_attn.kv_cache = batched_kv;
-
-            // Forward (attention automatically concatenates new K,V to cache)
-            hidden_states =
-                layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
-
-            // Extract new KV entries and append to each sequence's original cache.
-            // After the concat in attention, the batched cache is:
-            //   [N, kv_heads, max_kv_len+1, head_dim]
-            // The NEW token's K,V is at position max_kv_len (the last one appended).
+        for layer in self.layers.iter_mut() {
             if let Some((ref full_k, ref full_v)) = layer.self_attn.kv_cache {
-                let new_k_all = full_k.narrow(2, max_kv_len, 1)?; // [N, kv_heads, 1, d]
-                let new_v_all = full_v.narrow(2, max_kv_len, 1)?;
-
                 for i in 0..n_seqs {
-                    let new_k_i = new_k_all.narrow(0, i, 1)?; // [1, kv_heads, 1, d]
-                    let new_v_i = new_v_all.narrow(0, i, 1)?;
+                    let row_k = full_k.narrow(0, i, 1)?;
+                    let row_v = full_v.narrow(0, i, 1)?;
 
-                    let updated = match &layer_caches[i] {
-                        Some((old_k, old_v)) => Some((
-                            Tensor::cat(&[old_k.as_ref(), &new_k_i], 2)?,
-                            Tensor::cat(&[old_v.as_ref(), &new_v_i], 2)?,
-                        )),
-                        None => Some((new_k_i, new_v_i)),
+                    let clean = if kv_lens[i] == original_max_kv || rounds_done == 0 {
+                        // No padding gap to remove — contiguous data.
+                        let total = kv_lens[i] + rounds_done;
+                        Some((
+                            row_k.narrow(2, 0, total)?,
+                            row_v.narrow(2, 0, total)?,
+                        ))
+                    } else {
+                        // Padding at kv_lens[i]..original_max_kv.
+                        // Real data: 0..kv_lens[i]  +  original_max_kv..original_max_kv+rounds_done.
+                        let prefix_k = row_k.narrow(2, 0, kv_lens[i])?;
+                        let prefix_v = row_v.narrow(2, 0, kv_lens[i])?;
+                        let new_k = row_k.narrow(2, original_max_kv, rounds_done)?;
+                        let new_v = row_v.narrow(2, original_max_kv, rounds_done)?;
+                        Some((
+                            Tensor::cat(&[&prefix_k, &new_k], 2)?,
+                            Tensor::cat(&[&prefix_v, &new_v], 2)?,
+                        ))
                     };
-                    updated_seq_caches[i].push(updated);
+                    result[i].push(clean);
                 }
             } else {
                 for i in 0..n_seqs {
-                    updated_seq_caches[i].push(None);
+                    result[i].push(None);
                 }
             }
-
-            // Free batched KV to release memory
             layer.self_attn.kv_cache = None;
         }
 
-        // 5. Final norm + lm_head
-        let hidden_states = self.norm.forward(&hidden_states)?;
-        let logits = self.lm_head.forward(&hidden_states)?; // [N, 1, vocab]
-
-        Ok((logits, updated_seq_caches))
+        Ok(result)
     }
+}
+
+/// Build attention mask for batched decode with padding-aware masking.
+///
+/// Positions `kv_lens[i]..original_max_kv` are masked as -1e9 for each sequence.
+/// Positions before `kv_lens[i]` and after `original_max_kv` are 0.0 (attend).
+///
+/// Returns `None` if no padding exists (all sequences have the same KV length).
+pub fn build_batch_decode_mask(
+    kv_lens: &[usize],
+    original_max_kv: usize,
+    total_width: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Option<Tensor>> {
+    if kv_lens.iter().all(|&l| l == original_max_kv) {
+        return Ok(None);
+    }
+    let n = kv_lens.len();
+    let mut mask_data = vec![0f32; n * total_width];
+    for i in 0..n {
+        for j in kv_lens[i]..original_max_kv.min(total_width) {
+            mask_data[i * total_width + j] = -1e9;
+        }
+    }
+    let mask = Tensor::from_vec(mask_data, (n, total_width), device)?
+        .to_dtype(dtype)?;
+    Ok(Some(mask.unsqueeze(1)?.unsqueeze(1)?))
 }
 
 /// Pad per-sequence KV caches to `max_len` and stack into a batched tensor.
