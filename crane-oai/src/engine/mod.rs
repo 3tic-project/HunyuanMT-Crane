@@ -1,3 +1,5 @@
+pub mod backend;
+pub mod model_factory;
 pub mod scheduler;
 pub mod sequence;
 
@@ -12,8 +14,7 @@ use candle_transformers::generation::LogitsProcessor;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crane_core::models::hunyuan_dense::Model;
-use crane_core::models::hunyuan_dense::modeling::build_batch_decode_mask;
+use backend::ModelBackend;
 use crane_core::utils::token_output_stream::TokenOutputStream;
 
 use scheduler::{Scheduler, SchedulerOutput};
@@ -205,7 +206,7 @@ pub struct StatsSnapshot {
 /// gives the GPU a much larger workload per kernel launch compared to N
 /// sequential single-token forward passes.
 pub struct InferenceEngine {
-    model: Model,
+    model: Box<dyn ModelBackend>,
     sequences: HashMap<String, Sequence>,
     token_streams: HashMap<String, TokenOutputStream>,
     scheduler: Scheduler,
@@ -230,18 +231,32 @@ pub struct InferenceEngine {
 impl InferenceEngine {
     /// Create the engine and return a handle for submitting requests.
     pub fn new(
-        model: Model,
+        model: Box<dyn ModelBackend>,
         max_concurrent: usize,
         decode_tokens_per_seq: usize,
     ) -> (Self, EngineHandle) {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let num_layers = model.num_layers();
+
+        // Cap max_concurrent to 1 for models without KV cache swapping.
+        let effective_max = if model.supports_kv_swap() {
+            max_concurrent
+        } else {
+            1.min(max_concurrent)
+        };
+        if effective_max != max_concurrent {
+            info!(
+                "Model does not support KV swap — limiting max_concurrent to {}",
+                effective_max
+            );
+        }
+
         let stats = Arc::new(EngineStats::new());
         let engine = Self {
             model,
             sequences: HashMap::new(),
             token_streams: HashMap::new(),
-            scheduler: Scheduler::new(max_concurrent),
+            scheduler: Scheduler::new(effective_max),
             request_rx,
             active_seq_id: None,
             num_layers,
@@ -346,7 +361,7 @@ impl InferenceEngine {
 
     fn accept_request(&mut self, req: EngineRequest) {
         let prompt_len = req.tokens.len();
-        let tokenizer = self.model.tokenizer.tokenizer.clone();
+        let tokenizer = self.model.tokenizer().clone();
 
         info!(
             id = %req.id,
@@ -415,9 +430,12 @@ impl InferenceEngine {
             debug_assert_eq!(output.batch.len(), 1);
             let seq_id = &output.batch[0];
             self.step_prefill(seq_id.clone());
-        } else {
-            // Decode step: iterate sequences with multi-token decode.
+        } else if self.model.supports_batch_decode() {
+            // Batched decode for backends that support it (e.g. Hunyuan).
             self.step_decode_batch(output.batch);
+        } else {
+            // Sequential decode for backends without batch decode.
+            self.step_decode_sequential(output.batch);
         }
     }
 
@@ -527,9 +545,9 @@ impl InferenceEngine {
 
         let batch_size = batch.len();
 
-        if self.model.device.is_cuda() && self.decode_input_ids_buf.is_none() {
+        if self.model.device().is_cuda() && self.decode_input_ids_buf.is_none() {
             let max_batch = self.scheduler.max_running;
-            self.decode_input_ids_buf = match Tensor::zeros((max_batch, 1), DType::U32, &self.model.device) {
+            self.decode_input_ids_buf = match Tensor::zeros((max_batch, 1), DType::U32, self.model.device()) {
                 Ok(t) => Some(t),
                 Err(e) => {
                     error!("Decode input_ids buffer alloc failed: {e}");
@@ -571,12 +589,10 @@ impl InferenceEngine {
 
         // 4. Pre-build attention mask at maximum width.
         let max_total_width = original_max_kv + self.decode_tokens_per_seq;
-        let full_mask = match build_batch_decode_mask(
+        let full_mask = match self.model.build_batch_decode_mask(
             &kv_lens,
             original_max_kv,
             max_total_width,
-            &self.model.device,
-            self.model.dtype,
         ) {
             Ok(m) => m,
             Err(e) => {
@@ -641,7 +657,7 @@ impl InferenceEngine {
                     }
                 }
             } else {
-                match Tensor::new(tokens.as_slice(), &self.model.device) {
+                match Tensor::new(tokens.as_slice(), self.model.device()) {
                     Ok(t) => match t.reshape((batch_size, 1)) {
                         Ok(t) => t,
                         Err(e) => {
@@ -666,7 +682,7 @@ impl InferenceEngine {
             };
 
             // ONE batched forward pass (includes dead slots — trivial waste).
-            let logits = match self.model.step_batch_decode_with_input_ids(
+            let logits = match self.model.step_batch_decode(
                 &input_ids,
                 &positions,
                 mask_for_round.as_ref(),
@@ -780,7 +796,7 @@ impl InferenceEngine {
             .fetch_add(decode_us, Ordering::Relaxed);
 
         if total_tokens_this_step > 0 {
-            let alive_count = alive.iter().filter(|a| **a).count();
+            let _alive_count = alive.iter().filter(|a| **a).count();
             let tok_s = if decode_us > 0 {
                 (total_tokens_this_step as f64) / (decode_us as f64 / 1_000_000.0)
             } else {
@@ -803,11 +819,129 @@ impl InferenceEngine {
         self.check_cancelled();
     }
 
+    /// Sequential decode for backends without batch decode support.
+    ///
+    /// Processes each sequence individually with KV cache swapping (if
+    /// supported) or single-sequence mode.
+    fn step_decode_sequential(&mut self, batch: Vec<String>) {
+        let t0 = Instant::now();
+        let mut total_tokens: u64 = 0;
+
+        for seq_id in &batch {
+            // Skip cancelled sequences.
+            if self
+                .sequences
+                .get(seq_id)
+                .map_or(true, |s| s.response_tx.is_closed())
+            {
+                self.stats
+                    .cancelled_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                self.cleanup_sequence(seq_id);
+                continue;
+            }
+
+            self.swap_in(seq_id);
+
+            for _round in 0..self.decode_tokens_per_seq {
+                let (input_ids, start_pos) = {
+                    let seq = match self.sequences.get(seq_id) {
+                        Some(s) => s,
+                        None => break,
+                    };
+                    (seq.next_input_ids().to_vec(), seq.start_pos())
+                };
+
+                let logits = match self.model.forward_step(&input_ids, start_pos) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        self.send_error(seq_id, &format!("Decode forward failed: {e}"));
+                        break;
+                    }
+                };
+
+                let next_token = match self.sample(seq_id, &logits) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        self.send_error(seq_id, &format!("Sampling failed: {e}"));
+                        break;
+                    }
+                };
+
+                if let Some(seq) = self.sequences.get_mut(seq_id) {
+                    seq.tokens.push(next_token);
+                }
+
+                total_tokens += 1;
+                self.stats
+                    .total_decode_steps
+                    .fetch_add(1, Ordering::Relaxed);
+
+                self.send_token(seq_id, next_token);
+
+                if self
+                    .sequences
+                    .get(seq_id)
+                    .map_or(true, |s| s.should_stop())
+                {
+                    self.finish_sequence(seq_id);
+                    break;
+                }
+
+                if self
+                    .sequences
+                    .get(seq_id)
+                    .map_or(true, |s| s.response_tx.is_closed())
+                {
+                    warn!(id = %seq_id, "Client disconnected mid-decode");
+                    self.stats
+                        .cancelled_requests
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.cleanup_sequence(seq_id);
+                    break;
+                }
+            }
+
+            self.swap_out(seq_id);
+        }
+
+        let decode_us = t0.elapsed().as_micros() as u64;
+        self.stats
+            .total_decode_time_us
+            .fetch_add(decode_us, Ordering::Relaxed);
+
+        if total_tokens > 0 {
+            let tok_s = if decode_us > 0 {
+                (total_tokens as f64) / (decode_us as f64 / 1_000_000.0)
+            } else {
+                0.0
+            };
+            debug!(
+                tokens = total_tokens,
+                decode_ms = decode_us / 1000,
+                tok_s = format!("{:.1}", tok_s),
+                "Sequential decode step complete",
+            );
+        }
+
+        self.drain_requests();
+        self.check_cancelled();
+    }
+
     // ── KV cache management ──
 
     /// Load a sequence's KV cache into the model.
     fn swap_in(&mut self, seq_id: &str) {
         if self.active_seq_id.as_deref() == Some(seq_id) {
+            return;
+        }
+
+        if !self.model.supports_kv_swap() {
+            // Without KV swap support, just clear and track the active sequence.
+            if self.active_seq_id.as_deref() != Some(seq_id) {
+                self.model.clear_kv_cache();
+                self.active_seq_id = Some(seq_id.to_string());
+            }
             return;
         }
 
@@ -833,6 +967,9 @@ impl InferenceEngine {
 
     /// Save the model's current KV cache back to the sequence.
     fn swap_out(&mut self, seq_id: &str) {
+        if !self.model.supports_kv_swap() {
+            return;
+        }
         if self.active_seq_id.as_deref() == Some(seq_id) {
             let caches = self.model.get_kv_caches();
             if let Some(seq) = self.sequences.get_mut(seq_id) {
@@ -1016,8 +1153,7 @@ impl InferenceEngine {
             let completion_tokens = seq.num_generated();
             let full_text = self
                 .model
-                .tokenizer
-                .tokenizer
+                .tokenizer()
                 .decode(generated_ids, true)
                 .unwrap_or_default();
 

@@ -1,6 +1,28 @@
+//! OpenAI-compatible request / response types.
+//!
+//! Covers:
+//! * `/v1/chat/completions`  (chat)
+//! * `/v1/completions`       (text completion)
+//! * `/v1/models`            (model listing)
+//!
+//! Wire format follows the
+//! [OpenAI API reference](https://platform.openai.com/docs/api-reference).
+
 use serde::{Deserialize, Serialize};
 
-// ── Request types ──
+// ═════════════════════════════════════════════════════════════
+//  Shared helpers
+// ═════════════════════════════════════════════════════════════
+
+fn default_max_tokens() -> usize {
+    512
+}
+
+// ═════════════════════════════════════════════════════════════
+//  Chat Completion  (/v1/chat/completions)
+// ═════════════════════════════════════════════════════════════
+
+// ── Request ──
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -14,11 +36,13 @@ pub struct ChatCompletionRequest {
     pub repetition_penalty: Option<f32>,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
     pub stop: Option<Vec<String>>,
-}
-
-fn default_max_tokens() -> usize {
-    512
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub seed: Option<u64>,
+    pub n: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,7 +51,13 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-// ── Response types ──
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
+// ── Response ──
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatCompletionResponse {
@@ -35,25 +65,18 @@ pub struct ChatCompletionResponse {
     pub object: String,
     pub created: u64,
     pub model: String,
-    pub choices: Vec<Choice>,
+    pub choices: Vec<ChatChoice>,
     pub usage: Usage,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct Choice {
+pub struct ChatChoice {
     pub index: usize,
     pub message: ChatMessage,
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct Usage {
-    pub prompt_tokens: usize,
-    pub completion_tokens: usize,
-    pub total_tokens: usize,
-}
-
-// ── Streaming response types (SSE) ──
+// ── Streaming ──
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatCompletionChunk {
@@ -62,6 +85,8 @@ pub struct ChatCompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,7 +104,100 @@ pub struct ChunkDelta {
     pub content: Option<String>,
 }
 
-// ── Model list ──
+// ═════════════════════════════════════════════════════════════
+//  Text Completion  (/v1/completions)
+// ═════════════════════════════════════════════════════════════
+
+// ── Request ──
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompletionRequest {
+    pub model: String,
+    pub prompt: StringOrArray,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: usize,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<usize>,
+    pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+    pub stop: Option<Vec<String>>,
+    pub suffix: Option<String>,
+    pub echo: Option<bool>,
+    pub seed: Option<u64>,
+    pub n: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum StringOrArray {
+    Single(String),
+    Array(Vec<String>),
+}
+
+impl StringOrArray {
+    pub fn as_string(&self) -> String {
+        match self {
+            Self::Single(s) => s.clone(),
+            Self::Array(arr) => arr.join(""),
+        }
+    }
+}
+
+// ── Response ──
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionResponse {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<CompletionChoice>,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionChoice {
+    pub index: usize,
+    pub text: String,
+    pub finish_reason: Option<String>,
+}
+
+// ── Streaming ──
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionChunk {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<CompletionChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionChunkChoice {
+    pub index: usize,
+    pub text: String,
+    pub finish_reason: Option<String>,
+}
+
+// ═════════════════════════════════════════════════════════════
+//  Common types
+// ═════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Usage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+}
+
+// ── Model listing ──
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelList {

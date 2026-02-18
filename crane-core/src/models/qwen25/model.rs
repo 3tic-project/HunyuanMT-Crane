@@ -149,6 +149,16 @@ impl Model {
         }
     }
 
+    /// Run a single forward step, returning raw logits.
+    pub fn forward_step(
+        &mut self,
+        input_ids: &[u32],
+        start_pos: usize,
+    ) -> candle_core::Result<Tensor> {
+        let input = Tensor::new(input_ids, &self.device)?.unsqueeze(0)?;
+        self.forward(&input, start_pos)
+    }
+
     fn from_pretrained(model_path: &str, device: &Device, dtype: &DType) -> Result<Model> {
         let tokenizer_path = std::path::Path::new(model_path).join("tokenizer.json");
         if !tokenizer_path.exists() {
