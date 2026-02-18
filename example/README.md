@@ -5,35 +5,37 @@ This directory contains simple, user-friendly examples showing how to use the Cr
 ## Available Examples
 
 ### Chat Examples
-- `chat_simple.rs`: Basic chat functionality - shows how to send a message and get a response
-- `chat_streaming.rs`: Chat with real-time streaming responses - shows how to get token-by-token output
+- `chat_simple.rs`: Basic chat functionality — send a message and get a response
+- `chat_streaming.rs`: Chat with real-time streaming responses — token-by-token output
+- `hunyuan_simple.rs`: Hunyuan Dense model inference 
 
 ### Audio Examples
-- `asr_simple.rs`: Automatic Speech Recognition - transcribe audio to text (requires ONNX feature)
+- `asr_simple.rs`: Automatic Speech Recognition — transcribe audio to text (requires ONNX feature)
 
 ### Vision Examples
-- `vision_simple.rs`: Vision capabilities - image analysis and OCR (coming soon)
+- `vision_simple.rs`: Vision capabilities — image analysis and OCR
+- `ocr_simple.rs`: PaddleOCR VL — document OCR
 
 ## Running Examples
 
-### Simple Chat Example
 ```bash
-cargo run --bin chat_simple
-```
+# Simple Chat
+cargo run --bin chat_simple --release
 
-### Streaming Chat Example
-```bash
-cargo run --bin chat_streaming
-```
+# Streaming Chat
+cargo run --bin chat_streaming --release
 
-### ASR Example (with ONNX support)
-```bash
-cargo run --features onnx --bin asr_simple
-```
+# ASR (with ONNX support)
+cargo run --features onnx --bin asr_simple --release
 
-### Vision Example
-```bash
-cargo run --bin vision_simple
+# Vision
+cargo run --bin vision_simple --release
+
+# OCR
+cargo run --bin ocr_simple --release
+
+# Hunyuan Dense
+cargo run --bin hunyuan_simple --release
 ```
 
 ## Prerequisites
@@ -84,8 +86,10 @@ fn main() -> CraneResult<()> {
 
 The Crane SDK provides a high-level interface for various AI capabilities:
 - **Chat**: Natural conversation with AI models
-- **Vision**: OCR, image analysis (coming soon)
+- **Vision**: OCR, image analysis
 - **Audio**: ASR, TTS (with ONNX feature)
-- **Multimodal**: Vision-language models (coming soon)
+- **Multimodal**: Vision-language models
+
+For API server usage (OpenAI / SGLang compatible), see [crane-oai/README.md](../crane-oai/README.md).
 
 For more advanced usage, check the documentation in the main `crane` crate.

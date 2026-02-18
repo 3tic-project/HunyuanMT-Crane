@@ -10,17 +10,15 @@ A high-performance inference framework leveraging Rust's Candle for maximum spee
 
 **Supported Models**:
 
-
-- [ ] ~~[Canary-180M-flash](https://huggingface.co/nvidia/canary-180m-flash)~~
-- [ ] ~~[SmolDocing-256M](https://huggingface.co/ds4sd/SmolDocling-256M-preview)~~
-- [x] Qwen3 VL (2B, 4B);
-- [x] Qwen3
-- [x] Moonshine ASR model;
-- [ ] 🎙️ TTS Systems:[Spark-TTS](https://github.com/SparkAudio/Spark-TTS) | [Orpheus-TTS](https://github.com/canopyai/Orpheus-TTS) (WIP)
-- [x] Silero VAD model;
-- [x] PaddleOCR VL 0.9B;
-- [x] PaddleOCR VL 1.5 0.9B;
-- [ ] Qwen3-TTS (Highest Priority, PR welcomed);
+- [x] Qwen3 (0.6B ~ 30B+)
+- [x] Qwen 2.5 (0.5B ~ 72B)
+- [x] Hunyuan Dense
+- [x] Qwen3 VL (2B, 4B)
+- [x] PaddleOCR VL 0.9B / 1.5
+- [x] Moonshine ASR
+- [x] Silero VAD
+- [ ] 🎙️ TTS: [Spark-TTS](https://github.com/SparkAudio/Spark-TTS) | [Orpheus-TTS](https://github.com/canopyai/Orpheus-TTS) (WIP)
+- [ ] Qwen3-TTS (Highest Priority, PR welcomed)
 
 
 submit your models make other users use it easier!
@@ -30,10 +28,11 @@ submit your models make other users use it easier!
 
 **Key Advantages**:
 
-- 🚀 **Blazing-Fast Inference**: Outperforms native PyTorch with Candle's optimized kernels;
-- 🦀 **Rust-Powered**: Eliminate C++ complexity while maintaining native performance;
-- 🍎 **Apple Silicon Optimized**: Achieve GPU acceleration via Metal on macOS devices;
-- 🤖 **Hardware Agnostic**: Unified codebase for CPU/CUDA/Metal execution;
+- 🚀 **Blazing-Fast Inference**: Outperforms native PyTorch with Candle's optimized kernels
+- 🦀 **Rust-Powered**: Eliminate C++ complexity while maintaining native performance
+- 🍎 **Apple Silicon Optimized**: Achieve GPU acceleration via Metal on macOS devices
+- 🤖 **Hardware Agnostic**: Unified codebase for CPU/CUDA/Metal execution
+- 🌐 **OpenAI compatible API**: Supports OpenAI and SGLang interfaces
 
 
 **Crane maybe the fastest (both speed and develop speed) framework you can use to build your AI applications!**
@@ -180,19 +179,84 @@ To use `crane`, here are some notes:
 
 - `crane-core`: All models comes into core, this is a lib;
 - `crane`: All Apps (runnable AI pipelines, such as Qwen2-Chat, Spark-TTS, Qwen2.5-VL etc), you can build your apps inside it, each app is a binary for demonstration purpose;
-- `crane-oai`: OpenAI API server serving various services in OpenAI format;
+- `crane-oai`: OpenAI & SGLang compatible API server with continuous batching, see [crane-oai/README.md](crane-oai/README.md) for full documentation;
 
 1. Make sure latest Rust were installed;
 2. Build:
 
-   ```
+   ```bash
    cargo run --bin llmbench --release
    cargo run --bin qwenchat --release
    ```
 
 That's it!
 
+### OpenAI API Server
+
+Start a server compatible with OpenAI SDK and SGLang client:
+
+```bash
+# Build
+cargo build -p crane-oai --release
+
+# Start (auto-detect model type and device)
+./target/release/crane-oai --model-path /path/to/Qwen2.5-7B-Instruct
+
+# Or run directly
+cargo run -p crane-oai --release -- --model-path /path/to/model --port 8000
+```
+
+Then use it with any OpenAI-compatible client:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+response = client.chat.completions.create(
+    model="Qwen2.5-7B-Instruct",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(response.choices[0].message.content)
+```
+
+Supported endpoints:
+
+| Family | Endpoint | Description |
+|--------|----------|-------------|
+| OpenAI | `POST /v1/chat/completions` | Chat completions (streaming & non-streaming) |
+| OpenAI | `POST /v1/completions` | Text completions |
+| OpenAI | `GET /v1/models` | List models |
+| OpenAI | `POST /v1/tokenize` | Tokenize text |
+| OpenAI | `POST /v1/detokenize` | Detokenize tokens |
+| SGLang | `POST /generate` | Native text generation |
+| SGLang | `GET /model_info` | Model metadata |
+| SGLang | `GET /server_info` | Server stats |
+| SGLang | `GET /health_generate` | Deep health check |
+| Mgmt   | `GET /health` | Health check |
+| Mgmt   | `GET /v1/stats` | Engine statistics |
+
+See [crane-oai/README.md](crane-oai/README.md) for full API documentation with request/response examples.
+
 Now you can run LLM extremly fast (about 6x faster than vanilla transformers on M1)!
+
+## 📁 Project Structure
+
+```
+Crane/
+├── crane-core/          # Core library: model implementations, tokenizer, generation
+│   └── src/models/      # Model architectures (Qwen 2.5, Qwen 3, Hunyuan, etc.)
+├── crane/               # High-level SDK: Chat, Vision, Audio, Multimodal clients
+├── crane-oai/           # OpenAI & SGLang compatible API server
+│   └── src/
+│       ├── engine/      # Continuous batching inference engine
+│       ├── handlers/    # HTTP request handlers (OpenAI, SGLang, common)
+│       ├── openai_api.rs # OpenAI request/response types
+│       ├── sglang_api.rs # SGLang API types
+│       └── main.rs      # CLI entry point & router
+├── example/             # Example binaries (chat, ASR, vision, OCR)
+├── vendor/              # Vendored references (llama.cpp, sglang, vllm)
+└── scripts/             # Utility scripts
+```
 
 ## 🍺 Contribution
 
