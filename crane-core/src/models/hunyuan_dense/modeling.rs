@@ -6,9 +6,6 @@ use serde::Deserialize;
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
-#[cfg(feature = "flash-attn")]
-use candle_flash_attn::{flash_attn, flash_attn_varlen};
-
 // ── GGUF loading helper ──
 
 /// Wraps a parsed GGUF file + reader for convenient tensor loading.
@@ -106,19 +103,6 @@ impl Module for LinearLayer {
             }
         }
     }
-}
-
-/// Pre-computed metadata for flash_attn_varlen in batched decode.
-///
-/// Built once per decode round in `step_batch_decode` and shared across
-/// all 28 transformer layers, eliminating 84 redundant CPU→GPU tensor
-/// transfers per round (3 per layer × 28 layers → just 3 total).
-#[allow(dead_code)]
-pub(crate) struct VarlenContext {
-    pub seqlens_q: Tensor,
-    pub seqlens_k: Tensor,
-    pub gather_index: Tensor,
-    pub max_seqlen_k: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -266,8 +250,6 @@ struct Attention {
     kv_cache: Option<(Tensor, Tensor)>,
     /// Number of valid (filled) positions in the KV cache buffer.
     cache_seq_len: usize,
-    #[cfg(feature = "flash-attn")]
-    use_flash_attn: bool,
 }
 
 impl Attention {
@@ -359,8 +341,6 @@ impl Attention {
             head_dim,
             kv_cache: None,
             cache_seq_len: 0,
-            #[cfg(feature = "flash-attn")]
-            use_flash_attn: true,
         })
     }
 
@@ -401,8 +381,6 @@ impl Attention {
             head_dim,
             kv_cache: None,
             cache_seq_len: 0,
-            #[cfg(feature = "flash-attn")]
-            use_flash_attn: true,
         })
     }
 
@@ -475,10 +453,8 @@ impl Attention {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
-        varlen_ctx: Option<&VarlenContext>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = hidden_states.dims3()?;
-        let _ = &varlen_ctx; // suppress unused warning when flash-attn is off
 
         let q = self.q_proj.forward(hidden_states)?;
         let k = self.k_proj.forward(hidden_states)?;
@@ -513,71 +489,6 @@ impl Attention {
         };
 
         let (k, v) = self.update_kv_cache(k, v)?;
-
-        // ── Attention computation ──
-        // Try flash attention first (eliminates repeat_kv + fuses SDPA into 1 kernel).
-        // flash_attn handles GQA natively (num_heads_q != num_heads_kv).
-        // Fall back to manual SDPA when a custom attention mask is needed
-        // (e.g., batched decode with padding) since flash_attn only supports causal masking.
-        #[cfg(feature = "flash-attn")]
-        {
-            if self.use_flash_attn {
-                let can_use_flash = attention_mask.is_none() || seq_len > 1;
-                if can_use_flash {
-                    let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
-                    let causal = seq_len > 1;
-                    // flash_attn expects layout (B, S, H, D)
-                    let q_fa = q.transpose(1, 2)?.contiguous()?;
-                    let k_fa = k.transpose(1, 2)?.contiguous()?;
-                    let v_fa = v.transpose(1, 2)?.contiguous()?;
-                    let attn_output = flash_attn(&q_fa, &k_fa, &v_fa, softmax_scale, causal)?;
-                    let attn_output = attn_output.reshape((b_sz, seq_len, ()))?;
-                    return self.o_proj.forward(&attn_output);
-                }
-
-                // ── flash_attn_varlen for batched decode with heterogeneous KV lengths ──
-                // KV cache is RIGHT-ALIGNED: [padding | prefill_data | decode_data].
-                // Valid data per sequence is contiguous. We use the pre-computed
-                // VarlenContext (built once per round in step_batch_decode) to
-                // avoid redundant CPU→GPU transfers across the 28 layers.
-                if seq_len == 1 {
-                    if let Some(ctx) = varlen_ctx {
-                        let total_s = k.dim(2)?;
-
-                        // Q: [B, num_heads, 1, D] → [B, num_heads, D] (total_q = B)
-                        let q_packed = q.squeeze(2)?.contiguous()?;
-
-                        // K/V: [B, kv_heads, S, D] → [total_kv, kv_heads, D] via pre-computed index.
-                        let k_perm = k.transpose(1, 2)?.contiguous()?;
-                        let v_perm = v.transpose(1, 2)?.contiguous()?;
-                        let k_flat =
-                            k_perm.reshape((b_sz * total_s, self.num_kv_heads, self.head_dim))?;
-                        let v_flat =
-                            v_perm.reshape((b_sz * total_s, self.num_kv_heads, self.head_dim))?;
-                        let k_packed = k_flat.index_select(&ctx.gather_index, 0)?;
-                        let v_packed = v_flat.index_select(&ctx.gather_index, 0)?;
-
-                        let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
-
-                        let attn_output = flash_attn_varlen(
-                            &q_packed,
-                            &k_packed,
-                            &v_packed,
-                            &ctx.seqlens_q,
-                            &ctx.seqlens_k,
-                            1,
-                            ctx.max_seqlen_k,
-                            softmax_scale,
-                            false,
-                        )?;
-                        // [B, num_heads, D] → [B, 1, hidden_size]
-                        let attn_output =
-                            attn_output.reshape((b_sz, 1, self.num_heads * self.head_dim))?;
-                        return self.o_proj.forward(&attn_output);
-                    }
-                }
-            }
-        }
 
         // ── Manual SDPA fallback (with mask support) ──
         // Use grouped query attention: reshape Q into [B*kv_heads, n_rep, S, D]
@@ -776,13 +687,11 @@ impl DecoderLayer {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
-        varlen_ctx: Option<&VarlenContext>,
     ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
         let hidden_states =
-            self.self_attn
-                .forward(&hidden_states, cos, sin, attention_mask, varlen_ctx)?;
+            self.self_attn.forward(&hidden_states, cos, sin, attention_mask)?;
         let hidden_states = (residual + hidden_states)?;
 
         let residual = &hidden_states;
@@ -1013,7 +922,7 @@ impl HunYuanDenseV1 {
         let mut hidden_states = hidden_states;
         for layer in self.layers.iter_mut() {
             hidden_states =
-                layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref(), None)?;
+                layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -1184,67 +1093,11 @@ impl HunYuanDenseV1 {
             .index_select(&pos_tensor, 0)?
             .to_dtype(self.dtype)?
             .unsqueeze(1)?;
-
-        // Pre-compute varlen metadata ONCE per round, shared across all layers.
-        // This eliminates 84 redundant CPU→GPU transfers per round (3 per layer × 28).
-        #[cfg(feature = "flash-attn")]
-        let varlen_ctx = if let Some((kv_lens, max_kv)) = batch_kv_info {
-            let b_sz = kv_lens.len();
-            let cache_s = self.layers[0].self_attn.cache_seq_len;
-            let total_s = cache_s + 1; // after update_kv_cache appends 1 token
-            let decode_tokens = total_s - max_kv;
-
-            let seqlens_q_data: Vec<u32> = (0..=b_sz).map(|i| i as u32).collect();
-            let seqlens_q = Tensor::new(seqlens_q_data.as_slice(), device)?;
-
-            let valid_kv_lens: Vec<usize> = kv_lens.iter().map(|&l| l + decode_tokens).collect();
-            let mut seqlens_k_data = vec![0u32; b_sz + 1];
-            for i in 0..b_sz {
-                seqlens_k_data[i + 1] = seqlens_k_data[i] + valid_kv_lens[i] as u32;
-            }
-            let seqlens_k = Tensor::new(seqlens_k_data.as_slice(), device)?;
-
-            let total_kv: usize = valid_kv_lens.iter().sum();
-            let mut indices: Vec<i64> = Vec::with_capacity(total_kv);
-            for i in 0..b_sz {
-                let row_base = i * total_s;
-                let start = max_kv - kv_lens[i];
-                for j in start..total_s {
-                    indices.push((row_base + j) as i64);
-                }
-            }
-            let gather_index = Tensor::new(indices.as_slice(), device)?;
-            let max_seqlen_k = valid_kv_lens.iter().copied().max().unwrap_or(1);
-
-            Some(VarlenContext {
-                seqlens_q,
-                seqlens_k,
-                gather_index,
-                max_seqlen_k,
-            })
-        } else {
-            None
-        };
-
-        #[cfg(not(feature = "flash-attn"))]
         let _ = batch_kv_info;
 
         let mut hidden_states = hidden_states;
         for layer in self.layers.iter_mut() {
-            #[cfg(feature = "flash-attn")]
-            {
-                hidden_states = layer.forward(
-                    &hidden_states,
-                    &cos,
-                    &sin,
-                    attention_mask,
-                    varlen_ctx.as_ref(),
-                )?;
-            }
-            #[cfg(not(feature = "flash-attn"))]
-            {
-                hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask, None)?;
-            }
+            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;

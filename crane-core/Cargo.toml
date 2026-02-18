@@ -9,7 +9,6 @@ anyhow = "1.0.97"
 candle-nn = "^0.9.2-alpha.2"
 candle-transformers = "0.9.2-alpha.2"
 candle-onnx = { version = "0.9.2-alpha.2", optional = true }
-candle-flash-attn = { version = "0.9.2-alpha.2", optional = true }
 clap = { version = "4.5.32", features = ["derive"] }
 hf-hub = "0.4.2"
 minijinja = "2.8.0"
@@ -40,7 +39,6 @@ cuda = [
     "candle-transformers/cuda",
 ]
 cudnn = ["candle-core/cudnn"]
-flash-attn = ["cuda", "candle-transformers/flash-attn", "dep:candle-flash-attn"]
 mkl = [
     "dep:intel-mkl-src",
     "candle-core/mkl",

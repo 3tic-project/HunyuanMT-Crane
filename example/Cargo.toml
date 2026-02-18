@@ -37,10 +37,6 @@ path = "src/ocr_simple.rs"
 name = "hunyuan_simple"
 path = "src/hunyuan_simple.rs"
 
-[[bin]]
-name = "orion_translate"
-path = "src/orion_translate.rs"
-
 [features]
 default = []
 onnx = ["crane/onnx"]
