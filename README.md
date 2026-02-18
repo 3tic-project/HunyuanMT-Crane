@@ -55,6 +55,7 @@ We include:
 
 ## 🔥 Updates
 
+- **`2026.02.18`**: ⚡ Qwen3 & Hunyuan Dense inference optimization: pre-allocated KV cache, GQA 4D matmul, fused RoPE with cache pre-growth, GGUF quantization, batched decode, smart sampling fallback for large vocabularies;
 - **`2026.01.30`**: PaddleOCR-VL-1.5 supported now! model: https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.5/;
 - **`2025.03.21`**: 🔥 Qwen2.5 a more transformers liked Rust interface were supported, you now use Crane just like in your python;
 - **`2025.03.19`**: 🔥 project initialized;
@@ -274,6 +275,29 @@ As all we know, a TTS model or any model based on LLM, it might consist of diffe
 
 One can reference to `crane-core/src/models/namo2.rs` for new arch add, which uses `Siglip2`, `mm_projector`, `Qwen2.5` to support a VL model.
 
+
+## ⚡ Inference Optimizations
+
+Crane implements production-grade inference optimizations for both **Qwen3** and **Hunyuan Dense**:
+
+| Optimization | Description | Benefit |
+|-------------|-------------|--------|
+| **Pre-allocated KV cache** | `slice_set` in-place writes instead of `Tensor::cat` | O(new_tokens) per step instead of O(cache_len) |
+| **GQA 4D matmul** | Keep [B, kv_heads, n_rep, D] shape, avoid reshape+contiguous copies | ~3x fewer copy kernels per decode step |
+| **Fused RoPE** | `candle_nn::rotary_emb::rope()` CUDA kernel with cos/sin pre-growth | 1 kernel launch per Q/K, cache hit on decode |
+| **GGUF quantization** | Polymorphic `LinearLayer` enum (safetensors + GGUF) | 2-4x memory reduction, same code path |
+| **Batched decode** | `setup_batch_decode` / `step_batch_decode` / `extract_batch_kv` | GPU-efficient concurrent sequence serving |
+| **KV cache swap** | Save/restore per-sequence caches for continuous batching | Context switch without recomputation |
+| **Smart sampling** | CPU fallback for large vocabularies (>64K) when top_p active | Avoids expensive GPU topk on 151K vocab |
+
+Environment variables for tuning:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CRANE_FORCE_GPU_TOPK` | `0` | Force GPU topk sampling even for large vocabularies |
+| `CRANE_TOPP_FALLBACK_TOPK` | `64` | Top-k size when top_p is active and GPU path is used |
+| `CRANE_TOPK_SAMPLE_ON_CPU` | `0` | Force CPU sampling after GPU topk |
+| `CRANE_SAMPLE_TRACE` | `0` | Enable detailed sampling timing logs |
 
 ## ⚡️ Speed
 

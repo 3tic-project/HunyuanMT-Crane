@@ -327,11 +327,11 @@ HTTP Request → Handler → EngineHandle.submit() ──channel──→ Infere
 
 通过 `ModelBackend` trait 抽象，支持不同模型架构：
 
-| 模型 | 批解码 | KV Swap | 格式 |
-|------|--------|---------|------|
-| Hunyuan Dense | ✅ | ✅ | Safetensors / GGUF |
-| Qwen 2.5 | 顺序 | ❌ | Safetensors |
-| Qwen 3 | 顺序 | ❌ | Safetensors |
+| 模型 | 批解码 | KV Swap | 格式 | 优化 |
+|------|--------|---------|------|------|
+| Hunyuan Dense | ✅ | ✅ | Safetensors / GGUF | KV 预分配, GQA 4D matmul, RoPE 缓存预增长 |
+| Qwen 3 | ✅ | ✅ | Safetensors / GGUF | KV 预分配, GQA 4D matmul, RoPE 缓存预增长, QK Norm 4D, GGUF 量化 |
+| Qwen 2.5 | 顺序 | ❌ | Safetensors | — |
 
 模型类型可通过 `--model-type` 显式指定，或从 `config.json` 的 `model_type` / `architectures` 字段自动检测。
 
@@ -367,14 +367,40 @@ for chunk in stream:
 ## 测试
 
 ```bash
-# 运行所有单元测试（122 个）
+# 运行所有单元测试（122 个 crane-oai + 11 个 crane-core）
 cargo test -p crane-oai
+cargo test -p crane-core
 
 # 运行特定模块测试
 cargo test -p crane-oai engine::scheduler
 cargo test -p crane-oai openai_api::tests
 cargo test -p crane-oai sglang_api::tests
+cargo test -p crane-core autotokenizer
 ```
+
+## 推理优化
+
+### Qwen3 & Hunyuan Dense 优化列表
+
+| 优化 | 说明 | 影响 |
+|------|------|------|
+| **KV 缓存预分配** | `slice_set` 原地写入代替 `Tensor::cat` | 每步 O(new) → 避免 O(cache) 重分配 |
+| **GQA 4D Matmul** | 保持 [B, kv_heads, n_rep, D] 形状，避免 reshape→contiguous 拷贝 | 每层省 3 次 contiguous 拷贝 |
+| **RoPE 缓存预增长** | `alloc_len = max(seq_len, cached_len*2, 512)` | Decode 阶段 cos/sin 全部命中缓存 |
+| **QK Norm 4D** (Qwen3) | RmsNorm 直接在 4D tensor 上操作 | 省去 reshape→contiguous 往返 |
+| **GGUF 量化** | `LinearLayer` 枚举同时支持 safetensors 和 GGUF | 2-4x 显存节省 |
+| **批量解码** | `setup/step/extract_batch_decode` | GPU 高效并发序列推理 |
+| **KV 缓存交换** | `get/set_kv_caches` | 连续批处理上下文切换 |
+| **大词表采样优化** | vocab > 64K 时 top_p 自动回退 CPU 采样 | 避免 151K 词表上昂贵的 GPU topk |
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `CRANE_FORCE_GPU_TOPK` | `0` | 强制 GPU topk（即使大词表） |
+| `CRANE_TOPP_FALLBACK_TOPK` | `64` | GPU topk 的 k 值 |
+| `CRANE_TOPK_SAMPLE_ON_CPU` | `0` | GPU topk 后回 CPU 采样 |
+| `CRANE_SAMPLE_TRACE` | `0` | 采样耗时详细日志 |
 
 ## License
 
