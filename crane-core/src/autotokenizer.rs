@@ -186,6 +186,35 @@ impl AutoTokenizer {
             )) as Box<dyn std::error::Error + Send + Sync>
         })?;
         let mut env = minijinja::Environment::new();
+
+        // Python-style string methods not built into minijinja.
+        env.add_filter("startswith", |s: &str, prefix: &str| s.starts_with(prefix));
+        env.add_filter("endswith", |s: &str, suffix: &str| s.ends_with(suffix));
+        env.add_filter("split", |s: String, sep: String| -> Vec<String> {
+            s.split(sep.as_str()).map(|p| p.to_string()).collect()
+        });
+        env.add_filter("lstrip", |s: String, chars: Option<String>| -> String {
+            match chars {
+                None => s.trim_start().to_string(),
+                Some(c) => s.trim_start_matches(c.chars().collect::<Vec<_>>().as_slice()).to_string(),
+            }
+        });
+        env.add_filter("rstrip", |s: String, chars: Option<String>| -> String {
+            match chars {
+                None => s.trim_end().to_string(),
+                Some(c) => s.trim_end_matches(c.chars().collect::<Vec<_>>().as_slice()).to_string(),
+            }
+        });
+        env.add_filter("strip", |s: String, chars: Option<String>| -> String {
+            match chars {
+                None => s.trim().to_string(),
+                Some(c) => {
+                    let ch: Vec<char> = c.chars().collect();
+                    s.trim_matches(ch.as_slice()).to_string()
+                }
+            }
+        });
+
         env.add_template("default", template_str).unwrap();
         let tmpl = env.get_template("default").unwrap();
         let eos = if let Some(eos) = &self.config.eos_token {
