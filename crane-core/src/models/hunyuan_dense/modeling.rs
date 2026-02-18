@@ -580,6 +580,10 @@ struct Mlp {
     gate_proj: LinearLayer,
     up_proj: LinearLayer,
     down_proj: LinearLayer,
+    /// Merged gate+up weight [2*intermediate_size, hidden_size] — one gemv instead of two.
+    /// Only set for Standard (non-quantized) weights.
+    gate_up_proj: Option<Linear>,
+    intermediate_size: usize,
 }
 
 impl Mlp {
@@ -599,14 +603,28 @@ impl Mlp {
             config.hidden_size,
             vb.pp("down_proj"),
         )?);
+
+        // Create merged gate+up projection for Standard weights.
+        let gate_up_proj =
+            if let (LinearLayer::Standard(ref g), LinearLayer::Standard(ref u)) =
+                (&gate_proj, &up_proj)
+            {
+                let gate_up_w = Tensor::cat(&[g.weight(), u.weight()], 0)?;
+                Some(Linear::new(gate_up_w, None))
+            } else {
+                None
+            };
+
         Ok(Self {
             gate_proj,
             up_proj,
             down_proj,
+            gate_up_proj,
+            intermediate_size: config.intermediate_size,
         })
     }
 
-    fn new_from_gguf<R: Read + Seek>(gg: &mut Gguf<R>, layer_idx: usize) -> Result<Self> {
+    fn new_from_gguf<R: Read + Seek>(gg: &mut Gguf<R>, layer_idx: usize, intermediate_size: usize) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
         let gate_proj = gg.linear(&format!("{prefix}.ffn_gate.weight"))?;
         let up_proj = gg.linear(&format!("{prefix}.ffn_up.weight"))?;
@@ -615,10 +633,33 @@ impl Mlp {
             gate_proj,
             up_proj,
             down_proj,
+            gate_up_proj: None, // GGUF quantized — cannot merge
+            intermediate_size,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if let Some(ref gate_up) = self.gate_up_proj {
+            // Merged path: one gemv → fused SiLU(gate) * up
+            let gu = gate_up.forward(x)?; // [B, S, 2*intermediate_size]
+
+            #[cfg(feature = "cuda")]
+            {
+                if gu.device().is_cuda() {
+                    let activated = crate::fused_ops::fused_silu_mul(
+                        &gu.contiguous()?,
+                        self.intermediate_size,
+                    )?;
+                    return self.down_proj.forward(&activated);
+                }
+            }
+
+            // CPU fallback
+            let gate = gu.narrow(D::Minus1, 0, self.intermediate_size)?;
+            let up = gu.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
+            let gate = candle_nn::Activation::Silu.forward(&gate)?;
+            return self.down_proj.forward(&(gate * up)?);
+        }
         let gate = self.gate_proj.forward(x)?;
         let gate = candle_nn::Activation::Silu.forward(&gate)?;
         let up = self.up_proj.forward(x)?;
@@ -661,7 +702,7 @@ impl DecoderLayer {
         layer_idx: usize,
     ) -> Result<Self> {
         let self_attn = Attention::new_from_gguf(config, gg, layer_idx)?;
-        let mlp = Mlp::new_from_gguf(gg, layer_idx)?;
+        let mlp = Mlp::new_from_gguf(gg, layer_idx, config.intermediate_size)?;
         let prefix = format!("blk.{layer_idx}");
         let input_layernorm =
             gg.rms_norm(&format!("{prefix}.attn_norm.weight"), config.rms_norm_eps)?;

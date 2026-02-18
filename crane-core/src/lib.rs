@@ -1,4 +1,4 @@
-pub mod generation;
+pub mod fused_ops;pub mod generation;
 pub mod models;
 pub mod utils;
 

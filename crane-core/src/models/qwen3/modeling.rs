@@ -28,6 +28,46 @@ use std::sync::Arc;
 // Reuse the polymorphic linear layer and GGUF loader from the shared Hunyuan module.
 pub use crate::models::hunyuan_dense::modeling::{Gguf, LinearLayer};
 
+// ── Event-tracking RAII guard ────────────────────────────────────────────
+//
+// Candle defaults to tracking per-tensor CudaEvents for multi-stream safety.
+// Crane uses a single CUDA stream — those events are pure overhead.
+// This guard disables tracking during a forward pass and re-enables it after.
+
+#[cfg(feature = "cuda")]
+struct EventTrackingGuard<'a> {
+    device: &'a candle_core::Device,
+    was_enabled: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> EventTrackingGuard<'a> {
+    fn disable(device: &'a candle_core::Device) -> Self {
+        if let candle_core::Device::Cuda(ref dev) = device {
+            let was_enabled = dev.is_event_tracking();
+            if was_enabled {
+                // Safety: we ensure sequential use of single CUDA stream.
+                unsafe { dev.disable_event_tracking() };
+            }
+            Self { device, was_enabled }
+        } else {
+            Self { device, was_enabled: false }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> Drop for EventTrackingGuard<'a> {
+    fn drop(&mut self) {
+        if self.was_enabled {
+            if let candle_core::Device::Cuda(ref dev) = self.device {
+                // Safety: restoring to previous state — still single-stream.
+                unsafe { dev.enable_event_tracking() };
+            }
+        }
+    }
+}
+
 // ── Config ──────────────────────────────────────────────────────────────
 
 fn default_true() -> bool {
@@ -77,52 +117,49 @@ impl Config {
 // ── Rotary Embedding (with cache) ───────────────────────────────────────
 
 struct RotaryEmbedding {
-    inv_freq: Tensor,
-    cos_cache: Option<Tensor>,
-    sin_cache: Option<Tensor>,
-    cached_len: usize,
+    /// Pre-computed cos table: [max_pos, head_dim] — full table, zero-copy narrow per call.
+    cos_table: Tensor,
+    /// Pre-computed sin table: [max_pos, head_dim] — full table, zero-copy narrow per call.
+    sin_table: Tensor,
 }
 
 impl RotaryEmbedding {
     fn new(config: &Config, device: &Device) -> Result<Self> {
         let dim = config.head_dim();
         let base = config.rope_theta;
+        let max_pos = config.max_position_embeddings;
+
+        // inv_freq: [dim/2]
         let inv: Vec<f32> = (0..dim)
             .step_by(2)
             .map(|i| 1.0 / base.powf(i as f64 / dim as f64) as f32)
             .collect();
         let inv_freq = Tensor::new(inv.as_slice(), device)?;
 
-        Ok(Self {
-            inv_freq,
-            cos_cache: None,
-            sin_cache: None,
-            cached_len: 0,
-        })
-    }
-
-    fn forward(&mut self, seq_len: usize, device: &Device) -> Result<(Tensor, Tensor)> {
-        if seq_len <= self.cached_len {
-            if let (Some(ref cos), Some(ref sin)) = (&self.cos_cache, &self.sin_cache) {
-                return Ok((cos.narrow(0, 0, seq_len)?, sin.narrow(0, 0, seq_len)?));
-            }
-        }
-
-        // Pre-grow the cache so we don't recompute cos/sin every decode step.
-        let alloc_len = seq_len.max(self.cached_len.saturating_mul(2)).max(512);
-        let positions: Vec<f32> = (0..alloc_len).map(|i| i as f32).collect();
+        // positions × inv_freq: [max_pos, dim/2]
+        let positions: Vec<f32> = (0..max_pos).map(|i| i as f32).collect();
         let positions = Tensor::new(positions.as_slice(), device)?;
         let freqs = positions
             .unsqueeze(1)?
-            .matmul(&self.inv_freq.unsqueeze(0)?)?; // [alloc_len, dim/2]
-        let cos = freqs.cos()?;
-        let sin = freqs.sin()?;
+            .matmul(&inv_freq.unsqueeze(0)?)?; // [max_pos, dim/2]
 
-        self.cos_cache = Some(cos.clone());
-        self.sin_cache = Some(sin.clone());
-        self.cached_len = alloc_len;
+        // cos/sin tables: [max_pos, dim/2] — candle_nn::rotary_emb::rope() handles
+        // the half-dim duplication internally, so we store the raw half-dim tables.
+        let cos_table = freqs.cos()?.contiguous()?;
+        let sin_table = freqs.sin()?.contiguous()?;
 
-        Ok((cos.narrow(0, 0, seq_len)?, sin.narrow(0, 0, seq_len)?))
+        Ok(Self {
+            cos_table,
+            sin_table,
+        })
+    }
+
+    /// Return cos/sin slices for positions [0..seq_len].
+    /// Both narrow() calls are zero-copy views — no CUDA kernel launched.
+    fn forward(&self, seq_len: usize) -> Result<(Tensor, Tensor)> {
+        let cos = self.cos_table.narrow(0, 0, seq_len)?;
+        let sin = self.sin_table.narrow(0, 0, seq_len)?;
+        Ok((cos, sin))
     }
 }
 
@@ -133,11 +170,16 @@ struct Attention {
     k_proj: LinearLayer,
     v_proj: LinearLayer,
     o_proj: LinearLayer,
+    /// Merged QKV weight [q_dim + 2*kv_dim, hidden_size] — one gemv instead of 3.
+    /// Only set for Standard (non-quantized) weights.
+    qkv_proj: Option<Linear>,
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    q_dim: usize,
+    kv_dim: usize,
     /// Pre-allocated KV cache buffer (may be larger than `cache_seq_len`).
     kv_cache: Option<(Tensor, Tensor)>,
     /// Number of valid (filled) positions in the KV cache buffer.
@@ -172,6 +214,24 @@ impl Attention {
         let v_proj = make_proj(config.hidden_size, num_kv_heads * head_dim, "v_proj")?;
         let o_proj = make_proj(num_heads * head_dim, config.hidden_size, "o_proj")?;
 
+        // Create merged QKV projection for Standard weights:
+        // Concatenate [q_weight; k_weight; v_weight] along dim 0 so one gemv
+        // replaces three.  `narrow` splits are zero-copy views.
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let qkv_proj = if let (LinearLayer::Standard(ref q), LinearLayer::Standard(ref k), LinearLayer::Standard(ref v)) =
+            (&q_proj, &k_proj, &v_proj)
+        {
+            let qkv_w = Tensor::cat(&[q.weight(), k.weight(), v.weight()], 0)?;
+            let qkv_b = match (q.bias(), k.bias(), v.bias()) {
+                (Some(qb), Some(kb), Some(vb)) => Some(Tensor::cat(&[qb, kb, vb], 0)?),
+                _ => None,
+            };
+            Some(Linear::new(qkv_w, qkv_b))
+        } else {
+            None
+        };
+
         let (q_norm, k_norm) = if config.use_qk_norm {
             (
                 Some(candle_nn::rms_norm(
@@ -194,11 +254,14 @@ impl Attention {
             k_proj,
             v_proj,
             o_proj,
+            qkv_proj,
             q_norm,
             k_norm,
             num_heads,
             num_kv_heads,
             head_dim,
+            q_dim,
+            kv_dim,
             kv_cache: None,
             cache_seq_len: 0,
         })
@@ -240,11 +303,14 @@ impl Attention {
             k_proj,
             v_proj,
             o_proj,
+            qkv_proj: None, // GGUF quantized — cannot merge
             q_norm,
             k_norm,
             num_heads,
             num_kv_heads,
             head_dim,
+            q_dim: num_heads * head_dim,
+            kv_dim: num_kv_heads * head_dim,
             kv_cache: None,
             cache_seq_len: 0,
         })
@@ -322,9 +388,19 @@ impl Attention {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = hidden_states.dims3()?;
 
-        let q = self.q_proj.forward(hidden_states)?;
-        let k = self.k_proj.forward(hidden_states)?;
-        let v = self.v_proj.forward(hidden_states)?;
+        // Use merged QKV if available — one gemv instead of three.
+        let (q, k, v) = if let Some(ref qkv_proj) = self.qkv_proj {
+            let qkv = qkv_proj.forward(hidden_states)?; // [B, S, q_dim+2*kv_dim]
+            let q = qkv.narrow(D::Minus1, 0, self.q_dim)?;
+            let k = qkv.narrow(D::Minus1, self.q_dim, self.kv_dim)?;
+            let v = qkv.narrow(D::Minus1, self.q_dim + self.kv_dim, self.kv_dim)?;
+            (q, k, v)
+        } else {
+            let q = self.q_proj.forward(hidden_states)?;
+            let k = self.k_proj.forward(hidden_states)?;
+            let v = self.v_proj.forward(hidden_states)?;
+            (q, k, v)
+        };
 
         // [B, S, num_heads * head_dim] → [B, num_heads, S, head_dim]
         let q = q
@@ -448,6 +524,10 @@ struct Mlp {
     gate_proj: LinearLayer,
     up_proj: LinearLayer,
     down_proj: LinearLayer,
+    /// Merged gate+up weight [2*intermediate_size, hidden_size] — one gemv instead of two.
+    /// Only set for Standard (non-quantized) weights.
+    gate_up_proj: Option<Linear>,
+    intermediate_size: usize,
 }
 
 impl Mlp {
@@ -467,14 +547,28 @@ impl Mlp {
             config.hidden_size,
             vb.pp("down_proj"),
         )?);
+
+        // Create merged gate+up projection for Standard weights.
+        let gate_up_proj =
+            if let (LinearLayer::Standard(ref g), LinearLayer::Standard(ref u)) =
+                (&gate_proj, &up_proj)
+            {
+                let gate_up_w = Tensor::cat(&[g.weight(), u.weight()], 0)?;
+                Some(Linear::new(gate_up_w, None))
+            } else {
+                None
+            };
+
         Ok(Self {
             gate_proj,
             up_proj,
             down_proj,
+            gate_up_proj,
+            intermediate_size: config.intermediate_size,
         })
     }
 
-    fn new_from_gguf<R: Read + Seek>(gg: &mut Gguf<R>, layer_idx: usize) -> Result<Self> {
+    fn new_from_gguf<R: Read + Seek>(gg: &mut Gguf<R>, layer_idx: usize, intermediate_size: usize) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
         let gate_proj = gg.linear(&format!("{prefix}.ffn_gate.weight"))?;
         let up_proj = gg.linear(&format!("{prefix}.ffn_up.weight"))?;
@@ -483,10 +577,35 @@ impl Mlp {
             gate_proj,
             up_proj,
             down_proj,
+            gate_up_proj: None, // GGUF quantized — cannot merge
+            intermediate_size,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if let Some(ref gate_up) = self.gate_up_proj {
+            // Merged path: one gemv → fused SiLU(gate) * up
+            let gu = gate_up.forward(x)?; // [B, S, 2*intermediate_size]
+
+            // Use fused CUDA kernel when available: eliminates narrow + silu + mul
+            // (3 kernel launches → 1).
+            #[cfg(feature = "cuda")]
+            {
+                if gu.device().is_cuda() {
+                    let activated = crate::fused_ops::fused_silu_mul(
+                        &gu.contiguous()?,
+                        self.intermediate_size,
+                    )?;
+                    return self.down_proj.forward(&activated);
+                }
+            }
+
+            // CPU / non-CUDA fallback
+            let gate = gu.narrow(D::Minus1, 0, self.intermediate_size)?;
+            let up = gu.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
+            let gate = candle_nn::Activation::Silu.forward(&gate)?;
+            return self.down_proj.forward(&(gate * up)?);
+        }
         let gate = self.gate_proj.forward(x)?;
         let gate = candle_nn::Activation::Silu.forward(&gate)?;
         let up = self.up_proj.forward(x)?;
@@ -531,7 +650,7 @@ impl DecoderLayer {
         layer_idx: usize,
     ) -> Result<Self> {
         let self_attn = Attention::new_from_gguf(config, gg, layer_idx)?;
-        let mlp = Mlp::new_from_gguf(gg, layer_idx)?;
+        let mlp = Mlp::new_from_gguf(gg, layer_idx, config.intermediate_size)?;
         let prefix = format!("blk.{layer_idx}");
         let input_layernorm =
             gg.rms_norm(&format!("{prefix}.attn_norm.weight"), config.rms_norm_eps)?;
@@ -738,10 +857,17 @@ impl Qwen3Model {
 
     pub fn forward(&mut self, input_ids: &Tensor, start_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = input_ids.dims2()?;
+
+        // Disable event tracking for the duration of the forward pass.
+        // Crane uses a single CUDA stream; the per-tensor CudaEvents are
+        // unnecessary and cost ~2×cuEventCreate+cuEventRecord per temp tensor.
+        #[cfg(feature = "cuda")]
+        let _event_guard = EventTrackingGuard::disable(input_ids.device());
+
         let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
 
         let total_len = start_pos + seq_len;
-        let (full_cos, full_sin) = self.rotary_emb.forward(total_len, input_ids.device())?;
+        let (full_cos, full_sin) = self.rotary_emb.forward(total_len)?;
         let cos = full_cos
             .narrow(0, start_pos, seq_len)?
             .to_dtype(self.dtype)?;
@@ -788,9 +914,6 @@ impl Qwen3Model {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache();
         }
-        self.rotary_emb.cos_cache = None;
-        self.rotary_emb.sin_cache = None;
-        self.rotary_emb.cached_len = 0;
     }
 
     pub fn num_layers(&self) -> usize {
@@ -905,9 +1028,7 @@ impl Qwen3Model {
 
         let max_pos = positions.iter().copied().max().unwrap_or(0) + 1;
         let device = input_ids.device();
-        let (full_cos, full_sin) = self.rotary_emb.forward(max_pos, device)?;
-
-        let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+        let (full_cos, full_sin) = self.rotary_emb.forward(max_pos)?;        let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         let pos_tensor = Tensor::new(pos_ids.as_slice(), device)?;
         let cos = full_cos
             .index_select(&pos_tensor, 0)?

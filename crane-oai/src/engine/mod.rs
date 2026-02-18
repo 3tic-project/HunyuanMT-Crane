@@ -495,7 +495,7 @@ impl InferenceEngine {
                 .collect();
 
             let input_ids = if let Some(buf) = self.decode_input_ids_buf.as_ref() {
-                if let Err(e) = buf.copy_from_slice_u32(&tokens) {
+                if let Err(e) = crane_core::fused_ops::copy_from_slice_u32(buf, &tokens) {
                     error!("Decode input_ids upload failed: {e}");
                     self.model.clear_kv_cache();
                     return;

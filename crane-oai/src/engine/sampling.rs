@@ -123,6 +123,30 @@ pub fn sample(
     let trace = std::env::var("CRANE_SAMPLE_TRACE").ok().as_deref() == Some("1");
     let t0 = Instant::now();
 
+    // ── Fast path: greedy + no repetition penalty ──────────────────────
+    // Skip the bf16→f32 conversion and use GPU argmax directly on bf16
+    // logits.  Saves one dtype-conversion kernel + less DtoH.
+    let greedy = match seq.temperature {
+        Some(t) => t <= 0.0,
+        None => false,
+    };
+    #[cfg(feature = "cuda")]
+    {
+        if greedy && seq.repetition_penalty == 1.0 && logits.device().is_cuda() {
+            let flat = logits.squeeze(0)?.squeeze(0)?;
+            let token = crane_core::fused_ops::gpu_argmax(&flat)?;
+            if trace {
+                let t_done = Instant::now();
+                tracing::debug!(
+                    id = %seq_id,
+                    total_us = t_done.duration_since(t0).as_micros() as u64,
+                    "sample(gpu_argmax_fast)"
+                );
+            }
+            return Ok(token);
+        }
+    }
+
     let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
     let t_after_prep = Instant::now();
 
@@ -133,10 +157,6 @@ pub fn sample(
     }
     let t_after_rep = Instant::now();
 
-    let greedy = match seq.temperature {
-        Some(t) => t <= 0.0,
-        None => false,
-    };
     if greedy {
         return Ok(logits.argmax(0)?.to_scalar::<u32>()?);
     }
@@ -182,7 +202,7 @@ pub fn sample(
         top_k = top_k.min(64).min(vocab);
 
         if top_k > 0 && top_k < vocab {
-            let topk_idx = logits.topk_indices(top_k).map_err(anyhow::Error::from)?;
+            let topk_idx = crane_core::fused_ops::topk_indices(&logits, top_k).map_err(anyhow::Error::from)?;
             let topk_logits = logits.gather(&topk_idx, candle_core::D::Minus1)?;
             let t_after_topk = Instant::now();
 
