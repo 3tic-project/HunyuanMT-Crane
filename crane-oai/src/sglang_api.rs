@@ -213,3 +213,189 @@ pub struct AbortResponse {
     pub success: bool,
     pub message: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── SamplingParams defaults ──
+
+    #[test]
+    fn sampling_params_default_values() {
+        let sp = SamplingParams::default();
+        assert_eq!(sp.max_new_tokens, 128);
+        assert!(sp.temperature.is_none());
+        assert!(sp.top_p.is_none());
+        assert!(sp.top_k.is_none());
+        assert_eq!(sp.repetition_penalty, 1.0);
+        assert!(sp.frequency_penalty.is_none());
+        assert!(sp.presence_penalty.is_none());
+        assert!(sp.stop.is_none());
+        assert!(sp.stop_token_ids.is_none());
+        assert!(sp.skip_special_tokens);
+        assert!(sp.seed.is_none());
+        assert_eq!(sp.n, 1);
+    }
+
+    // ── StringOrList ──
+
+    #[test]
+    fn string_or_list_single_into_vec() {
+        let s = StringOrList::Single("stop".into());
+        assert_eq!(s.into_vec(), vec!["stop".to_string()]);
+    }
+
+    #[test]
+    fn string_or_list_list_into_vec() {
+        let s = StringOrList::List(vec!["a".into(), "b".into()]);
+        assert_eq!(s.into_vec(), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn string_or_list_deserialize_single() {
+        let v: StringOrList = serde_json::from_str(r#""stop""#).unwrap();
+        assert_eq!(v.into_vec(), vec!["stop".to_string()]);
+    }
+
+    #[test]
+    fn string_or_list_deserialize_list() {
+        let v: StringOrList = serde_json::from_str(r#"["a","b"]"#).unwrap();
+        assert_eq!(v.into_vec(), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    // ── GenerateRequest deserialization ──
+
+    #[test]
+    fn generate_request_with_text() {
+        let json = r#"{
+            "text": "Hello world",
+            "sampling_params": {"max_new_tokens": 64},
+            "stream": false
+        }"#;
+        let req: GenerateRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.text, Some("Hello world".into()));
+        assert!(req.input_ids.is_none());
+        assert_eq!(req.sampling_params.max_new_tokens, 64);
+        assert!(!req.stream);
+    }
+
+    #[test]
+    fn generate_request_with_input_ids() {
+        let json = r#"{"input_ids": [1, 2, 3]}"#;
+        let req: GenerateRequest = serde_json::from_str(json).unwrap();
+        assert!(req.text.is_none());
+        assert_eq!(req.input_ids, Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn generate_request_defaults() {
+        let json = r#"{"text": "hi"}"#;
+        let req: GenerateRequest = serde_json::from_str(json).unwrap();
+        assert!(!req.stream);
+        assert!(req.rid.is_none());
+        // sampling_params should have defaults.
+        assert_eq!(req.sampling_params.max_new_tokens, 128);
+    }
+
+    #[test]
+    fn generate_request_with_rid() {
+        let json = r#"{"text": "hi", "rid": "custom-123"}"#;
+        let req: GenerateRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.rid, Some("custom-123".into()));
+    }
+
+    #[test]
+    fn generate_request_with_stop_strings() {
+        let json = r#"{
+            "text": "hi",
+            "sampling_params": {
+                "stop": ["<|end|>", "\n\n"]
+            }
+        }"#;
+        let req: GenerateRequest = serde_json::from_str(json).unwrap();
+        let stops = req.sampling_params.stop.unwrap().into_vec();
+        assert_eq!(stops, vec!["<|end|>", "\n\n"]);
+    }
+
+    // ── Response serialization ──
+
+    #[test]
+    fn generate_response_serializes() {
+        let resp = GenerateResponse {
+            text: "Hello!".into(),
+            meta_info: GenerateMetaInfo {
+                id: "gen-1".into(),
+                prompt_tokens: 5,
+                completion_tokens: 1,
+                finish_reason: "stop".into(),
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"text\":\"Hello!\""));
+        assert!(json.contains("\"prompt_tokens\":5"));
+    }
+
+    #[test]
+    fn generate_stream_chunk_optional_meta() {
+        let chunk = GenerateStreamChunk {
+            text: "tok".into(),
+            meta_info: None,
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(!json.contains("meta_info"));
+
+        let chunk_with_meta = GenerateStreamChunk {
+            text: "".into(),
+            meta_info: Some(GenerateMetaInfo {
+                id: "g1".into(),
+                prompt_tokens: 3,
+                completion_tokens: 10,
+                finish_reason: "length".into(),
+            }),
+        };
+        let json = serde_json::to_string(&chunk_with_meta).unwrap();
+        assert!(json.contains("\"finish_reason\":\"length\""));
+    }
+
+    #[test]
+    fn model_info_response_optional_fields() {
+        let resp = ModelInfoResponse {
+            model_path: "/models/test".into(),
+            model_type: "qwen3".into(),
+            is_generation: true,
+            dtype: None,
+            device: None,
+            max_model_len: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("dtype"));
+        assert!(!json.contains("device"));
+    }
+
+    #[test]
+    fn flush_cache_response_serializes() {
+        let resp = FlushCacheResponse {
+            success: true,
+            message: "done".into(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"success\":true"));
+    }
+
+    #[test]
+    fn abort_request_deserializes() {
+        let json = r#"{"rid": "req-42"}"#;
+        let req: AbortRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.rid, "req-42");
+    }
+
+    #[test]
+    fn abort_response_serializes() {
+        let resp = AbortResponse {
+            success: true,
+            message: "aborted".into(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"success\":true"));
+    }
+}

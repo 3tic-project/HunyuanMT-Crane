@@ -93,3 +93,170 @@ impl Scheduler {
         !self.waiting.is_empty() || !self.running.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_scheduler_is_empty() {
+        let mut s = Scheduler::new(4);
+        assert_eq!(s.active_count(), 0);
+        assert!(!s.has_work());
+        assert!(s.schedule().is_none());
+    }
+
+    #[test]
+    fn add_puts_into_waiting() {
+        let mut s = Scheduler::new(4);
+        s.add("req-1".into());
+        assert_eq!(s.waiting.len(), 1);
+        assert_eq!(s.running.len(), 0);
+        assert_eq!(s.active_count(), 1);
+        assert!(s.has_work());
+    }
+
+    #[test]
+    fn schedule_prefers_prefill_over_decode() {
+        let mut s = Scheduler::new(4);
+        // req-1 is already running (via promote).
+        s.promote_to_running("req-1".into());
+        // req-2 is waiting.
+        s.add("req-2".into());
+
+        let out = s.schedule().unwrap();
+        // Should prefill req-2 first (priority 1: waiting has items and capacity available).
+        assert!(out.is_prefill);
+        assert_eq!(out.batch, vec!["req-2".to_string()]);
+    }
+
+    #[test]
+    fn schedule_prefill_returns_single_sequence() {
+        let mut s = Scheduler::new(4);
+        s.add("req-1".into());
+        s.add("req-2".into());
+
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        // Only one sequence per prefill step.
+        assert_eq!(out.batch.len(), 1);
+        assert_eq!(out.batch[0], "req-1");
+    }
+
+    #[test]
+    fn schedule_decode_returns_all_running() {
+        let mut s = Scheduler::new(4);
+        s.promote_to_running("req-1".into());
+        s.promote_to_running("req-2".into());
+        s.promote_to_running("req-3".into());
+
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill);
+        assert_eq!(out.batch.len(), 3);
+    }
+
+    #[test]
+    fn schedule_respects_max_running() {
+        let mut s = Scheduler::new(2);
+        s.promote_to_running("req-1".into());
+        s.promote_to_running("req-2".into());
+        s.add("req-3".into()); // waiting, but at capacity
+
+        let out = s.schedule().unwrap();
+        // Can't prefill because running is at max_running.
+        assert!(!out.is_prefill);
+        assert_eq!(out.batch.len(), 2);
+    }
+
+    #[test]
+    fn remove_from_waiting() {
+        let mut s = Scheduler::new(4);
+        s.add("req-1".into());
+        s.add("req-2".into());
+        s.remove("req-1");
+        assert_eq!(s.waiting.len(), 1);
+        assert_eq!(s.waiting[0], "req-2");
+    }
+
+    #[test]
+    fn remove_from_running() {
+        let mut s = Scheduler::new(4);
+        s.promote_to_running("req-1".into());
+        s.promote_to_running("req-2".into());
+        s.remove("req-1");
+        assert_eq!(s.running.len(), 1);
+        assert_eq!(s.running[0], "req-2");
+    }
+
+    #[test]
+    fn remove_nonexistent_is_no_op() {
+        let mut s = Scheduler::new(4);
+        s.add("req-1".into());
+        s.remove("req-999"); // doesn't exist
+        assert_eq!(s.active_count(), 1);
+    }
+
+    #[test]
+    fn promote_to_running_adds_to_running_queue() {
+        let mut s = Scheduler::new(4);
+        s.promote_to_running("req-1".into());
+        assert_eq!(s.running.len(), 1);
+        assert_eq!(s.running[0], "req-1");
+    }
+
+    #[test]
+    fn fifo_order_maintained() {
+        let mut s = Scheduler::new(4);
+        s.add("a".into());
+        s.add("b".into());
+        s.add("c".into());
+
+        // First schedule should pick "a" (FIFO).
+        let out = s.schedule().unwrap();
+        assert_eq!(out.batch[0], "a");
+
+        // Next should pick "b".
+        let out = s.schedule().unwrap();
+        assert_eq!(out.batch[0], "b");
+    }
+
+    #[test]
+    fn schedule_none_when_empty() {
+        let mut s = Scheduler::new(4);
+        assert!(s.schedule().is_none());
+    }
+
+    #[test]
+    fn full_lifecycle() {
+        let mut s = Scheduler::new(2);
+
+        // Add 3 requests.
+        s.add("r1".into());
+        s.add("r2".into());
+        s.add("r3".into());
+        assert_eq!(s.active_count(), 3);
+
+        // Prefill r1.
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch[0], "r1");
+        s.promote_to_running("r1".into());
+
+        // Prefill r2.
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch[0], "r2");
+        s.promote_to_running("r2".into());
+
+        // At max_running=2, r3 waits; decode r1+r2.
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill);
+        assert_eq!(out.batch.len(), 2);
+
+        // Finish r1, now room for r3.
+        s.remove("r1");
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch[0], "r3");
+    }
+}

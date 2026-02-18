@@ -301,3 +301,37 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/abort_request", post(handlers::sglang::abort_request))
         .with_state(state)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn now_epoch_is_reasonable() {
+        let ts = now_epoch();
+        // Should be after 2020-01-01 (1577836800).
+        assert!(ts > 1_577_836_800);
+    }
+
+    #[test]
+    fn make_error_returns_correct_status() {
+        let (status, Json(body)) = make_error(StatusCode::BAD_REQUEST, "test error");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.error.message, "test error");
+        assert_eq!(body.error.r#type, "invalid_request_error");
+        assert!(body.error.code.is_none());
+    }
+
+    #[test]
+    fn make_error_internal() {
+        let (status, Json(body)) = make_error(StatusCode::INTERNAL_SERVER_ERROR, "boom");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error.message, "boom");
+    }
+
+    #[test]
+    fn make_error_service_unavailable() {
+        let (status, _) = make_error(StatusCode::SERVICE_UNAVAILABLE, "overloaded");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+}

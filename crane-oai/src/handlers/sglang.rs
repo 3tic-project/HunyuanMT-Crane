@@ -69,7 +69,7 @@ pub async fn generate(
             sp.max_new_tokens,
             sp.temperature.or(Some(0.8)),
             sp.top_p.or(Some(0.95)),
-            sp.top_k.or(Some(40)),
+            sp.top_k.or(Some(20)),
             sp.repetition_penalty,
             state.eos_token_id,
         )

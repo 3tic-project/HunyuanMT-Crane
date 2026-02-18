@@ -102,3 +102,132 @@ impl Sequence {
         "length"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_transformers::generation::LogitsProcessor;
+
+    /// Helper: build a minimal Sequence for testing.
+    fn make_seq(
+        prompt: &[u32],
+        generated: &[u32],
+        max_tokens: usize,
+        eos_token_id: u32,
+        status: SequenceStatus,
+    ) -> Sequence {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut tokens = prompt.to_vec();
+        tokens.extend_from_slice(generated);
+        Sequence {
+            id: "test-seq".into(),
+            status,
+            tokens,
+            prompt_len: prompt.len(),
+            kv_caches: vec![],
+            logits_processor: LogitsProcessor::new(42, Some(0.8), Some(0.95)),
+            temperature: Some(0.8),
+            top_p: Some(0.95),
+            top_k: Some(40),
+            max_tokens,
+            eos_token_id,
+            repetition_penalty: 1.0,
+            repeat_last_n: 64,
+            response_tx: tx,
+        }
+    }
+
+    #[test]
+    fn num_generated_no_generation() {
+        let seq = make_seq(&[1, 2, 3], &[], 10, 0, SequenceStatus::Waiting);
+        assert_eq!(seq.num_generated(), 0);
+    }
+
+    #[test]
+    fn num_generated_with_tokens() {
+        let seq = make_seq(&[1, 2, 3], &[10, 11, 12], 10, 0, SequenceStatus::Running);
+        assert_eq!(seq.num_generated(), 3);
+    }
+
+    #[test]
+    fn should_stop_at_max_tokens() {
+        let seq = make_seq(&[1, 2], &[10, 11], 2, 999, SequenceStatus::Running);
+        assert!(seq.should_stop());
+    }
+
+    #[test]
+    fn should_stop_on_eos() {
+        let seq = make_seq(&[1, 2], &[10, 2], 100, 2, SequenceStatus::Running);
+        assert!(seq.should_stop());
+    }
+
+    #[test]
+    fn should_not_stop_mid_generation() {
+        let seq = make_seq(&[1, 2], &[10], 100, 999, SequenceStatus::Running);
+        assert!(!seq.should_stop());
+    }
+
+    #[test]
+    fn should_stop_empty_with_max_zero() {
+        let seq = make_seq(&[1], &[], 0, 999, SequenceStatus::Running);
+        assert!(seq.should_stop());
+    }
+
+    #[test]
+    fn start_pos_waiting_is_zero() {
+        let seq = make_seq(&[1, 2, 3], &[], 10, 0, SequenceStatus::Waiting);
+        assert_eq!(seq.start_pos(), 0);
+    }
+
+    #[test]
+    fn start_pos_running_after_prefill() {
+        // Prompt of 3 tokens, 1 generated => total 4 tokens, start_pos = 3
+        let seq = make_seq(&[1, 2, 3], &[10], 10, 0, SequenceStatus::Running);
+        assert_eq!(seq.start_pos(), 3); // tokens.len() - 1 = 4 - 1
+    }
+
+    #[test]
+    fn start_pos_running_no_generated() {
+        // Just moved to Running but no token generated yet
+        let seq = make_seq(&[1, 2, 3], &[], 10, 0, SequenceStatus::Running);
+        assert_eq!(seq.start_pos(), 2); // tokens.len() - 1 = 3 - 1
+    }
+
+    #[test]
+    fn next_input_ids_waiting_returns_prompt() {
+        let seq = make_seq(&[1, 2, 3], &[], 10, 0, SequenceStatus::Waiting);
+        assert_eq!(seq.next_input_ids(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn next_input_ids_running_returns_last_token() {
+        let seq = make_seq(&[1, 2, 3], &[10, 11], 10, 0, SequenceStatus::Running);
+        assert_eq!(seq.next_input_ids(), &[11]);
+    }
+
+    #[test]
+    fn finish_reason_eos() {
+        let seq = make_seq(&[1, 2], &[10, 42], 100, 42, SequenceStatus::Running);
+        assert_eq!(seq.finish_reason(), "stop");
+    }
+
+    #[test]
+    fn finish_reason_length() {
+        let seq = make_seq(&[1, 2], &[10, 11], 100, 999, SequenceStatus::Running);
+        assert_eq!(seq.finish_reason(), "length");
+    }
+
+    #[test]
+    fn finish_reason_prompt_eos() {
+        // Prompt ends with EOS but no generation — still "stop"
+        let seq = make_seq(&[1, 2, 42], &[], 100, 42, SequenceStatus::Waiting);
+        assert_eq!(seq.finish_reason(), "stop");
+    }
+
+    #[test]
+    fn sequence_status_enum_eq() {
+        assert_eq!(SequenceStatus::Waiting, SequenceStatus::Waiting);
+        assert_ne!(SequenceStatus::Waiting, SequenceStatus::Running);
+        assert_ne!(SequenceStatus::Running, SequenceStatus::Finished);
+    }
+}

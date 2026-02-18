@@ -195,3 +195,153 @@ pub fn create_chat_template(
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ModelType::from_str ──
+
+    #[test]
+    fn model_type_from_str_hunyuan_variants() {
+        assert_eq!(ModelType::from_str("hunyuan"), ModelType::HunyuanDense);
+        assert_eq!(ModelType::from_str("hunyuan_dense"), ModelType::HunyuanDense);
+        assert_eq!(ModelType::from_str("hunyuandense"), ModelType::HunyuanDense);
+        assert_eq!(ModelType::from_str("HUNYUAN"), ModelType::HunyuanDense);
+    }
+
+    #[test]
+    fn model_type_from_str_qwen_variants() {
+        assert_eq!(ModelType::from_str("qwen25"), ModelType::Qwen25);
+        assert_eq!(ModelType::from_str("qwen2.5"), ModelType::Qwen25);
+        assert_eq!(ModelType::from_str("qwen2"), ModelType::Qwen25);
+        assert_eq!(ModelType::from_str("QWEN2"), ModelType::Qwen25);
+        assert_eq!(ModelType::from_str("qwen3"), ModelType::Qwen3);
+        assert_eq!(ModelType::from_str("QWEN3"), ModelType::Qwen3);
+    }
+
+    #[test]
+    fn model_type_from_str_auto_fallback() {
+        assert_eq!(ModelType::from_str("auto"), ModelType::Auto);
+        assert_eq!(ModelType::from_str("unknown"), ModelType::Auto);
+        assert_eq!(ModelType::from_str(""), ModelType::Auto);
+    }
+
+    #[test]
+    fn model_type_display_name() {
+        assert_eq!(ModelType::Auto.display_name(), "auto");
+        assert_eq!(ModelType::HunyuanDense.display_name(), "hunyuan");
+        assert_eq!(ModelType::Qwen25.display_name(), "qwen25");
+        assert_eq!(ModelType::Qwen3.display_name(), "qwen3");
+    }
+
+    // ── ModelFormat::from_str ──
+
+    #[test]
+    fn model_format_from_str() {
+        assert_eq!(ModelFormat::from_str("safetensors"), ModelFormat::Safetensors);
+        assert_eq!(ModelFormat::from_str("SAFETENSORS"), ModelFormat::Safetensors);
+        assert_eq!(ModelFormat::from_str("gguf"), ModelFormat::Gguf);
+        assert_eq!(ModelFormat::from_str("auto"), ModelFormat::Auto);
+        assert_eq!(ModelFormat::from_str("unknown"), ModelFormat::Auto);
+    }
+
+    // ── detect_model_type with temp files ──
+
+    #[test]
+    fn detect_from_config_json_model_type_qwen2() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, r#"{"model_type": "qwen2"}"#).unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::Qwen25);
+    }
+
+    #[test]
+    fn detect_from_config_json_model_type_qwen3() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, r#"{"model_type": "qwen3"}"#).unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::Qwen3);
+    }
+
+    #[test]
+    fn detect_from_config_json_architectures() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(
+            &config,
+            r#"{"architectures": ["HunyuanForCausalLM"]}"#,
+        )
+        .unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::HunyuanDense);
+    }
+
+    #[test]
+    fn detect_from_config_json_architectures_qwen2() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(
+            &config,
+            r#"{"architectures": ["Qwen2ForCausalLM"]}"#,
+        )
+        .unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::Qwen25);
+    }
+
+    #[test]
+    fn detect_from_config_json_architectures_qwen3() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(
+            &config,
+            r#"{"architectures": ["Qwen3ForCausalLM"]}"#,
+        )
+        .unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::Qwen3);
+    }
+
+    #[test]
+    fn detect_path_heuristic_hunyuan() {
+        let result = detect_model_type("/models/Hunyuan-Dense-7B");
+        assert_eq!(result, ModelType::HunyuanDense);
+    }
+
+    #[test]
+    fn detect_path_heuristic_qwen3() {
+        let result = detect_model_type("/models/Qwen3-8B");
+        assert_eq!(result, ModelType::Qwen3);
+    }
+
+    #[test]
+    fn detect_path_heuristic_qwen2() {
+        let result = detect_model_type("/models/Qwen2.5-7B-Instruct");
+        assert_eq!(result, ModelType::Qwen25);
+    }
+
+    #[test]
+    fn detect_fallback_unknown_defaults_to_qwen25() {
+        // Temp dir with no config.json and no heuristic match.
+        let dir = tempfile::tempdir().unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::Qwen25);
+    }
+
+    // ── resolve ──
+
+    #[test]
+    fn resolve_auto_delegates_to_detect() {
+        let result = resolve(ModelType::Auto, "/models/Qwen3-8B");
+        assert_eq!(result, ModelType::Qwen3);
+    }
+
+    #[test]
+    fn resolve_explicit_type_is_passthrough() {
+        let result = resolve(ModelType::HunyuanDense, "/models/whatever");
+        assert_eq!(result, ModelType::HunyuanDense);
+    }
+}

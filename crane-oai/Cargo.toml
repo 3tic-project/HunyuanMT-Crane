@@ -26,3 +26,6 @@ candle-transformers = "0.9.2-alpha.2"
 cuda = ["crane-core/cuda"]
 cudnn = ["crane-core/cudnn"]
 mkl = ["crane-core/mkl"]
+
+[dev-dependencies]
+tempfile = "3"
