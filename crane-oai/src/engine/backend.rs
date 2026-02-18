@@ -329,7 +329,7 @@ impl ModelBackend for Qwen3Backend {
     }
 
     fn num_layers(&self) -> usize {
-        0
+        self.model.num_layers()
     }
 
     fn device(&self) -> &Device {
@@ -337,7 +337,7 @@ impl ModelBackend for Qwen3Backend {
     }
 
     fn dtype(&self) -> DType {
-        self.dtype
+        self.model.dtype
     }
 
     fn tokenizer(&self) -> &tokenizers::Tokenizer {
@@ -357,5 +357,69 @@ impl ModelBackend for Qwen3Backend {
 
     fn warmup(&mut self) {
         self.model.warmup();
+    }
+
+    // ── KV swap ──
+
+    fn supports_kv_swap(&self) -> bool {
+        true
+    }
+
+    fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.model.get_kv_caches()
+    }
+
+    fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+        self.model.set_kv_caches(caches);
+    }
+
+    // ── Batch decode ──
+
+    fn supports_batch_decode(&self) -> bool {
+        true
+    }
+
+    fn setup_batch_decode(
+        &mut self,
+        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        extra_room: usize,
+    ) -> candle_core::Result<(Vec<usize>, usize)> {
+        self.model.setup_batch_decode(seq_kv_caches, extra_room)
+    }
+
+    fn step_batch_decode(
+        &mut self,
+        input_ids: &Tensor,
+        positions: &[usize],
+        attention_mask: Option<&Tensor>,
+        batch_kv_info: Option<(&[usize], usize)>,
+    ) -> candle_core::Result<Tensor> {
+        self.model
+            .step_batch_decode_with_input_ids(input_ids, positions, attention_mask, batch_kv_info)
+    }
+
+    fn extract_batch_kv(
+        &mut self,
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        rounds_done: usize,
+    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        self.model
+            .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
+    }
+
+    fn build_batch_decode_mask(
+        &self,
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        max_total_width: usize,
+    ) -> candle_core::Result<Option<Tensor>> {
+        crane_core::models::qwen3::modeling::build_batch_decode_mask(
+            kv_lens,
+            original_max_kv,
+            max_total_width,
+            self.device(),
+            self.dtype(),
+        )
     }
 }

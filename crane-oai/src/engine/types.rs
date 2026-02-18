@@ -107,7 +107,7 @@ mod tests {
             Some(0.95),
             Some(40),
             1.0,
-            0,
+            vec![0],
         );
         assert!(rx.is_ok());
     }
@@ -128,7 +128,7 @@ mod tests {
             None,
             None,
             1.0,
-            0,
+            vec![0],
         );
         assert!(result.is_err());
         assert!(result
