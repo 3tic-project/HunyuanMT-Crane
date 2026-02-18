@@ -173,7 +173,24 @@ impl AutoTokenizer {
             AutoTokenizer::from_file(tokenizer_file)
         }
     }
+}
 
+/// Rewrite Python-style string method calls to minijinja filter syntax.
+///
+/// Handles: `.startswith(`, `.endswith(`, `.split(`, `.lstrip(`, `.rstrip(`, `.strip(`
+/// e.g. `content.startswith('x')` → `(content) | startswith('x')`
+fn rewrite_python_str_methods(template: &str) -> String {
+    const METHODS: &[&str] = &["startswith", "endswith", "split", "lstrip", "rstrip", "strip"];
+    let mut out = template.to_string();
+    for method in METHODS {
+        let pat = format!(".{}(", method);
+        let repl = format!(" | {}(", method);
+        out = out.replace(&pat, &repl);
+    }
+    out
+}
+
+impl AutoTokenizer {
     pub fn apply_chat_template<S: serde::Serialize>(
         &self,
         ctx: S,
@@ -185,6 +202,10 @@ impl AutoTokenizer {
                 "missing field `chat_template`",
             )) as Box<dyn std::error::Error + Send + Sync>
         })?;
+        // Rewrite Python-style method calls to minijinja filter syntax.
+        // e.g. `content.startswith('x')` → `content | startswith('x')`
+        let template_str = rewrite_python_str_methods(template_str);
+
         let mut env = minijinja::Environment::new();
 
         // Python-style string methods not built into minijinja.
@@ -215,7 +236,7 @@ impl AutoTokenizer {
             }
         });
 
-        env.add_template("default", template_str).unwrap();
+        env.add_template("default", &template_str).unwrap();
         let tmpl = env.get_template("default").unwrap();
         let eos = if let Some(eos) = &self.config.eos_token {
             match eos {
