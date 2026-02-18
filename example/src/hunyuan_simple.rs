@@ -79,19 +79,26 @@ fn main() -> Result<()> {
     };
 
     println!("\nGenerating...");
-    let mut streamer = StdoutTokenStreamer {
-        stream: crane_core::utils::token_output_stream::TokenOutputStream::new(
+
+    let (mut streamer, receiver) =
+        crane_core::generation::streamer::AsyncTextStreamer::with_tokenizer(
             model.tokenizer.tokenizer.clone(),
-        ),
-    };
+        );
+
     let output_ids = model.generate(&input_ids, &gen_config, Some(&mut streamer))?;
 
-    let decoded = model
-        .tokenizer
-        .tokenizer
-        .decode(&output_ids, true)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    println!("\nFull output: {}", decoded);
+    let mut response_text = String::new();
+    for message in receiver {
+        match message {
+            crane_core::generation::streamer::StreamerMessage::Token(token_text) => {
+                print!("{token_text}");
+                response_text.push_str(&token_text);
+            }
+            crane_core::generation::streamer::StreamerMessage::End => {
+                break;
+            }
+        }
+    }
 
     Ok(())
 }

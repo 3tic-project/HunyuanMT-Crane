@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::sync::mpsc;
 use tokenizers::Tokenizer;
 
-use crate::autotokenizer::AutoTokenizer;
+use crate::{autotokenizer::AutoTokenizer, utils::token_output_stream::TokenOutputStream};
 
 pub trait TokenStreamer {
     fn append(&mut self, token_id: u32) -> Result<()>;
@@ -64,6 +64,7 @@ pub trait TokenDecode {
     fn decode_token(&self, token_id: u32) -> anyhow::Result<String>;
 }
 
+// traits decode_token for relatived types.
 impl TokenDecode for Tokenizer {
     fn decode_token(&self, token_id: u32) -> anyhow::Result<String> {
         self.decode(&[token_id], true)
@@ -74,6 +75,14 @@ impl TokenDecode for Tokenizer {
 impl TokenDecode for AutoTokenizer {
     fn decode_token(&self, token_id: u32) -> anyhow::Result<String> {
         self.decode(&[token_id], true)
+            .map_err(|e| anyhow::anyhow!("Decode failed: {}", e))
+    }
+}
+
+impl TokenDecode for TokenOutputStream {
+    fn decode_token(&self, token_id: u32) -> anyhow::Result<String> {
+        self.tokenizer
+            .decode(&[token_id], true)
             .map_err(|e| anyhow::anyhow!("Decode failed: {}", e))
     }
 }

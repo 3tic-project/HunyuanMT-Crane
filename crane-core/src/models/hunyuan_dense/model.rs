@@ -31,6 +31,7 @@ pub enum ModelFormat {
 }
 
 pub struct Model {
+    // pub tokenizer: TokenOutputStream,
     pub tokenizer: TokenOutputStream,
     pub device: Device,
     pub dtype: DType,
