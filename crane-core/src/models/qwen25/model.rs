@@ -9,7 +9,7 @@ use std::io::Write;
 use anyhow::{Error as E, Result};
 
 use candle_transformers::models::qwen2::{Config as ConfigBase, ModelForCausalLM as ModelBase};
-use candle_transformers::models::qwen2_moe::{Config as ConfigMoe, Model as ModelMoe};
+use candle_transformers::models::qwen2_moe::{Model as ModelMoe};
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -147,6 +147,16 @@ impl Model {
             ModelTyped::Moe(ref mut m) => m.clear_kv_cache(),
             ModelTyped::Base(ref mut m) => m.clear_kv_cache(),
         }
+    }
+
+    /// Run a single forward step, returning raw logits.
+    pub fn forward_step(
+        &mut self,
+        input_ids: &[u32],
+        start_pos: usize,
+    ) -> candle_core::Result<Tensor> {
+        let input = Tensor::new(input_ids, &self.device)?.unsqueeze(0)?;
+        self.forward(&input, start_pos)
     }
 
     fn from_pretrained(model_path: &str, device: &Device, dtype: &DType) -> Result<Model> {
