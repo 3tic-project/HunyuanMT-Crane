@@ -28,6 +28,13 @@ pub struct Scheduler {
     /// Used to interleave decode between consecutive prefills
     /// so running sequences are not starved.
     last_was_prefill: bool,
+    /// Dynamic cap on running sequences, set after eviction.
+    ///
+    /// When eviction occurs, the current running count (post-eviction) is
+    /// stored here to prevent immediately re-admitting sequences that would
+    /// exceed the KV budget again. Reset to `None` when a sequence finishes
+    /// naturally, allowing the system to try admitting more.
+    pub effective_max_running: Option<usize>,
 }
 
 impl Scheduler {
@@ -37,6 +44,7 @@ impl Scheduler {
             running: VecDeque::new(),
             max_running,
             last_was_prefill: false,
+            effective_max_running: None,
         }
     }
 
@@ -65,7 +73,8 @@ impl Scheduler {
 
         // Priority 1: Prefill a waiting sequence if there's capacity
         // and we're not forcing decode.
-        if !force_decode && !self.waiting.is_empty() && self.running.len() < self.max_running {
+        let max = self.effective_max_running.unwrap_or(self.max_running);
+        if !force_decode && !self.waiting.is_empty() && self.running.len() < max {
             let seq_id = self.waiting.pop_front().unwrap();
             self.last_was_prefill = true;
             return Some(SchedulerOutput {
@@ -375,5 +384,47 @@ mod tests {
         let out = s.schedule().unwrap();
         assert!(out.is_prefill);
         assert_eq!(out.batch[0], "r2");
+    }
+
+    #[test]
+    fn effective_max_running_prevents_prefill() {
+        let mut s = Scheduler::new(8);
+        s.promote_to_running("r1".into());
+        s.promote_to_running("r2".into());
+        s.promote_to_running("r3".into());
+        s.add("r4".into()); // waiting
+
+        // Without cap: would prefill r4 (3 < 8).
+        // With cap set to 3: should decode instead.
+        s.effective_max_running = Some(3);
+
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill, "Should decode, not prefill (capped at 3)");
+        assert_eq!(out.batch.len(), 3);
+
+        // Remove one running → running=2 < cap=3 → now can prefill.
+        s.remove("r1");
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch[0], "r4");
+    }
+
+    #[test]
+    fn effective_max_running_reset_allows_admission() {
+        let mut s = Scheduler::new(8);
+        s.promote_to_running("r1".into());
+        s.promote_to_running("r2".into());
+        s.add("r3".into());
+
+        // Cap at 2 → can't admit r3.
+        s.effective_max_running = Some(2);
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill);
+
+        // Lift cap → can now admit r3.
+        s.effective_max_running = None;
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch[0], "r3");
     }
 }

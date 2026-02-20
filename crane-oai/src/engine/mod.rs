@@ -582,10 +582,22 @@ impl InferenceEngine {
 
             self.tracked_kv_bytes = self.tracked_kv_bytes.saturating_sub(freed);
 
-            // Move from running back to waiting (front, so it gets re-prefilled soon).
+            // Move from running back to waiting (back, not front — avoid
+            // immediate re-prefill which would cause thrashing).
             self.scheduler.running.retain(|id| id != &victim_id);
-            self.scheduler.waiting.push_front(victim_id);
+            self.scheduler.waiting.push_back(victim_id);
         }
+
+        // Cap effective max_running to the post-eviction running count.
+        // This prevents the scheduler from admitting new sequences that
+        // would immediately exceed the budget again (eviction thrashing).
+        // The cap is lifted when a sequence finishes naturally.
+        let post_eviction_running = self.scheduler.running.len();
+        self.scheduler.effective_max_running = Some(post_eviction_running);
+        info!(
+            "Eviction complete: capping concurrent sequences at {} (was {})",
+            post_eviction_running, self.scheduler.max_running,
+        );
 
         // Grant a cooldown period so the cuMemGetInfo hard-safety check
         // doesn't immediately re-trigger (CUDA pool retains freed blocks).
@@ -1350,6 +1362,13 @@ impl InferenceEngine {
             self.active_seq_id = None;
         }
         self.model.clear_kv_cache();
+
+        // Lift the eviction cap: a sequence finished naturally, so there
+        // is genuine headroom to admit new sequences from the waiting queue.
+        if self.scheduler.effective_max_running.is_some() {
+            debug!("Eviction cap lifted (sequence completed, headroom available)");
+            self.scheduler.effective_max_running = None;
+        }
 
         debug!(id = %seq_id, "Sequence cleaned up");
     }
