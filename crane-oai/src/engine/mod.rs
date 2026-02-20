@@ -723,7 +723,12 @@ impl InferenceEngine {
             debug_assert_eq!(output.batch.len(), 1);
             let seq_id = &output.batch[0];
             self.step_prefill(seq_id.clone());
-        } else if self.model.supports_batch_decode() {
+        } else if self.model.supports_batch_decode() && output.batch.len() > 1 {
+            // True batched decode only when there are multiple sequences.
+            // For a single sequence the sequential path is far cheaper: it
+            // keeps the KV cache resident in the model and avoids the
+            // extract→pad→stack→extract GPU-copy cycle that batch decode
+            // performs every scheduling round.
             self.step_decode_batch(output.batch);
         } else {
             self.step_decode_sequential(output.batch);
@@ -871,6 +876,17 @@ impl InferenceEngine {
                 }
             };
         drop(kv_caches);
+
+        // Now that setup_batch_decode has consumed the KV views (building its
+        // own padded buffer), drop the per-sequence cache references.  With
+        // zero-copy narrow views from get_kv_caches(), these still pin the
+        // old pre-allocated buffers — clearing them here lets CUDA free that
+        // VRAM before the decode loop allocates intermediates.
+        for seq_id in &batch {
+            if let Some(seq) = self.sequences.get_mut(seq_id) {
+                seq.kv_caches = vec![None; self.num_layers];
+            }
+        }
 
         let t_setup = t0.elapsed();
 

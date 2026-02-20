@@ -928,8 +928,12 @@ impl Qwen3Model {
             .sum()
     }
 
-    /// Extract per-layer KV caches. Returns only the valid (filled) portion
-    /// as **contiguous copies**, not views of the oversized pre-allocated buffer.
+    /// Extract per-layer KV caches (valid portion only, zero-copy narrow views).
+    ///
+    /// The returned views still reference the pre-allocated buffer.  Callers
+    /// that need to free the buffer (e.g. batch-decode extract) should use
+    /// `Tensor::contiguous()` on their side, or clear `seq.kv_caches` after
+    /// consuming the views.
     pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
         self.layers
             .iter()
@@ -937,14 +941,9 @@ impl Qwen3Model {
                 l.self_attn.kv_cache.as_ref().map(|(k, v)| {
                     let len = l.self_attn.cache_seq_len;
                     if len > 0 && len < k.dim(2).unwrap_or(0) {
-                        // Contiguous copy — breaks ref to oversized buffer.
                         (
-                            k.narrow(2, 0, len)
-                                .and_then(|t| t.contiguous())
-                                .unwrap_or_else(|_| k.clone()),
-                            v.narrow(2, 0, len)
-                                .and_then(|t| t.contiguous())
-                                .unwrap_or_else(|_| v.clone()),
+                            k.narrow(2, 0, len).unwrap_or_else(|_| k.clone()),
+                            v.narrow(2, 0, len).unwrap_or_else(|_| v.clone()),
                         )
                     } else {
                         (k.clone(), v.clone())
