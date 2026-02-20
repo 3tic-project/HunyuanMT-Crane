@@ -427,13 +427,18 @@ impl InferenceEngine {
     // ─────────────────────────────────────────────────────────
 
     /// Recount `tracked_kv_bytes` from all sequences.
-    /// Call this after batch operations that change multiple sequences' KV caches.
+    /// For the active sequence, bytes are in the model (uses `active_kv_cache_bytes`).
+    /// For other sequences, bytes are stored in `seq.kv_caches`.
     fn recount_kv_bytes(&mut self) {
-        self.tracked_kv_bytes = self
-            .sequences
-            .values()
-            .map(|seq| sequence::kv_cache_bytes(&seq.kv_caches))
-            .sum();
+        let mut total: u64 = 0;
+        for (id, seq) in &self.sequences {
+            if self.active_seq_id.as_deref() == Some(id.as_str()) {
+                total += self.model.active_kv_cache_bytes();
+            } else {
+                total += sequence::kv_cache_bytes(&seq.kv_caches);
+            }
+        }
+        self.tracked_kv_bytes = total;
     }
 
     /// KV cache budget **in KV-cache bytes** (not raw GPU bytes).
@@ -838,17 +843,12 @@ impl InferenceEngine {
             if self.sequences.contains_key(prev_id) {
                 let caches = self.model.get_kv_caches();
                 if let Some(seq) = self.sequences.get_mut(prev_id) {
-                    let old_bytes = sequence::kv_cache_bytes(&seq.kv_caches);
                     seq.kv_caches = caches;
-                    let new_bytes = sequence::kv_cache_bytes(&seq.kv_caches);
-                    self.tracked_kv_bytes = self
-                        .tracked_kv_bytes
-                        .saturating_sub(old_bytes)
-                        .saturating_add(new_bytes);
                 }
             }
             self.model.clear_kv_cache();
         }
+        self.recount_kv_bytes();
 
         // Collect KV caches and setup batched decode.
         let kv_caches: Vec<Vec<Option<(Tensor, Tensor)>>> = batch
@@ -1208,19 +1208,15 @@ impl InferenceEngine {
             return;
         }
 
+        // Save previous active sequence's KV cache from the model.
         if let Some(ref prev_id) = self.active_seq_id.clone() {
             let caches = self.model.get_kv_caches();
             if let Some(prev_seq) = self.sequences.get_mut(prev_id) {
-                let old_bytes = sequence::kv_cache_bytes(&prev_seq.kv_caches);
                 prev_seq.kv_caches = caches;
-                let new_bytes = sequence::kv_cache_bytes(&prev_seq.kv_caches);
-                self.tracked_kv_bytes = self
-                    .tracked_kv_bytes
-                    .saturating_sub(old_bytes)
-                    .saturating_add(new_bytes);
             }
         }
 
+        // Load new sequence's KV cache into the model.
         let caches = self
             .sequences
             .get(seq_id)
@@ -1229,28 +1225,33 @@ impl InferenceEngine {
         self.model.set_kv_caches(caches);
         self.active_seq_id = Some(seq_id.to_string());
 
+        self.recount_kv_bytes();
         self.stats
             .total_kv_swap_count
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Mark that the model finished processing `seq_id` for this scheduling
+    /// round.  Instead of extracting full KV caches (expensive GPU copies),
+    /// we only update byte tracking from the model's internal state.
+    /// The actual KV tensors remain in the model and are saved lazily by
+    /// `swap_in` when switching to a different sequence.
     fn swap_out(&mut self, seq_id: &str) {
         if !self.model.supports_kv_swap() {
             return;
         }
-        if self.active_seq_id.as_deref() == Some(seq_id) {
-            let caches = self.model.get_kv_caches();
-            if let Some(seq) = self.sequences.get_mut(seq_id) {
-                // Update tracked KV bytes: subtract old, add new.
-                let old_bytes = sequence::kv_cache_bytes(&seq.kv_caches);
-                seq.kv_caches = caches;
-                let new_bytes = sequence::kv_cache_bytes(&seq.kv_caches);
-                self.tracked_kv_bytes = self
-                    .tracked_kv_bytes
-                    .saturating_sub(old_bytes)
-                    .saturating_add(new_bytes);
+        if self.active_seq_id.as_deref() != Some(seq_id) {
+            return;
+        }
+        // Drop stale seq cache references (from the last swap_in) to free
+        // GPU memory.  swap_in will extract fresh caches from the model
+        // when switching to a different sequence.
+        if let Some(seq) = self.sequences.get_mut(seq_id) {
+            if seq.kv_caches.iter().any(|c| c.is_some()) {
+                seq.kv_caches = vec![None; seq.kv_caches.len()];
             }
         }
+        self.recount_kv_bytes();
     }
 
     // ─────────────────────────────────────────────────────────
@@ -1346,10 +1347,15 @@ impl InferenceEngine {
 
     fn cleanup_sequence(&mut self, seq_id: &str) {
         // Subtract this sequence's KV bytes from the tracked total.
-        if let Some(seq) = self.sequences.get(seq_id) {
-            let freed = sequence::kv_cache_bytes(&seq.kv_caches);
-            self.tracked_kv_bytes = self.tracked_kv_bytes.saturating_sub(freed);
-        }
+        // If active, bytes are in the model (not in seq.kv_caches).
+        let freed = if self.active_seq_id.as_deref() == Some(seq_id) {
+            self.model.active_kv_cache_bytes()
+        } else if let Some(seq) = self.sequences.get(seq_id) {
+            sequence::kv_cache_bytes(&seq.kv_caches)
+        } else {
+            0
+        };
+        self.tracked_kv_bytes = self.tracked_kv_bytes.saturating_sub(freed);
 
         self.sequences.remove(seq_id);
         self.token_streams.remove(seq_id);

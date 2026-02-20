@@ -908,6 +908,26 @@ impl Qwen3Model {
         self.layers.len()
     }
 
+    /// Total bytes held by the model's KV caches (no GPU copies).
+    pub fn active_kv_cache_bytes(&self) -> u64 {
+        self.layers
+            .iter()
+            .map(|l| {
+                l.self_attn
+                    .kv_cache
+                    .as_ref()
+                    .map(|(k, v)| {
+                        let k_bytes =
+                            k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
+                        let v_bytes =
+                            v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
+                        k_bytes + v_bytes
+                    })
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
     /// Extract per-layer KV caches. Returns only the valid (filled) portion
     /// as **contiguous copies**, not views of the oversized pre-allocated buffer.
     pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
