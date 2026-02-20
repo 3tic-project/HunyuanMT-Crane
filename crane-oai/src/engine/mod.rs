@@ -1141,10 +1141,17 @@ impl InferenceEngine {
         self.token_streams.remove(seq_id);
         self.scheduler.remove(seq_id);
 
+        // Always clear model KV cache when a sequence is removed.
+        // In the batch-decode path `active_seq_id` is None (taken at
+        // the start of the step), so the old conditional would skip
+        // clearing — leaving stale KV data in the model.
         if self.active_seq_id.as_deref() == Some(seq_id) {
-            self.model.clear_kv_cache();
             self.active_seq_id = None;
         }
+        // Unconditionally clear: extract_batch_kv already sets per-layer
+        // caches to None, but this also resets RoPE caches and ensures
+        // no dangling GPU tensors when the last sequence finishes.
+        self.model.clear_kv_cache();
 
         debug!(id = %seq_id, "Sequence cleaned up");
     }

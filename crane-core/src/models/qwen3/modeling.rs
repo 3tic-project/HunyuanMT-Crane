@@ -341,7 +341,7 @@ impl Attention {
                     drop(cur_k);
                     drop(cur_v);
                     let total = full_k.dim(2)?;
-                    let room = total.max(256);
+                    let room = 256; // fixed small room — avoids 2x over-allocation
                     let (b, h, _, d) = full_k.dims4()?;
                     let new_buf_k =
                         Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
@@ -357,7 +357,7 @@ impl Attention {
             None => {
                 // First use — allocate buffer with extra room.
                 let (b, h, s, d) = k.dims4()?;
-                let room = s.max(256);
+                let room = 256; // fixed small room — avoids 2x over-allocation
                 let buf_k = Tensor::zeros((b, h, s + room, d), k.dtype(), k.device())?;
                 let buf_v = Tensor::zeros((b, h, s + room, d), v.dtype(), v.device())?;
                 buf_k.slice_set(&k, 2, 0)?;
@@ -908,7 +908,8 @@ impl Qwen3Model {
         self.layers.len()
     }
 
-    /// Extract per-layer KV caches (valid portion only, zero-copy narrow views).
+    /// Extract per-layer KV caches. Returns only the valid (filled) portion
+    /// as **contiguous copies**, not views of the oversized pre-allocated buffer.
     pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
         self.layers
             .iter()
@@ -916,9 +917,14 @@ impl Qwen3Model {
                 l.self_attn.kv_cache.as_ref().map(|(k, v)| {
                     let len = l.self_attn.cache_seq_len;
                     if len > 0 && len < k.dim(2).unwrap_or(0) {
+                        // Contiguous copy — breaks ref to oversized buffer.
                         (
-                            k.narrow(2, 0, len).unwrap_or_else(|_| k.clone()),
-                            v.narrow(2, 0, len).unwrap_or_else(|_| v.clone()),
+                            k.narrow(2, 0, len)
+                                .and_then(|t| t.contiguous())
+                                .unwrap_or_else(|_| k.clone()),
+                            v.narrow(2, 0, len)
+                                .and_then(|t| t.contiguous())
+                                .unwrap_or_else(|_| v.clone()),
                         )
                     } else {
                         (k.clone(), v.clone())
@@ -1057,9 +1063,10 @@ impl Qwen3Model {
                     let row_v = full_v.narrow(0, i, 1)?;
                     let total = kv_lens[i] + rounds_done;
                     let offset = original_max_kv - kv_lens[i];
+                    // Contiguous copy — breaks ref to padded batch buffer.
                     let clean = Some((
-                        row_k.narrow(2, offset, total)?,
-                        row_v.narrow(2, offset, total)?,
+                        row_k.narrow(2, offset, total)?.contiguous()?,
+                        row_v.narrow(2, offset, total)?.contiguous()?,
                     ));
                     result[i].push(clean);
                 }

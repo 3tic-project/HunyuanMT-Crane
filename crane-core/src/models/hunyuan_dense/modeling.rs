@@ -421,7 +421,7 @@ impl Attention {
                     drop(cur_k);
                     drop(cur_v);
                     let total = full_k.dim(2)?;
-                    let room = total.max(256);
+                    let room = 256; // fixed small room — avoids 2x over-allocation
                     let (b, h, _, d) = full_k.dims4()?;
                     let new_buf_k = Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
                     let new_buf_v = Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
@@ -435,7 +435,7 @@ impl Attention {
             None => {
                 // First use: allocate buffer with extra room.
                 let (b, h, s, d) = k.dims4()?;
-                let room = s.max(256);
+                let room = 256; // fixed small room — avoids 2x over-allocation
                 let buf_k = Tensor::zeros((b, h, s + room, d), k.dtype(), k.device())?;
                 let buf_v = Tensor::zeros((b, h, s + room, d), v.dtype(), v.device())?;
                 buf_k.slice_set(&k, 2, 0)?;
@@ -979,9 +979,10 @@ impl HunYuanDenseV1 {
         self.layers.len()
     }
 
-    /// Extract per-layer KV caches. Returns only the valid (filled) portion,
-    /// **not** the pre-allocated buffer. Per-sequence storage should keep these
-    /// compactly; `setup_batch_decode` will re-create a pre-allocated buffer.
+    /// Extract per-layer KV caches. Returns only the valid (filled) portion
+    /// as **contiguous copies**, not views of the (oversized) pre-allocated
+    /// buffer. This ensures the buffer can be freed immediately, preventing
+    /// VRAM from growing across requests.
     pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
         self.layers
             .iter()
@@ -989,10 +990,14 @@ impl HunYuanDenseV1 {
                 l.self_attn.kv_cache.as_ref().map(|(k, v)| {
                     let len = l.self_attn.cache_seq_len;
                     if len > 0 && len < k.dim(2).unwrap_or(0) {
-                        // Narrow to valid data — still a zero-copy view.
+                        // Contiguous copy of valid data — breaks ref to oversized buffer.
                         (
-                            k.narrow(2, 0, len).unwrap_or_else(|_| k.clone()),
-                            v.narrow(2, 0, len).unwrap_or_else(|_| v.clone()),
+                            k.narrow(2, 0, len)
+                                .and_then(|t| t.contiguous())
+                                .unwrap_or_else(|_| k.clone()),
+                            v.narrow(2, 0, len)
+                                .and_then(|t| t.contiguous())
+                                .unwrap_or_else(|_| v.clone()),
                         )
                     } else {
                         (k.clone(), v.clone())
@@ -1169,9 +1174,11 @@ impl HunYuanDenseV1 {
                     // decode at [max_kv .. max_kv + rounds_done].
                     let total = kv_lens[i] + rounds_done;
                     let offset = original_max_kv - kv_lens[i];
+                    // Contiguous copy — breaks reference to the large padded
+                    // batch buffer so it can be freed immediately.
                     let clean = Some((
-                        row_k.narrow(2, offset, total)?,
-                        row_v.narrow(2, offset, total)?,
+                        row_k.narrow(2, offset, total)?.contiguous()?,
+                        row_v.narrow(2, offset, total)?.contiguous()?,
                     ));
                     result[i].push(clean);
                 }
