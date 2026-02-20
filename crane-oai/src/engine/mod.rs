@@ -1360,10 +1360,18 @@ impl InferenceEngine {
         }
         self.model.clear_kv_cache();
 
-        // Lift the eviction cap: a sequence finished naturally, so there
-        // is genuine headroom to admit new sequences from the waiting queue.
-        if self.scheduler.effective_max_running.is_some() {
-            debug!("Eviction cap lifted (sequence completed, headroom available)");
+        // Only lift the eviction cap when the system has drained all
+        // waiting sequences. Under sustained load, keeping the cap prevents
+        // repeated eviction-readmit cycles (e.g., cap=6 → finish → admit 7th →
+        // evict → cap=6 → repeat). Once the load subsides and all waiting
+        // sequences are served, we reset so the next burst can try full
+        // concurrency again.
+        if self.scheduler.effective_max_running.is_some()
+            && self.scheduler.waiting.is_empty()
+        {
+            debug!(
+                "Eviction cap lifted (no waiting sequences, load subsided)"
+            );
             self.scheduler.effective_max_running = None;
         }
 
