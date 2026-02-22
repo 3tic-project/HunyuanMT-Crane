@@ -1,7 +1,7 @@
 //! High-level Qwen3-TTS model wrapper.
 //!
 //! Handles model loading, text tokenization, speech generation, and
-//! code → waveform decoding via ONNX speech tokenizer.
+//! code → waveform decoding via native Candle speech tokenizer decoder.
 
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, Tensor};
@@ -10,17 +10,44 @@ use hound::{SampleFormat, WavSpec, WavWriter};
 use tokenizers::Tokenizer;
 
 use super::modeling::{Qwen3TTSConfig, Qwen3TTSModel};
+use super::speech_tokenizer_v2::NativeSpeechTokenizerDecoder;
 use crate::utils::utils;
 
-// ── Speech Tokenizer (ONNX decoder: codes → waveform) ──────────────────
+// ── Speech Tokenizer decoders (codes → waveform) ───────────────────────
 
 /// ONNX-based speech tokenizer decoder. Converts 16-codebook codec tokens
 /// into raw audio waveform.
+#[cfg(feature = "onnx")]
 pub struct SpeechTokenizerDecoder {
     model: candle_onnx::onnx::ModelProto,
     pub sample_rate: u32,
 }
 
+enum SpeechDecoderBackend {
+    Native(NativeSpeechTokenizerDecoder),
+    #[cfg(feature = "onnx")]
+    Onnx(SpeechTokenizerDecoder),
+}
+
+impl SpeechDecoderBackend {
+    fn decode(&self, codes: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Native(m) => m.chunked_decode(codes, 300, 25),
+            #[cfg(feature = "onnx")]
+            Self::Onnx(m) => m.decode(codes),
+        }
+    }
+
+    fn sample_rate(&self) -> u32 {
+        match self {
+            Self::Native(m) => m.sample_rate(),
+            #[cfg(feature = "onnx")]
+            Self::Onnx(m) => m.sample_rate,
+        }
+    }
+}
+
+#[cfg(feature = "onnx")]
 impl SpeechTokenizerDecoder {
     /// Load from a pre-exported ONNX file.
     pub fn new(onnx_path: &str, sample_rate: Option<u32>) -> Result<Self> {
@@ -82,7 +109,7 @@ pub struct Model {
     pub dtype: DType,
     pub config: Qwen3TTSConfig,
     inner: Qwen3TTSModel,
-    speech_decoder: Option<SpeechTokenizerDecoder>,
+    speech_decoder: Option<SpeechDecoderBackend>,
 }
 
 impl Model {
@@ -92,7 +119,8 @@ impl Model {
     ///   - `config.json` (Qwen3TTSConfig)
     ///   - `tokenizer.json`
     ///   - `model.safetensors` / `model-*.safetensors` (talker weights)
-    ///   - `speech_tokenizer/speech_tokenizer_decoder.onnx` (optional, for waveform decode)
+    ///   - `speech_tokenizer/config.json` + `speech_tokenizer/model.safetensors` (preferred)
+    ///   - `speech_tokenizer/speech_tokenizer_decoder.onnx` (optional fallback)
     pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
         let model_dir = std::path::Path::new(model_path);
 
@@ -112,16 +140,47 @@ impl Model {
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, *dtype, device) }?;
         let inner = Qwen3TTSModel::new(&config, vb)?;
 
-        // Speech tokenizer decoder (optional ONNX)
-        let onnx_path = model_dir.join("speech_tokenizer").join("speech_tokenizer_decoder.onnx");
-        let speech_decoder = if onnx_path.exists() {
-            Some(SpeechTokenizerDecoder::new(onnx_path.to_str().unwrap(), Some(24000))?)
+        // Speech tokenizer decoder (native Candle preferred, ONNX fallback)
+        let speech_dir = model_dir.join("speech_tokenizer");
+        let speech_decoder = if speech_dir.exists() {
+            match NativeSpeechTokenizerDecoder::new(speech_dir.to_str().unwrap(), device, *dtype) {
+                Ok(native) => Some(SpeechDecoderBackend::Native(native)),
+                Err(native_err) => {
+                    #[cfg(feature = "onnx")]
+                    {
+                        let onnx_path = speech_dir.join("speech_tokenizer_decoder.onnx");
+                        if onnx_path.exists() {
+                            eprintln!(
+                                "Warning: native speech tokenizer load failed: {native_err}. Falling back to ONNX at {}",
+                                onnx_path.display()
+                            );
+                            Some(SpeechDecoderBackend::Onnx(SpeechTokenizerDecoder::new(
+                                onnx_path.to_str().unwrap(),
+                                Some(24000),
+                            )?))
+                        } else {
+                            eprintln!(
+                                "Warning: speech tokenizer native load failed and ONNX missing: {native_err}. \
+                                 Code-to-waveform decoding will not be available."
+                            );
+                            None
+                        }
+                    }
+                    #[cfg(not(feature = "onnx"))]
+                    {
+                        eprintln!(
+                            "Warning: native speech tokenizer load failed: {native_err}. \
+                             Code-to-waveform decoding will not be available."
+                        );
+                        None
+                    }
+                }
+            }
         } else {
             eprintln!(
-                "Warning: speech tokenizer ONNX not found at {}. \
-                 Code-to-waveform decoding will not be available. \
-                 Export it with: python scripts/export_qwen_tts_tokenizer_onnx.py",
-                onnx_path.display()
+                "Warning: speech_tokenizer directory not found at {}. \
+                 Code-to-waveform decoding will not be available.",
+                speech_dir.display()
             );
             None
         };
@@ -197,7 +256,7 @@ impl Model {
         let speech_decoder = self
             .speech_decoder
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Speech tokenizer ONNX not loaded; cannot decode to audio"))?;
+            .ok_or_else(|| anyhow::anyhow!("Speech tokenizer decoder not loaded; cannot decode to audio"))?;
 
         // Convert codes: Vec<Vec<u32>> of shape [timesteps, num_code_groups]
         // → Tensor [1, num_code_groups, timesteps]
@@ -213,7 +272,7 @@ impl Model {
             .unsqueeze(0)?;
 
         let audio = speech_decoder.decode(&codes_tensor)?;
-        Ok((audio, speech_decoder.sample_rate))
+        Ok((audio, speech_decoder.sample_rate()))
     }
 
     /// Generate speech and write directly to a WAV file.
@@ -239,7 +298,7 @@ impl Model {
             repetition_penalty,
             system_prompt,
         )?;
-        SpeechTokenizerDecoder::save_wav(&audio, output_path, sr)
+        Self::save_wav(&audio, output_path, sr)
     }
 
     /// Generate only the codec codes (no waveform decode).
@@ -273,7 +332,7 @@ impl Model {
         let speech_decoder = self
             .speech_decoder
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Speech tokenizer ONNX not loaded"))?;
+            .ok_or_else(|| anyhow::anyhow!("Speech tokenizer decoder not loaded"))?;
 
         let num_steps = codes.len();
         let num_groups = codes[0].len();
@@ -305,7 +364,25 @@ impl Model {
     pub fn sample_rate(&self) -> u32 {
         self.speech_decoder
             .as_ref()
-            .map(|d| d.sample_rate)
+            .map(|d| d.sample_rate())
             .unwrap_or(24000)
+    }
+
+    fn save_wav(audio_values: &Tensor, filename: &str, sample_rate: u32) -> Result<String> {
+        let audio = audio_values.to_dtype(DType::F32)?.flatten_all()?;
+        let scaled = audio.affine(32767.0, 0.0)?.clamp(-32768.0, 32767.0)?.round()?;
+        let audio_i64 = scaled.to_dtype(DType::I64)?;
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let mut writer = WavWriter::create(filename, spec)?;
+        for sample in audio_i64.to_vec1::<i64>()? {
+            writer.write_sample(sample.clamp(i16::MIN as i64, i16::MAX as i64) as i16)?;
+        }
+        writer.finalize()?;
+        Ok(filename.to_string())
     }
 }

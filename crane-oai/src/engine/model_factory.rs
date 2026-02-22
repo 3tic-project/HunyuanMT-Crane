@@ -241,7 +241,6 @@ pub fn create_vlm_model(
 }
 
 /// Create a Qwen3-TTS model for TTS inference.
-#[cfg(feature = "onnx")]
 pub fn create_tts_model(
     model_path: &str,
     device: &Device,

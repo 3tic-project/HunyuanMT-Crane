@@ -1028,8 +1028,8 @@ impl TalkerModel {
 //  Full Qwen3-TTS Model
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Top-level Qwen3-TTS model — owns the talker and delegates to the speech
-/// tokenizer (ONNX) for code-to-waveform conversion.
+/// Top-level Qwen3-TTS model — owns the talker and generates speech codec tokens.
+/// Code-to-waveform conversion is handled by the speech tokenizer decoder backend.
 pub struct Qwen3TTSModel {
     pub talker: TalkerModel,
     pub config: Qwen3TTSConfig,

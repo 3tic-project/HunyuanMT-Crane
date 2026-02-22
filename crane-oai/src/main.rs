@@ -225,119 +225,111 @@ async fn main() -> Result<()> {
         (Option<EngineHandle>, tokenizers::Tokenizer, Vec<u32>, Box<dyn ChatTemplateProcessor>, Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>, Option<tokio::sync::mpsc::UnboundedSender<TtsGenerateRequest>>) = if is_tts {
         // TTS path: create Qwen3-TTS on a dedicated thread.
         info!("Loading TTS model (Qwen3-TTS) from: {}", args.model_path);
+        let model_path_clone = args.model_path.clone();
 
-        #[cfg(feature = "onnx")]
-        {
-            let model_path_clone = args.model_path.clone();
+        let use_cpu = args.cpu || {
+            #[cfg(feature = "cuda")]
+            { !candle_core::utils::cuda_is_available() }
+            #[cfg(not(feature = "cuda"))]
+            { true }
+        };
 
-            let use_cpu = args.cpu || {
-                #[cfg(feature = "cuda")]
-                { !candle_core::utils::cuda_is_available() }
-                #[cfg(not(feature = "cuda"))]
-                { true }
-            };
+        let tts_device = if use_cpu {
+            crane_core::models::Device::Cpu
+        } else {
+            device.clone()
+        };
+        let tts_dtype = dtype;
 
-            let tts_device = if use_cpu {
-                crane_core::models::Device::Cpu
-            } else {
-                device.clone()
-            };
-            let tts_dtype = dtype;
+        let (tts_tx, mut tts_rx) = tokio::sync::mpsc::unbounded_channel::<TtsGenerateRequest>();
 
-            let (tts_tx, mut tts_rx) = tokio::sync::mpsc::unbounded_channel::<TtsGenerateRequest>();
-
-            std::thread::Builder::new()
-                .name("tts-engine".into())
-                .spawn(move || {
-                    let mut tts = match engine::model_factory::create_tts_model(
-                        &model_path_clone,
-                        &tts_device,
-                        &tts_dtype,
-                    ) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::error!("Failed to load TTS model: {e}");
-                            return;
-                        }
-                    };
-                    info!("TTS engine thread started");
-
-                    while let Some(req) = tts_rx.blocking_recv() {
-                        let result = (|| -> Result<handlers::tts::TtsResult, String> {
-                            let system_prompt = req.instructions.as_deref();
-
-                            let (audio, sr) = tts
-                                .generate_speech(
-                                    &req.input,
-                                    &req.language,
-                                    req.voice.as_deref(),
-                                    req.max_tokens,
-                                    req.temperature,
-                                    req.top_p,
-                                    req.repetition_penalty,
-                                    system_prompt,
-                                )
-                                .map_err(|e| e.to_string())?;
-
-                            // Build WAV bytes in memory.
-                            let audio_f32 = audio
-                                .to_dtype(candle_core::DType::F32)
-                                .map_err(|e| e.to_string())?
-                                .flatten_all()
-                                .map_err(|e| e.to_string())?;
-                            let samples = audio_f32
-                                .to_vec1::<f32>()
-                                .map_err(|e| e.to_string())?;
-
-                            let mut wav_buf = std::io::Cursor::new(Vec::new());
-                            {
-                                let spec = hound::WavSpec {
-                                    channels: 1,
-                                    sample_rate: sr,
-                                    bits_per_sample: 16,
-                                    sample_format: hound::SampleFormat::Int,
-                                };
-                                let mut writer = hound::WavWriter::new(&mut wav_buf, spec)
-                                    .map_err(|e| e.to_string())?;
-                                for &s in &samples {
-                                    let s16 = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                                    writer.write_sample(s16).map_err(|e| e.to_string())?;
-                                }
-                                writer.finalize().map_err(|e| e.to_string())?;
-                            }
-
-                            Ok(handlers::tts::TtsResult {
-                                audio_bytes: wav_buf.into_inner(),
-                                content_type: "audio/wav",
-                                sample_rate: sr,
-                            })
-                        })();
-
-                        let _ = req.tx.send(result);
+        std::thread::Builder::new()
+            .name("tts-engine".into())
+            .spawn(move || {
+                let mut tts = match engine::model_factory::create_tts_model(
+                    &model_path_clone,
+                    &tts_device,
+                    &tts_dtype,
+                ) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!("Failed to load TTS model: {e}");
+                        return;
                     }
-                })
-                .expect("Failed to spawn TTS thread");
+                };
+                info!("TTS engine thread started");
 
-            info!("TTS model routing established (type: {:?})", resolved_type);
+                while let Some(req) = tts_rx.blocking_recv() {
+                    let result = (|| -> Result<handlers::tts::TtsResult, String> {
+                        let system_prompt = req.instructions.as_deref();
 
-            // Use tokenizer from the TTS model for API compatibility.
-            let tok_path = std::path::Path::new(&args.model_path).join("tokenizer.json");
-            let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
-                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+                        let (audio, sr) = tts
+                            .generate_speech(
+                                &req.input,
+                                &req.language,
+                                req.voice.as_deref(),
+                                req.max_tokens,
+                                req.temperature,
+                                req.top_p,
+                                req.repetition_penalty,
+                                system_prompt,
+                            )
+                            .map_err(|e| e.to_string())?;
 
-            let eos_id = tokenizer
-                .token_to_id("<|im_end|>")
-                .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
-                .unwrap_or(151645);
+                        // Build WAV bytes in memory.
+                        let audio_f32 = audio
+                            .to_dtype(candle_core::DType::F32)
+                            .map_err(|e| e.to_string())?
+                            .flatten_all()
+                            .map_err(|e| e.to_string())?;
+                        let samples = audio_f32
+                            .to_vec1::<f32>()
+                            .map_err(|e| e.to_string())?;
 
-            let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
+                        let mut wav_buf = std::io::Cursor::new(Vec::new());
+                        {
+                            let spec = hound::WavSpec {
+                                channels: 1,
+                                sample_rate: sr,
+                                bits_per_sample: 16,
+                                sample_format: hound::SampleFormat::Int,
+                            };
+                            let mut writer = hound::WavWriter::new(&mut wav_buf, spec)
+                                .map_err(|e| e.to_string())?;
+                            for &s in &samples {
+                                let s16 = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                                writer.write_sample(s16).map_err(|e| e.to_string())?;
+                            }
+                            writer.finalize().map_err(|e| e.to_string())?;
+                        }
 
-            (None, tokenizer, vec![eos_id], chat_template, None, Some(tts_tx))
-        }
-        #[cfg(not(feature = "onnx"))]
-        {
-            anyhow::bail!("Qwen3-TTS requires the 'onnx' feature to be enabled for speech tokenizer decoding");
-        }
+                        Ok(handlers::tts::TtsResult {
+                            audio_bytes: wav_buf.into_inner(),
+                            content_type: "audio/wav",
+                            sample_rate: sr,
+                        })
+                    })();
+
+                    let _ = req.tx.send(result);
+                }
+            })
+            .expect("Failed to spawn TTS thread");
+
+        info!("TTS model routing established (type: {:?})", resolved_type);
+
+        // Use tokenizer from the TTS model for API compatibility.
+        let tok_path = std::path::Path::new(&args.model_path).join("tokenizer.json");
+        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+
+        let eos_id = tokenizer
+            .token_to_id("<|im_end|>")
+            .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
+            .unwrap_or(151645);
+
+        let chat_template = engine::model_factory::create_chat_template(model_type, &args.model_path);
+
+        (None, tokenizer, vec![eos_id], chat_template, None, Some(tts_tx))
     } else if is_vlm {
         // VLM path: create PaddleOcrVL on a dedicated thread to avoid Send/Sync issues.
         info!("Loading VLM model (PaddleOCR-VL) from: {}", args.model_path);

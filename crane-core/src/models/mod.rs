@@ -6,7 +6,6 @@ pub mod paddleocr_vl;
 pub mod qwen25;
 pub mod qwen25_vit;
 pub mod qwen3;
-#[cfg(feature = "onnx")]
 pub mod qwen3_tts;
 // pub mod qwen3_vl;
 pub mod hunyuan_dense;

@@ -8,7 +8,7 @@ An OpenAI & SGLang compatible inference API server built on the [Crane](../READM
 - **SGLang native API** — `/generate`, `/model_info`, `/server_info` and related endpoints
 - **Continuous batching** — Dedicated inference thread with prefill-priority scheduling, dynamic KV memory budget, and automatic sequence eviction/recovery
 - **Multi-model support** — Auto-detects and loads Hunyuan Dense, Qwen 2.5, Qwen 3, Qwen3-TTS architectures
-- **Qwen3-TTS** — Full two-level TTS inference (Talker + Code Predictor) with ONNX speech-tokenizer decoder; exposes OpenAI-compatible `/v1/audio/speech`
+- **Qwen3-TTS** — Full two-level TTS inference (Talker + Code Predictor) with native Candle speech-tokenizer decoder (ONNX optional fallback); exposes OpenAI-compatible `/v1/audio/speech`
 - **Streaming** — SSE (Server-Sent Events) token streaming
 - **Cross-platform acceleration** — CPU / CUDA / Apple Metal, selected automatically
 
@@ -45,7 +45,7 @@ crane-oai --model-path /path/to/model --cpu
 
 ### Qwen3-TTS Quick Start
 
-> **Requires the `onnx` feature** for speech-tokenizer decoding.
+> Native speech-tokenizer decoding is enabled by default. ONNX export is optional as a compatibility fallback.
 
 **Step 1 — Download the model**
 
@@ -60,7 +60,7 @@ huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
     --local-dir checkpoints/Qwen3-TTS-12Hz-0.6B-CustomVoice
 ```
 
-**Step 2 — Export the ONNX speech-tokenizer decoder**
+**Step 2 — (Optional) Export the ONNX speech-tokenizer decoder fallback**
 
 ```bash
 # Install the Qwen3-TTS Python package first (needed for export only)
@@ -75,10 +75,10 @@ python scripts/export_qwen_tts_tokenizer_onnx.py \
 
 ```bash
 # CPU (always available)
-cargo build -p crane-oai --release --features onnx
+cargo build -p crane-oai --release
 
 # CUDA
-cargo build -p crane-oai --release --features "cuda onnx"
+cargo build -p crane-oai --release --features "cuda"
 
 # macOS Metal
 cargo build -p crane-oai --release --features "metal onnx"
@@ -143,7 +143,7 @@ Tokenizer (Qwen chat tokenizer, tokenizer.json)
   │  [T, 16] codec tokens
   ▼
 ┌──────────────────────────────────────────────────┐
-│  Speech Tokenizer Decoder  (ONNX)                │
+│  Speech Tokenizer Decoder  (native Candle)       │
 │  - 12 Hz, 24 kHz, 16 RVQ quantizers             │
 │  - Converts [1, 16, T] tokens → [1, 1, S] audio │
 └──────────────────────────────────────────────────┘
@@ -154,7 +154,7 @@ WAV audio (24 kHz, 16-bit PCM)
 
 ### Setup
 
-**1. Export the speech tokenizer ONNX** (one-time step):
+**1. (Optional) Export the speech tokenizer ONNX fallback** (one-time step):
 
 ```bash
 # Install required Python package (for export only — not needed at runtime)
@@ -171,14 +171,14 @@ python scripts/export_qwen_tts_tokenizer_onnx.py \
     checkpoints/Qwen3-TTS-12Hz-0.6B-CustomVoice/speech_tokenizer/speech_tokenizer_decoder.onnx
 ```
 
-**2. Build with the `onnx` feature:**
+**2. Build:**
 
 ```bash
 # CPU
-cargo build -p crane-oai --release --features onnx
+cargo build -p crane-oai --release
 
 # CUDA
-cargo build -p crane-oai --release --features "cuda onnx"
+cargo build -p crane-oai --release --features "cuda"
 
 # macOS Metal
 cargo build -p crane-oai --release --features "metal onnx"
@@ -714,7 +714,7 @@ crane-oai/src/
 | Hunyuan Dense | ✅ | ✅ | Safetensors / GGUF | KV pre-alloc, GQA 4D matmul, RoPE cache growth |
 | Qwen 3 | ✅ | ✅ | Safetensors / GGUF | + QK Norm 4D, GGUF quantization |
 | Qwen 2.5 | sequential | ❌ | Safetensors | — |
-| **Qwen3-TTS** | N/A | N/A | Safetensors + ONNX | Dedicated thread; requires `--features onnx`; no continuous batching |
+| **Qwen3-TTS** | N/A | N/A | Safetensors (ONNX fallback optional) | Dedicated thread; no continuous batching |
 
 Model type is auto-detected from `config.json` (`model_type` / `architectures`) or can be set explicitly with `--model-type`.
 
@@ -737,7 +737,7 @@ Model type is auto-detected from `config.json` (`model_type` / `architectures`) 
 - **`--decode-tokens-per-seq`** controls decode rounds per engine step, not per request. Requests always complete fully regardless of this value.
 - **Log diagnostics** — The startup log prints `kv_bytes` and `kv_budget`. Monitor these to validate your `--gpu-memory-limit` headroom.
 - **Qwen3-TTS runs on a dedicated thread** — No continuous batching; each `/v1/audio/speech` request is processed sequentially. Concurrent requests are queued in an unbounded channel.
-- **ONNX required for Qwen3-TTS** — The speech-tokenizer decoder (codes → waveform) is loaded from an ONNX file. Build with `--features onnx` and export the ONNX with `scripts/export_qwen_tts_tokenizer_onnx.py` before starting the server.
+- **Qwen3-TTS decoder backend** — The speech-tokenizer decoder (codes → waveform) uses native Candle by default. ONNX export is optional as a compatibility fallback.
 
 ## Testing
 
