@@ -4,10 +4,11 @@ An OpenAI & SGLang compatible inference API server built on the [Crane](../READM
 
 ## Features
 
-- **OpenAI-compatible API** — Chat Completions, Text Completions, Models, Tokenize/Detokenize
+- **OpenAI-compatible API** — Chat Completions, Text Completions, Text-to-Speech, Models, Tokenize/Detokenize
 - **SGLang native API** — `/generate`, `/model_info`, `/server_info` and related endpoints
 - **Continuous batching** — Dedicated inference thread with prefill-priority scheduling, dynamic KV memory budget, and automatic sequence eviction/recovery
-- **Multi-model support** — Auto-detects and loads Hunyuan Dense, Qwen 2.5, Qwen 3 architectures
+- **Multi-model support** — Auto-detects and loads Hunyuan Dense, Qwen 2.5, Qwen 3, Qwen3-TTS architectures
+- **Qwen3-TTS** — Full two-level TTS inference (Talker + Code Predictor) with ONNX speech-tokenizer decoder; exposes OpenAI-compatible `/v1/audio/speech`
 - **Streaming** — SSE (Server-Sent Events) token streaming
 - **Cross-platform acceleration** — CPU / CUDA / Apple Metal, selected automatically
 
@@ -41,6 +42,200 @@ crane-oai --model-path /path/to/model.gguf \
 # Force CPU
 crane-oai --model-path /path/to/model --cpu
 ```
+
+### Qwen3-TTS Quick Start
+
+> **Requires the `onnx` feature** for speech-tokenizer decoding.
+
+**Step 1 — Download the model**
+
+```bash
+mkdir -p checkpoints/
+# Base model (multi-speaker, 12 Hz)
+huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base \
+    --local-dir checkpoints/Qwen3-TTS-12Hz-0.6B-Base
+
+# Custom-voice model (add your own speaker embedding)
+huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+    --local-dir checkpoints/Qwen3-TTS-12Hz-0.6B-CustomVoice
+```
+
+**Step 2 — Export the ONNX speech-tokenizer decoder**
+
+```bash
+# Install the Qwen3-TTS Python package first (needed for export only)
+pip install -e vendor/Qwen3-TTS
+
+python scripts/export_qwen_tts_tokenizer_onnx.py \
+    checkpoints/Qwen3-TTS-12Hz-0.6B-Base/speech_tokenizer \
+    checkpoints/Qwen3-TTS-12Hz-0.6B-Base/speech_tokenizer/speech_tokenizer_decoder.onnx
+```
+
+**Step 3 — Build and start the server**
+
+```bash
+# CPU (always available)
+cargo build -p crane-oai --release --features onnx
+
+# CUDA
+cargo build -p crane-oai --release --features "cuda onnx"
+
+# macOS Metal
+cargo build -p crane-oai --release --features "metal onnx"
+
+# Start the TTS server (auto-detected from config.json)
+./target/release/crane-oai \
+    --model-path checkpoints/Qwen3-TTS-12Hz-0.6B-Base \
+    --model-type qwen3_tts \
+    --port 8080
+```
+
+**Step 4 — Synthesize speech**
+
+```bash
+# Generate WAV audio from text (saves to speech.wav)
+curl http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-TTS",
+    "input": "今天天气真好，我们去公园吧！",
+    "voice": "Chelsie",
+    "language": "chinese"
+  }' \
+  --output speech.wav
+
+# English
+curl http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-TTS",
+    "input": "Hello, this is a test of the Qwen3-TTS model.",
+    "voice": "Chelsie",
+    "language": "english"
+  }' \
+  --output speech.wav
+```
+
+## Qwen3-TTS
+
+Crane implements a full **Qwen3-TTS** inference pipeline in pure Rust + Candle, making it the first non-Python framework to support this model.
+
+### Architecture overview
+
+```
+Text input
+  │
+  ▼
+Tokenizer (Qwen chat tokenizer, tokenizer.json)
+  │
+  ▼
+┌──────────────────────────────────────────────────┐
+│  Talker  (28-layer transformer, MRoPE)           │
+│  - Embeds text via text_projection MLP           │
+│  - Autoregressively generates codec group 0      │
+└──────────────────────────────────────────────────┘
+  │  hidden state + group-0 token
+  ▼
+┌──────────────────────────────────────────────────┐
+│  Code Predictor  (5-layer transformer)           │
+│  - Predicts codec groups 1–15 from hidden state  │
+└──────────────────────────────────────────────────┘
+  │  [T, 16] codec tokens
+  ▼
+┌──────────────────────────────────────────────────┐
+│  Speech Tokenizer Decoder  (ONNX)                │
+│  - 12 Hz, 24 kHz, 16 RVQ quantizers             │
+│  - Converts [1, 16, T] tokens → [1, 1, S] audio │
+└──────────────────────────────────────────────────┘
+  │
+  ▼
+WAV audio (24 kHz, 16-bit PCM)
+```
+
+### Setup
+
+**1. Export the speech tokenizer ONNX** (one-time step):
+
+```bash
+# Install required Python package (for export only — not needed at runtime)
+pip install -e vendor/Qwen3-TTS
+
+# Base model
+python scripts/export_qwen_tts_tokenizer_onnx.py \
+    checkpoints/Qwen3-TTS-12Hz-0.6B-Base/speech_tokenizer \
+    checkpoints/Qwen3-TTS-12Hz-0.6B-Base/speech_tokenizer/speech_tokenizer_decoder.onnx
+
+# CustomVoice model
+python scripts/export_qwen_tts_tokenizer_onnx.py \
+    checkpoints/Qwen3-TTS-12Hz-0.6B-CustomVoice/speech_tokenizer \
+    checkpoints/Qwen3-TTS-12Hz-0.6B-CustomVoice/speech_tokenizer/speech_tokenizer_decoder.onnx
+```
+
+**2. Build with the `onnx` feature:**
+
+```bash
+# CPU
+cargo build -p crane-oai --release --features onnx
+
+# CUDA
+cargo build -p crane-oai --release --features "cuda onnx"
+
+# macOS Metal
+cargo build -p crane-oai --release --features "metal onnx"
+```
+
+**3. Start the server:**
+
+```bash
+./target/release/crane-oai \
+    --model-path checkpoints/Qwen3-TTS-12Hz-0.6B-Base \
+    --model-type qwen3_tts \
+    --port 8080
+```
+
+The model type is auto-detected from `config.json` — `--model-type qwen3_tts` is optional if the path contains `Qwen3-TTS`.
+
+### Model variants
+
+| Variant | HuggingFace ID | Description |
+|---------|---------------|-------------|
+| Base | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | Multi-speaker; select via `voice` field |
+| CustomVoice | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | Accepts custom speaker embeddings |
+
+### Speaker list (Base model)
+
+The available speakers are defined in `config.json` under `talker_config.spk_id`. Open the file to see all names:
+
+```bash
+python3 -c "
+import json, sys
+c = json.load(open('checkpoints/Qwen3-TTS-12Hz-0.6B-Base/config.json'))
+for name in sorted(c['talker_config']['spk_id']):
+    print(name)
+"
+```
+
+Common built-in speakers include: `Chelsie`, `Ethan`, `Cherry`, `Serena`, `Dylan`, `Brenda`, and many more covering Chinese, English, Japanese, and Korean.
+
+### Generation parameters
+
+| Parameter | Recommended | Notes |
+|-----------|-------------|-------|
+| `temperature` | `0.6`–`0.9` | Lower = more stable prosody; higher = more expressive |
+| `max_tokens` | `1024`–`4096` | 12 tokens ≈ 1 second of audio at 12 Hz |
+| `repetition_penalty` | `1.0`–`1.05` | Helps avoid repeating codec tokens |
+| `top_p` | `null` or `0.95` | Nucleus sampling; usually not needed for TTS |
+| `language` | match input | Wrong language hint degrades quality |
+
+### Troubleshooting
+
+**`Speech tokenizer ONNX not found`** — Run the export script again and confirm the file exists at `<model_dir>/speech_tokenizer/speech_tokenizer_decoder.onnx`.
+
+**`TTS model not loaded`** — The server was started with an LLM model (not TTS). Restart with `--model-type qwen3_tts`.
+
+**Garbled audio / silence** — Try lowering `temperature` to `0.5`–`0.7` and ensure `language` matches the input text.
+
+**Build error: `candle_onnx not found`** — The `onnx` feature was not passed at build time. Add `--features onnx`.
 
 ## CUDA Usage
 
@@ -105,7 +300,7 @@ Currently crane-oai runs on a single CUDA device (device 0). Multi-GPU tensor pa
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--model-path` | *(required)* | Path to model directory or GGUF file |
-| `--model-type` | `auto` | Architecture: `auto`, `hunyuan`, `qwen25`, `qwen3` |
+| `--model-type` | `auto` | Architecture: `auto`, `hunyuan`, `qwen25`, `qwen3`, `qwen3_tts` |
 | `--model-name` | directory name | Model name shown in API responses |
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `8080` | Bind port |
@@ -128,6 +323,90 @@ Currently crane-oai runs on a single CUDA device (device 0). Multi-GPU tensor pa
 ## API Reference
 
 ### OpenAI-compatible
+
+#### `POST /v1/audio/speech` — Text-to-Speech (Qwen3-TTS)
+
+Synthesizes speech from text. Returns a WAV audio file (or raw PCM, depending on `response_format`).
+
+```bash
+# Basic Chinese TTS
+curl http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-TTS",
+    "input": "今天天气真好，我们去公园吧。",
+    "voice": "Chelsie",
+    "language": "chinese"
+  }' \
+  --output speech.wav
+
+# English TTS with higher temperature
+curl http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-TTS",
+    "input": "Hello! This is Crane, an ultra-fast inference framework written in Rust.",
+    "voice": "Chelsie",
+    "language": "english",
+    "temperature": 0.8,
+    "max_tokens": 2048
+  }' \
+  --output hello.wav
+
+# Auto-detect language
+curl http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-TTS",
+    "input": "This is a bilingual test. 这是一个中英文混合测试。",
+    "language": "auto"
+  }' \
+  --output bilingual.wav
+
+# Custom system instructions
+curl http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-TTS",
+    "input": "Welcome to our service.",
+    "voice": "Chelsie",
+    "language": "english",
+    "instructions": "Speak slowly and clearly with a warm, professional tone."
+  }' \
+  --output welcome.wav
+```
+
+**Request fields:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `model` | string | — | Model name (e.g. `"Qwen3-TTS"`) |
+| `input` | string | — | The text to synthesize. UTF-8, up to a few thousand characters |
+| `voice` | string | `null` | Speaker name. See speaker list below. `null` uses default voice |
+| `language` | string | `"auto"` | Language hint: `"chinese"`, `"english"`, `"japanese"`, `"korean"`, `"auto"` |
+| `instructions` | string | `null` | Optional system-level prompt to guide speaking style |
+| `response_format` | string | `"wav"` | Output audio format: `"wav"` or `"pcm"` (raw 16-bit LE at 24 kHz). `"mp3"`, `"opus"`, `"aac"`, `"flac"` accepted but return WAV |
+| `speed` | float | `1.0` | Speaking speed multiplier (reserved, not yet applied to generation) |
+| `temperature` | float | `0.7` | Sampling temperature. Lower = more deterministic |
+| `top_p` | float | `null` | Nucleus sampling threshold |
+| `repetition_penalty` | float | `1.0` | Repetition penalty for codec token generation |
+| `max_tokens` | int | `4096` | Max codec tokens to generate. Controls maximum audio duration (~83 ms per token at 12 Hz) |
+
+**Response:** Binary audio bytes with `Content-Type: audio/wav`. Save directly to a `.wav` file.
+
+**Approximate duration cap:** `max_tokens / 12` seconds (e.g. `4096` tokens ≈ 341 seconds).
+
+**Available speakers (Qwen3-TTS-12Hz-0.6B-Base):**
+
+| Name | Gender | Language |
+|------|--------|----------|
+| Chelsie | Female | English / Chinese |
+| Ethan | Male | English / Chinese |
+| Cherry | Female | Chinese |
+| Serena | Female | Chinese |
+| ... | — | See `config.json → talker_config.spk_id` for full list |
+
+> **Tip:** The available speaker names are stored in `config.json` under `talker_config.spk_id`. Open the file to see all supported names for your model variant.
 
 #### `POST /v1/chat/completions`
 
@@ -312,6 +591,8 @@ curl http://localhost:8080/abort_request \
 
 ## Using with OpenAI SDK
 
+### Chat (LLM)
+
 ```python
 from openai import OpenAI
 
@@ -338,18 +619,82 @@ for chunk in stream:
         print(chunk.choices[0].delta.content, end="", flush=True)
 ```
 
+### Text-to-Speech (Qwen3-TTS)
+
+> Start crane-oai with `--model-type qwen3_tts` and a Qwen3-TTS checkpoint.
+
+```python
+from openai import OpenAI
+import pathlib
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="not-needed",
+)
+
+# --- Basic synthesis (returns WAV bytes) ---
+response = client.audio.speech.create(
+    model="Qwen3-TTS",
+    voice="Chelsie",
+    input="今天天气真好，我们去公园吧！",
+    extra_body={"language": "chinese"},
+)
+response.stream_to_file("output.wav")
+
+# --- English ---
+response = client.audio.speech.create(
+    model="Qwen3-TTS",
+    voice="Ethan",
+    input="Hello, this is a test of the Crane TTS engine.",
+    extra_body={"language": "english", "temperature": 0.7},
+)
+response.stream_to_file("english.wav")
+
+# --- Access raw bytes directly ---
+wav_bytes = client.audio.speech.create(
+    model="Qwen3-TTS",
+    voice="Chelsie",
+    input="Hello world!",
+    extra_body={"language": "english"},
+).content  # bytes
+pathlib.Path("hello.wav").write_bytes(wav_bytes)
+```
+
+**Low-level requests (requests library):**
+
+```python
+import requests, pathlib
+
+r = requests.post(
+    "http://localhost:8080/v1/audio/speech",
+    json={
+        "model": "Qwen3-TTS",
+        "input": "今天天气真好，我们去公园吧！",
+        "voice": "Chelsie",
+        "language": "chinese",
+        "temperature": 0.7,
+        "max_tokens": 2048,
+    },
+)
+r.raise_for_status()
+pathlib.Path("speech.wav").write_bytes(r.content)
+print(f"Saved {len(r.content):,} bytes")
+```
+
 ## Source Structure
 
 ```
 crane-oai/src/
 ├── main.rs              # CLI entry point, AppState, route registration
-├── openai_api.rs        # OpenAI request/response types
+├── openai_api.rs        # OpenAI request/response types (incl. SpeechRequest)
 ├── sglang_api.rs        # SGLang native API types
 ├── chat_template.rs     # Chat template rendering (Jinja / Hunyuan hard-coded)
 ├── handlers/
 │   ├── common.rs        # /health, /v1/stats
 │   ├── openai.rs        # OpenAI endpoint handlers
 │   ├── sglang.rs        # SGLang endpoint handlers
+│   ├── tts.rs           # /v1/audio/speech handler (Qwen3-TTS)
+│   ├── vlm.rs           # VLM handler (PaddleOCR-VL)
 │   └── sse.rs           # SSE stream builder
 └── engine/
     ├── mod.rs           # InferenceEngine core loop (continuous batching)
@@ -359,7 +704,7 @@ crane-oai/src/
     ├── scheduler.rs     # Prefill-priority scheduler (dynamic effective_max_running cap)
     ├── sequence.rs      # Sequence lifecycle management
     ├── backend.rs       # ModelBackend trait and per-model implementations
-    └── model_factory.rs # Model auto-detection and factory
+    └── model_factory.rs # Model auto-detection and factory (incl. Qwen3TTS)
 ```
 
 ## Model Backend Support
@@ -369,6 +714,7 @@ crane-oai/src/
 | Hunyuan Dense | ✅ | ✅ | Safetensors / GGUF | KV pre-alloc, GQA 4D matmul, RoPE cache growth |
 | Qwen 3 | ✅ | ✅ | Safetensors / GGUF | + QK Norm 4D, GGUF quantization |
 | Qwen 2.5 | sequential | ❌ | Safetensors | — |
+| **Qwen3-TTS** | N/A | N/A | Safetensors + ONNX | Dedicated thread; requires `--features onnx`; no continuous batching |
 
 Model type is auto-detected from `config.json` (`model_type` / `architectures`) or can be set explicitly with `--model-type`.
 
@@ -390,6 +736,8 @@ Model type is auto-detected from `config.json` (`model_type` / `architectures`) 
 - **GGUF quantization** is supported for Hunyuan Dense and Qwen 3. Qwen 2.5 requires Safetensors format.
 - **`--decode-tokens-per-seq`** controls decode rounds per engine step, not per request. Requests always complete fully regardless of this value.
 - **Log diagnostics** — The startup log prints `kv_bytes` and `kv_budget`. Monitor these to validate your `--gpu-memory-limit` headroom.
+- **Qwen3-TTS runs on a dedicated thread** — No continuous batching; each `/v1/audio/speech` request is processed sequentially. Concurrent requests are queued in an unbounded channel.
+- **ONNX required for Qwen3-TTS** — The speech-tokenizer decoder (codes → waveform) is loaded from an ONNX file. Build with `--features onnx` and export the ONNX with `scripts/export_qwen_tts_tokenizer_onnx.py` before starting the server.
 
 ## Testing
 

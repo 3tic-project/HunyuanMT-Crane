@@ -3,6 +3,7 @@
 //! Covers:
 //! * `/v1/chat/completions`  (chat)
 //! * `/v1/completions`       (text completion)
+//! * `/v1/audio/speech`      (text-to-speech)
 //! * `/v1/models`            (model listing + retrieval)
 //! * `/v1/tokenize`          (tokenization)
 //! * `/v1/detokenize`        (detokenization)
@@ -294,6 +295,64 @@ pub struct DetokenizeRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct DetokenizeResponse {
     pub text: String,
+}
+
+// ═════════════════════════════════════════════════════════════
+//  Audio Speech  (/v1/audio/speech)
+// ═════════════════════════════════════════════════════════════
+
+/// Audio response format.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioResponseFormat {
+    #[default]
+    Wav,
+    Pcm,
+    Mp3,
+    Opus,
+    Aac,
+    Flac,
+}
+
+fn default_speed() -> f64 {
+    1.0
+}
+
+fn default_audio_max_tokens() -> usize {
+    4096
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct SpeechRequest {
+    /// Model ID (e.g. "qwen3-tts").
+    pub model: String,
+    /// The text to synthesize.
+    pub input: String,
+    /// Voice name (speaker ID or preset).
+    #[serde(default)]
+    pub voice: Option<String>,
+    /// Language hint (e.g. "chinese", "english", "auto").
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Optional system-level instructions.
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// Response audio format.
+    #[serde(default)]
+    pub response_format: AudioResponseFormat,
+    /// Speaking speed multiplier (currently unused, reserved).
+    #[serde(default = "default_speed")]
+    pub speed: f64,
+    /// Generation temperature.
+    pub temperature: Option<f64>,
+    /// Nucleus sampling top-p.
+    pub top_p: Option<f64>,
+    /// Repetition penalty.
+    pub repetition_penalty: Option<f32>,
+    /// Max codec tokens to generate (controls max duration).
+    #[serde(default = "default_audio_max_tokens")]
+    pub max_tokens: usize,
 }
 
 // ═════════════════════════════════════════════════════════════

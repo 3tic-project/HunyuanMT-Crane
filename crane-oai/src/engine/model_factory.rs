@@ -22,6 +22,7 @@ pub enum ModelType {
     HunyuanDense,
     Qwen25,
     Qwen3,
+    Qwen3TTS,
     PaddleOcrVl,
 }
 
@@ -31,6 +32,7 @@ impl ModelType {
             "hunyuan" | "hunyuan_dense" | "hunyuandense" => Self::HunyuanDense,
             "qwen25" | "qwen2.5" | "qwen2" => Self::Qwen25,
             "qwen3" => Self::Qwen3,
+            "qwen3_tts" | "qwen3tts" | "qwen3-tts" | "tts" => Self::Qwen3TTS,
             "paddleocr_vl" | "paddleocrv" | "paddleocr" | "paddle_ocr_vl" | "paddleocrvl" => Self::PaddleOcrVl,
             _ => Self::Auto,
         }
@@ -42,6 +44,7 @@ impl ModelType {
             Self::HunyuanDense => "hunyuan",
             Self::Qwen25 => "qwen25",
             Self::Qwen3 => "qwen3",
+            Self::Qwen3TTS => "qwen3_tts",
             Self::PaddleOcrVl => "paddleocr_vl",
         }
     }
@@ -49,6 +52,11 @@ impl ModelType {
     /// Whether this model type is a vision-language model.
     pub fn is_vlm(&self) -> bool {
         matches!(self, Self::PaddleOcrVl)
+    }
+
+    /// Whether this model type is a TTS model.
+    pub fn is_tts(&self) -> bool {
+        matches!(self, Self::Qwen3TTS)
     }
 }
 
@@ -100,6 +108,7 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                     match mt.to_lowercase().as_str() {
                         "qwen2" | "qwen2.5" => return ModelType::Qwen25,
                         "qwen3" => return ModelType::Qwen3,
+                        "qwen3_tts" | "qwen3tts" => return ModelType::Qwen3TTS,
                         m if m.contains("hunyuan") => return ModelType::HunyuanDense,
                         m if m.contains("paddleocr") => return ModelType::PaddleOcrVl,
                         _ => {}
@@ -115,6 +124,9 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                         }
                         if a.contains("hunyuan") {
                             return ModelType::HunyuanDense;
+                        }
+                        if a.contains("qwen3ttsforconditional") || a.contains("qwen3_tts") {
+                            return ModelType::Qwen3TTS;
                         }
                         if a.contains("qwen3") {
                             return ModelType::Qwen3;
@@ -134,6 +146,8 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
         ModelType::PaddleOcrVl
     } else if path_lower.contains("hunyuan") {
         ModelType::HunyuanDense
+    } else if path_lower.contains("qwen3-tts") || path_lower.contains("qwen3_tts") || path_lower.contains("qwen3tts") {
+        ModelType::Qwen3TTS
     } else if path_lower.contains("qwen3") {
         ModelType::Qwen3
     } else if path_lower.contains("qwen2") || path_lower.contains("qwen25") {
@@ -184,6 +198,9 @@ pub fn create_backend(
         ModelType::PaddleOcrVl => {
             anyhow::bail!("PaddleOCR-VL is a VLM model — use create_vlm_model() instead of create_backend()")
         }
+        ModelType::Qwen3TTS => {
+            anyhow::bail!("Qwen3-TTS is a TTS model — use create_tts_model() instead of create_backend()")
+        }
         ModelType::Auto => unreachable!(),
     }
 }
@@ -221,6 +238,17 @@ pub fn create_vlm_model(
 ) -> Result<crane_core::models::paddleocr_vl::PaddleOcrVL> {
     tracing::info!("Creating PaddleOCR-VL model from: {}", model_path);
     crane_core::models::paddleocr_vl::PaddleOcrVL::from_local(model_path, use_cpu, use_bf16)
+}
+
+/// Create a Qwen3-TTS model for TTS inference.
+#[cfg(feature = "onnx")]
+pub fn create_tts_model(
+    model_path: &str,
+    device: &Device,
+    dtype: &DType,
+) -> Result<crane_core::models::qwen3_tts::Model> {
+    tracing::info!("Creating Qwen3-TTS model from: {}", model_path);
+    crane_core::models::qwen3_tts::Model::new(model_path, device, dtype)
 }
 
 #[cfg(test)]
