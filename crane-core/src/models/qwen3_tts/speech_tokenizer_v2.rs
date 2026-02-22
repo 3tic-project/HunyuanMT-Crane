@@ -740,7 +740,11 @@ impl PointwiseProjNoBias {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = x.transpose(1, 2)?; // [B, T, C]
-        let y = x.matmul(&self.weight_t)?; // [B, T, O]
+        let (b, t, c) = x.dims3()?;
+        let o = self.weight_t.dims2()?.1;
+        let x2 = x.reshape((b * t, c))?;
+        let y2 = x2.matmul(&self.weight_t)?; // [B*T, O]
+        let y = y2.reshape((b, t, o))?;
         Ok(y.transpose(1, 2)?) // [B, O, T]
     }
 }
