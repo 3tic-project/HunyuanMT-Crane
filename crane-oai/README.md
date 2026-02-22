@@ -156,12 +156,34 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+#### Multimodal / Vision (PaddleOCR-VL-1.5)
+
+For VLM requests, use an array in `content` to provide the image URL and the prompt text:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "paddleocr_vl-1.5",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "image_url", "image_url": {"url": "https://i0.hdslb.com/bfs/new_dyn/1824ac967aca31d7ac9da4fdda678c4639471072.png"}},
+          {"type": "text", "text": "OCR:"}
+        ]
+      }
+    ],
+    "max_tokens": 1024
+  }'
+```
+
 **Request fields:**
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `model` | string | — | Model name |
-| `messages` | array | — | `[{role, content}]` |
+| `messages` | array | — | `[{role, content}]`. `content` can be a string, or an array of `{"type": "text", "text": "..."}` and `{"type": "image_url", "image_url": {"url": "..."}}` items for VLM models. |
 | `max_tokens` | int | `512` | Max tokens to generate |
 | `temperature` | float | `0.8` | Sampling temperature; `0` = greedy |
 | `top_p` | float | `0.95` | Nucleus sampling threshold |
@@ -211,6 +233,20 @@ curl http://localhost:8080/generate \
   -d '{
     "text": "The meaning of life is",
     "sampling_params": {"max_new_tokens": 128, "temperature": 0.8, "top_p": 0.95}
+  }'
+```
+
+#### Multimodal / Vision (PaddleOCR-VL-1.5)
+
+To run a multimodal inference request with a VLM (PaddleOCR-VL), include the `image_url` parameter:
+
+```bash
+curl http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "OCR:",
+    "image_url": "https://i0.hdslb.com/bfs/new_dyn/1824ac967aca31d7ac9da4fdda678c4639471072.png",
+    "sampling_params": {"max_new_tokens": 1024}
   }'
 ```
 

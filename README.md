@@ -242,7 +242,7 @@ Supported endpoints:
 | Mgmt   | `GET /health` | Health check |
 | Mgmt   | `GET /v1/stats` | Engine statistics |
 
-See [crane-oai/README.md](crane-oai/README.md) for full API documentation with request/response examples.
+✨ **Multimodal & Vision support**: For models like PaddleOCR-VL, the endpoints accept OpenAI's structured `messages.[]content.[{type: "image_url", image_url: {url: "..."}}]` payload or SGLang's `image_url` field. See [crane-oai/README.md](crane-oai/README.md) for full API documentation with request/response examples.
 
 Now you can run LLM extremly fast (about 6x faster than vanilla transformers on M1)!
 
