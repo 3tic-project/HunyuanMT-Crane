@@ -27,6 +27,9 @@ fn default_rope_theta() -> f64 {
 fn default_num_heads() -> usize {
     16
 }
+fn default_head_dim() -> usize {
+    64
+}
 fn default_attention_bias() -> bool {
     false
 }
@@ -86,6 +89,8 @@ pub struct DecoderConfig {
     pub num_attention_heads: usize,
     #[serde(default = "default_num_heads")]
     pub num_key_value_heads: usize,
+    #[serde(default = "default_head_dim")]
+    pub head_dim: usize,
     #[serde(default = "default_attention_bias")]
     pub attention_bias: bool,
     #[serde(default = "default_sliding_window")]
@@ -193,27 +198,34 @@ struct TokenizerAttention {
 
 impl TokenizerAttention {
     fn new(cfg: &DecoderConfig, vb: VarBuilder) -> Result<Self> {
-        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+        let head_dim = cfg.head_dim;
+        let make = |in_d, out_d, name: &str| -> Result<Linear> {
+            if cfg.attention_bias {
+                Ok(linear(in_d, out_d, vb.pp(name))?)
+            } else {
+                Ok(linear_no_bias(in_d, out_d, vb.pp(name))?)
+            }
+        };
         Ok(Self {
-            q_proj: linear(
+            q_proj: make(
                 cfg.hidden_size,
                 cfg.num_attention_heads * head_dim,
-                vb.pp("q_proj"),
+                "q_proj",
             )?,
-            k_proj: linear(
+            k_proj: make(
                 cfg.hidden_size,
                 cfg.num_key_value_heads * head_dim,
-                vb.pp("k_proj"),
+                "k_proj",
             )?,
-            v_proj: linear(
+            v_proj: make(
                 cfg.hidden_size,
                 cfg.num_key_value_heads * head_dim,
-                vb.pp("v_proj"),
+                "v_proj",
             )?,
-            o_proj: linear(
+            o_proj: make(
                 cfg.num_attention_heads * head_dim,
                 cfg.hidden_size,
-                vb.pp("o_proj"),
+                "o_proj",
             )?,
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
@@ -696,28 +708,42 @@ impl ResidualVectorQuantization {
 #[derive(Debug, Clone)]
 struct ResidualVectorQuantizer {
     vq: ResidualVectorQuantization,
-    output_proj: Conv1d,
+    output_proj: PointwiseProjNoBias,
+}
+
+#[derive(Debug, Clone)]
+struct PointwiseProjNoBias {
+    weight_t: Tensor, // [in, out]
+}
+
+impl PointwiseProjNoBias {
+    fn new(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
+        let w = match vb.get((out_dim, in_dim, 1), "weight") {
+            Ok(w) => w.squeeze(2)?,
+            Err(_) => vb.get((out_dim, in_dim), "weight")?,
+        };
+        Ok(Self {
+            weight_t: w.transpose(0, 1)?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = x.transpose(1, 2)?; // [B, T, C]
+        let y = x.matmul(&self.weight_t)?; // [B, T, O]
+        Ok(y.transpose(1, 2)?) // [B, O, T]
+    }
 }
 
 impl ResidualVectorQuantizer {
     fn new(n_q: usize, dimension: usize, bins: usize, output_dimension: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
             vq: ResidualVectorQuantization::new(n_q, dimension, bins, vb.pp("vq"))?,
-            output_proj: conv1d(
-                dimension,
-                output_dimension,
-                1,
-                Conv1dConfig {
-                    groups: 1,
-                    ..Default::default()
-                },
-                vb.pp("output_proj"),
-            )?,
+            output_proj: PointwiseProjNoBias::new(dimension, output_dimension, vb.pp("output_proj"))?,
         })
     }
 
     fn decode(&self, codes: &Tensor) -> Result<Tensor> {
-        Ok(self.vq.decode(codes)?.apply(&self.output_proj)?)
+        self.output_proj.forward(&self.vq.decode(codes)?)
     }
 }
 
