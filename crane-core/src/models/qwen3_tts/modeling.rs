@@ -1161,9 +1161,9 @@ impl Qwen3TTSModel {
             let text_contrib = if step < trailing_len {
                 trailing_text_hidden.squeeze(0)?.narrow(0, step, 1)?
             } else {
-                tts_pad_embed.squeeze(0)?.squeeze(0)?
+                tts_pad_embed.squeeze(0)?
             };
-            let next_input = (sum_embed + text_contrib)?.unsqueeze(0)?.unsqueeze(0)?;
+            let next_input = (sum_embed + text_contrib)?.unsqueeze(0)?;
 
             // Forward one step
             let hs = self.talker.forward_embeds(&next_input, None)?;
