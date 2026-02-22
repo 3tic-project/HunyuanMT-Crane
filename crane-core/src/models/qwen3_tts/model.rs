@@ -113,6 +113,26 @@ pub struct Model {
 }
 
 impl Model {
+    fn normalize_codec_id(&self, code: u32) -> u32 {
+        let codebook_size = self.config.talker_config.code_predictor_config.vocab_size as u32;
+        if codebook_size == 0 {
+            return code;
+        }
+
+        // Qwen3-TTS first-codebook tokens may come from the tail range of the
+        // talker vocab; map them back to local codebook ids.
+        let vocab_size = self.config.talker_config.vocab_size as u32;
+        let tail_base = vocab_size.saturating_sub(codebook_size);
+
+        let mapped = if code >= tail_base && vocab_size >= codebook_size {
+            code - tail_base
+        } else {
+            code
+        };
+
+        mapped.min(codebook_size.saturating_sub(1))
+    }
+
     /// Load from a HuggingFace-style directory.
     ///
     /// Expects:
@@ -260,7 +280,7 @@ impl Model {
         let num_groups = codes[0].len();
         let flat: Vec<i64> = codes
             .iter()
-            .flat_map(|frame| frame.iter().map(|&c| c as i64))
+            .flat_map(|frame| frame.iter().map(|&c| self.normalize_codec_id(c) as i64))
             .collect();
         let codes_tensor = Tensor::new(flat.as_slice(), &self.device)?
             .reshape((num_steps, num_groups))?
@@ -334,7 +354,7 @@ impl Model {
         let num_groups = codes[0].len();
         let flat: Vec<i64> = codes
             .iter()
-            .flat_map(|frame| frame.iter().map(|&c| c as i64))
+            .flat_map(|frame| frame.iter().map(|&c| self.normalize_codec_id(c) as i64))
             .collect();
         let codes_tensor = Tensor::new(flat.as_slice(), &self.device)?
             .reshape((num_steps, num_groups))?
