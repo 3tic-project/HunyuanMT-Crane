@@ -215,8 +215,15 @@ fn apply_rotary_pos_emb(
     sin: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
     // cos, sin: [seq_len, head_dim/2] → broadcast to [1, 1, seq_len, head_dim]
-    let cos_full = Tensor::cat(&[cos, cos], D::Minus1)?.unsqueeze(0)?.unsqueeze(0)?;
-    let sin_full = Tensor::cat(&[sin, sin], D::Minus1)?.unsqueeze(0)?.unsqueeze(0)?;
+    let target_dtype = q.dtype();
+    let cos_full = Tensor::cat(&[cos, cos], D::Minus1)?
+        .to_dtype(target_dtype)?
+        .unsqueeze(0)?
+        .unsqueeze(0)?;
+    let sin_full = Tensor::cat(&[sin, sin], D::Minus1)?
+        .to_dtype(target_dtype)?
+        .unsqueeze(0)?
+        .unsqueeze(0)?;
     let q_embed = (q.broadcast_mul(&cos_full)? + rotate_half(q)?.broadcast_mul(&sin_full)?)?;
     let k_embed = (k.broadcast_mul(&cos_full)? + rotate_half(k)?.broadcast_mul(&sin_full)?)?;
     Ok((q_embed, k_embed))
@@ -254,8 +261,9 @@ fn apply_mrope(
         sin_chunks.push(s);
         offset += sec;
     }
-    let cos_cat = Tensor::cat(&cos_chunks, D::Minus1)?;
-    let sin_cat = Tensor::cat(&sin_chunks, D::Minus1)?;
+    let target_dtype = q.dtype();
+    let cos_cat = Tensor::cat(&cos_chunks, D::Minus1)?.to_dtype(target_dtype)?;
+    let sin_cat = Tensor::cat(&sin_chunks, D::Minus1)?.to_dtype(target_dtype)?;
 
     let q_embed = (q.broadcast_mul(&cos_cat)? + rotate_half(q)?.broadcast_mul(&sin_cat)?)?;
     let k_embed = (k.broadcast_mul(&cos_cat)? + rotate_half(k)?.broadcast_mul(&sin_cat)?)?;

@@ -244,8 +244,15 @@ impl TokenizerAttention {
             .transpose(1, 2)?;
 
         let (cos, sin) = self.rotary.forward(t)?;
-        let cos = Tensor::cat(&[&cos, &cos], D::Minus1)?.unsqueeze(0)?.unsqueeze(0)?;
-        let sin = Tensor::cat(&[&sin, &sin], D::Minus1)?.unsqueeze(0)?.unsqueeze(0)?;
+        let target_dtype = q.dtype();
+        let cos = Tensor::cat(&[&cos, &cos], D::Minus1)?
+            .to_dtype(target_dtype)?
+            .unsqueeze(0)?
+            .unsqueeze(0)?;
+        let sin = Tensor::cat(&[&sin, &sin], D::Minus1)?
+            .to_dtype(target_dtype)?
+            .unsqueeze(0)?
+            .unsqueeze(0)?;
         let q = (q.broadcast_mul(&cos)? + rotate_half(&q)?.broadcast_mul(&sin)?)?;
         let k = (k.broadcast_mul(&cos)? + rotate_half(&k)?.broadcast_mul(&sin)?)?;
 
@@ -612,9 +619,18 @@ struct EuclideanCodebook {
 
 impl EuclideanCodebook {
     fn new(dim: usize, codebook_size: usize, vb: VarBuilder) -> Result<Self> {
+        let embedding_sum = vb.get((codebook_size, dim), "embedding_sum")?;
+        let cluster_usage = match vb.get(codebook_size, "cluster_usage") {
+            Ok(v) => v,
+            Err(_) => {
+                let ones = vec![1f32; codebook_size];
+                Tensor::new(ones.as_slice(), vb.device())?.to_dtype(embedding_sum.dtype())?
+            }
+        };
+
         Ok(Self {
-            cluster_usage: vb.get(codebook_size, "cluster_usage")?,
-            embedding_sum: vb.get((codebook_size, dim), "embedding_sum")?,
+            cluster_usage,
+            embedding_sum,
             epsilon: 1e-5,
         })
     }

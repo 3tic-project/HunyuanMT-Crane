@@ -229,7 +229,7 @@ Common built-in speakers include: `Chelsie`, `Ethan`, `Cherry`, `Serena`, `Dylan
 
 ### Troubleshooting
 
-**`native speech tokenizer load failed`** — Check `<model_dir>/speech_tokenizer/config.json` and safetensors files are complete. You can optionally export ONNX as a fallback decoder.
+**`native speech tokenizer load failed`** — Check `<model_dir>/speech_tokenizer/config.json` and safetensors files are complete. For older checkpoints that miss `quantizer.*._codebook.cluster_usage`, Crane now auto-falls back to a ones vector during load; if loading still fails, optionally export ONNX as a fallback decoder.
 
 **`TTS model not loaded`** — The server was started with an LLM model (not TTS). Restart with `--model-type qwen3_tts`.
 
