@@ -274,7 +274,7 @@ impl TokenizerAttention {
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-        let mask = causal_sliding_mask(t, self.sliding_window, hidden.device())?;
+        let mask = causal_sliding_mask(t, self.sliding_window, hidden.device())?.to_dtype(scores.dtype())?;
         let scores = scores.broadcast_add(&mask)?;
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let out = probs
@@ -523,7 +523,11 @@ impl SnakeBeta {
         let beta = self.beta.reshape((1, c, 1))?.exp()?;
         let periodic = hidden.broadcast_mul(&alpha)?.sin()?.sqr()?;
         let gain = (&beta + 1e-9)?.recip()?;
-        Ok((hidden + gain.broadcast_mul(&periodic)?)?)
+        let mut periodic_gain = gain.broadcast_mul(&periodic)?;
+        if periodic_gain.dtype() != hidden.dtype() {
+            periodic_gain = periodic_gain.to_dtype(hidden.dtype())?;
+        }
+        Ok((hidden + periodic_gain)?)
     }
 }
 
@@ -794,15 +798,21 @@ impl SplitResidualVectorQuantizer {
 
     fn decode(&self, codes: &Tensor) -> Result<Tensor> {
         let (_, k, _) = codes.dims3()?;
-        let first = self
+        let mut first = self
             .rvq_first
             .decode(&codes.narrow(1, 0, self.n_q_semantic)?)?;
         if k > self.n_q_semantic {
-            let rest = self
+            let mut rest = self
                 .rvq_rest
                 .decode(&codes.narrow(1, self.n_q_semantic, k - self.n_q_semantic)?)?;
+            if rest.dtype() != first.dtype() {
+                rest = rest.to_dtype(first.dtype())?;
+            }
             Ok((first + rest)?)
         } else {
+            if first.dtype() != codes.dtype() {
+                first = first.to_dtype(codes.dtype())?;
+            }
             Ok(first)
         }
     }
