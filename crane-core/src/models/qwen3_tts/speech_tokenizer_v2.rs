@@ -1345,9 +1345,9 @@ impl MimiEncoder {
         // Layer 14: last conv [in_ch → hidden_size, k=last_kernel_size]
         let last_conv = CausalConvNet::new(in_ch, cfg.hidden_size, cfg.last_kernel_size, 1, 1, 1, layers_vb.pp(14))?;
 
-        // Downsample: stride-4 conv, no bias (compress=2 → stride=4)
+        // Downsample: ConvDownsample1d(compress=2) → kernel_size=2*compress=4, stride=compress=2
         // Weight: encoder.downsample.conv.weight [512, 512, 4] (no bias key)
-        let downsample = CausalConvNet::new_no_bias(cfg.hidden_size, cfg.hidden_size, 4, 4, 1, 1, vb.pp("downsample"))?;
+        let downsample = CausalConvNet::new_no_bias(cfg.hidden_size, cfg.hidden_size, 4, 2, 1, 1, vb.pp("downsample"))?;
 
         // Encoder transformer
         let mut transformer_layers = Vec::new();

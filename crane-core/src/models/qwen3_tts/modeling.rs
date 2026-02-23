@@ -1910,6 +1910,15 @@ impl Qwen3TTSModel {
         let eos_suppress_mask = Tensor::new(eos_suppress_data.as_slice(), &self.device)?;
 
         let trailing_len = trailing_text_hidden.dim(1)?;
+        let tts_debug = std::env::var("CRANE_TTS_DEBUG").map(|v| v == "1" || v == "true").unwrap_or(false);
+
+        if tts_debug {
+            eprintln!(
+                "[CRANE_TTS_DEBUG] voice_clone gen starting: eos_token_id={}, vocab_size={}, \
+                 suppress_start={}, offset={}, trailing_len={}, max_new_tokens={}",
+                eos_token_id, vocab_size, suppress_start, offset, trailing_len, max_new_tokens
+            );
+        }
 
         for step in 0..max_new_tokens {
             let logits = self.talker.predict_first_code(&past_hidden)?
@@ -1928,6 +1937,21 @@ impl Qwen3TTSModel {
             } else {
                 (logits + &suppress_mask)?
             };
+
+            // Diagnostic: log EOS logit and top-5 values for select steps
+            if tts_debug && (step < 5 || step % 500 == 0 || step == max_new_tokens - 1) {
+                let logits_vec: Vec<f32> = logits.to_vec1()?;
+                let eos_logit = logits_vec.get(eos_token_id as usize).copied().unwrap_or(f32::NAN);
+                let mut indexed: Vec<(usize, f32)> = logits_vec.iter().copied().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top5: Vec<(usize, f32)> = indexed.iter().take(5).copied().collect();
+                let eos_rank = indexed.iter().position(|(i, _)| *i == eos_token_id as usize).unwrap_or(9999);
+                eprintln!(
+                    "[CRANE_TTS_DEBUG] step={step}: eos_logit={eos_logit:.3} eos_rank={eos_rank} \
+                     top5={:?} trailing={}", top5,
+                    if step < trailing_len { "text" } else { "pad" },
+                );
+            }
 
             let first_code = logits_processor.sample(&logits)?;
             if first_code == eos_token_id {
