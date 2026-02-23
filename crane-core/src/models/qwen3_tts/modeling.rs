@@ -825,10 +825,22 @@ impl TalkerModel {
         })
     }
 
-    /// Build the input embeddings for the talker prefill.
+    /// Build the input embeddings for the talker prefill (non-streaming mode).
     ///
-    /// For CustomVoice model with a known speaker:
-    ///   [text(<|im_start|>assistant\n)] + [codec tags + speaker + bos] + [text tokens]
+    /// Follows the Python reference implementation exactly:
+    ///
+    /// text_token_ids layout (from `<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n`):
+    ///   [0..3]   = role prefix (`<|im_start|>`, `assistant`, `\n`)
+    ///   [3..-5]  = actual text content
+    ///   [-5..]   = trailing (`<|im_end|>`, `\n`, `<|im_start|>`, `assistant`, `\n`) — not used
+    ///
+    /// Non-streaming prefill construction:
+    ///   [role(3)]
+    ///   + [(tts_pad*(N-2) + tts_bos) + codec_prefix[:-1]]
+    ///   + [(text_all + tts_eos) + codec_pad*(text_len+1)]
+    ///   + [(tts_pad) + codec_bos]
+    ///
+    /// trailing_text_hidden = tts_pad_embed (all text already in prefill)
     ///
     /// Returns (input_embeds, trailing_text_hidden, tts_pad_embed)
     pub fn build_prefill_embeds(
@@ -836,44 +848,37 @@ impl TalkerModel {
         text_token_ids: &[u32],
         language: &str,
         speaker: Option<&str>,
+        tts_bos_token_id: u32,
+        tts_eos_token_id: u32,
+        tts_pad_token_id: u32,
         device: &Device,
         dtype: DType,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let cfg = &self.config;
 
-        // Get special embeddings: tts_bos, tts_eos, tts_pad
-        // These are text tokens that get projected through text_projection
-        // We need to hardcode the parent config tokens here
-        // The caller should pass tts token IDs from the top-level config
-        // For now, we use the text embedding + projection pipeline
+        // ── 1. Compute tts_bos / tts_eos / tts_pad embeddings ──────────
+        // These are TEXT tokens projected into the talker hidden space:
+        //   text_projection(text_embedding([tts_bos_id, tts_eos_id, tts_pad_id])) → chunk(3)
+        let tts_token_ids = Tensor::new(
+            &[[tts_bos_token_id, tts_eos_token_id, tts_pad_token_id]],
+            device,
+        )?;
+        let tts_embeds = self.text_embedding.forward(&tts_token_ids)?; // [1, 3, text_hidden]
+        let tts_projected = self.text_projection.forward(&tts_embeds)?; // [1, 3, hidden]
+        let tts_bos_embed = tts_projected.narrow(1, 0, 1)?; // [1, 1, D]
+        let tts_eos_embed = tts_projected.narrow(1, 1, 1)?; // [1, 1, D]
+        let tts_pad_embed = tts_projected.narrow(1, 2, 1)?; // [1, 1, D]
 
-        // 1. Build codec prefill tags
+        // ── 2. Build codec prefill tags ────────────────────────────────
         let language_id = if language.to_lowercase() == "auto" {
             None
         } else {
             cfg.codec_language_id.get(&language.to_lowercase()).copied()
         };
 
-        let mut codec_prefill: Vec<u32> = Vec::new();
-        if language_id.is_none() {
-            codec_prefill.extend_from_slice(&[
-                cfg.codec_nothink_id as u32,
-                cfg.codec_think_bos_id as u32,
-                cfg.codec_think_eos_id as u32,
-            ]);
-        } else {
-            codec_prefill.extend_from_slice(&[
-                cfg.codec_think_id as u32,
-                cfg.codec_think_bos_id as u32,
-                language_id.unwrap() as u32,
-                cfg.codec_think_eos_id as u32,
-            ]);
-        }
-
-        // Add speaker embed if available
         let speaker_id = speaker.and_then(|s| cfg.spk_id.get(&s.to_lowercase()).copied());
 
-        // Check if dialect should be used
+        // Check dialect override
         let final_language_id = if let Some(spk_name) = speaker {
             if language.to_lowercase() == "chinese" || language.to_lowercase() == "auto" {
                 if let Some(dialect_val) = cfg.spk_is_dialect.get(&spk_name.to_lowercase()) {
@@ -892,7 +897,6 @@ impl TalkerModel {
             language_id
         };
 
-        // Rebuild codec_prefill with final language
         let mut codec_prefill: Vec<u32> = Vec::new();
         if final_language_id.is_none() {
             codec_prefill.extend_from_slice(&[
@@ -909,14 +913,14 @@ impl TalkerModel {
             ]);
         }
 
+        // Codec prefix embeddings (via codec_embedding)
         let codec_prefill_tensor = Tensor::new(codec_prefill.as_slice(), device)?;
         let codec_embed_0 = self.codec_embedding.forward(&codec_prefill_tensor)?.unsqueeze(0)?;
 
-        // codec_pad + codec_bos
         let codec_suffix = Tensor::new(&[cfg.codec_pad_id as u32, cfg.codec_bos_id as u32], device)?;
         let codec_embed_1 = self.codec_embedding.forward(&codec_suffix)?.unsqueeze(0)?;
 
-        // Build full codec embedding (with or without speaker)
+        // Full codec prefix (with optional speaker)
         let codec_input_embedding = if let Some(sid) = speaker_id {
             let spk_tensor = Tensor::new(&[sid as u32], device)?;
             let spk_embed = self.codec_embedding.forward(&spk_tensor)?.unsqueeze(0)?;
@@ -924,73 +928,69 @@ impl TalkerModel {
         } else {
             Tensor::cat(&[&codec_embed_0, &codec_embed_1], 1)?
         };
+        let codec_prefix_len = codec_input_embedding.dim(1)?;
 
-        // Text processing:
-        // text_token_ids layout: [<|im_start|>, 'assistant', '\n', ...text..., <|im_end|>, '\n', <|im_start|>, 'assistant', '\n']
-        // First 3 tokens are the role prefix
-        let all_ids = Tensor::new(text_token_ids, device)?;
-
-        // Build tts_pad embedding (we need the TTS pad token embedded through text pipeline)
-        // The tts_pad_token_id comes from the parent config (e.g., 151671)
-        // For now we'll compute it from zero embeddings as a simple approach
-        // Actually we need the text_projection of the text_embedding of tts_pad_token_id
-        // These IDs need to be passed in. Let's create a helper.
-
-        // We'll just embed all text and project it
-        let text_embeds = self.text_embedding.forward(&all_ids)?;
-        let text_embeds = self.text_projection.forward(&text_embeds.unsqueeze(0)?)?;
+        // ── 3. Text embeddings via text_embedding → text_projection ────
+        let text_len = text_token_ids.len();
+        let all_ids = Tensor::new(text_token_ids, device)?.unsqueeze(0)?; // [1, text_len]
+        let text_embeds = self.text_embedding.forward(&all_ids)?; // [1, text_len, text_hidden]
+        let text_embeds = self.text_projection.forward(&text_embeds)?; // [1, text_len, hidden]
 
         // Role prefix: first 3 tokens ("<|im_start|>assistant\n")
-        let role_embed = text_embeds.narrow(1, 0, 3)?;
+        let role_embed = text_embeds.narrow(1, 0, 3)?; // [1, 3, D]
 
-        // The rest of the text (content + trailing tokens)
-        let text_len = text_token_ids.len();
-
-        // Pad embeddings for the codec prefix
-        let pad_id = Tensor::new(&[cfg.codec_pad_id as u32], device)?;
-        let pad_embed = self.codec_embedding.forward(&pad_id)?.unsqueeze(0)?;
-
-        // tts_pad is a placeholder — we use codec_pad embedding as base
-        let tts_pad_embed = pad_embed.clone();
-
-        // Build prefill: role + (tts_pad * codec_prefix_len + tts_bos) + codec + first_text
-        let codec_prefix_len = codec_input_embedding.dim(1)?;
-        let pad_expanded = pad_embed.repeat((1, codec_prefix_len - 2, 1))?; // for codec tags
-        // We use text pad for the codec-aligned tokens (silence before speech)
-        let pad_text_embed = tts_pad_embed.repeat((1, codec_prefix_len - 2, 1))?;
-
-        // Combine: text_projection(tts_pad) * N + text_projection(tts_bos) aligned with codec prefix
-        let bos_id = Tensor::new(&[cfg.codec_bos_id as u32], device)?;
-        let bos_embed = self.codec_embedding.forward(&bos_id)?.unsqueeze(0)?;
-
-        // Simple approach: role_embed + (padding aligned with codec prefix except last) + (first text + last codec)
-        // concat role + codec prefill
-        let prefill_codec = codec_input_embedding.narrow(1, 0, codec_prefix_len - 1)?;
-
-        // Pad text embeddings for alignment
-        let pad_text = tts_pad_embed.repeat((1, codec_prefix_len - 2, 1))?;
-
-        // The text side: pad * (codec_prefix_len - 2) + tts_bos
-        let aligned = (pad_text + prefill_codec.narrow(1, 0, codec_prefix_len - 2)?)?;
-
-        // Now for the first actual text token (index 3 in text_token_ids)
-        let first_text_embed = text_embeds.narrow(1, 3, 1)?;
-        let last_codec = codec_input_embedding.narrow(1, codec_prefix_len - 1, 1)?;
-        let first_aligned = (first_text_embed + last_codec)?;
-
-        let talker_input_embed = Tensor::cat(&[&role_embed, &aligned, &first_aligned], 1)?;
-
-        // Trailing text hidden: remaining text content (index 4..(text_len-5)) + eos
-        // text_token_ids ends with: ...<|im_end|>\n<|im_start|>assistant\n  (5 tokens)
-        let trailing_start = 4;
-        let trailing_end = text_len.saturating_sub(5);
-        let trailing_len = trailing_end.saturating_sub(trailing_start);
-
-        let trailing_text_hidden = if trailing_len > 0 {
-            text_embeds.narrow(1, trailing_start, trailing_len)?
+        // Text content: tokens [3..-5]
+        let text_content_len = text_len.saturating_sub(8); // 3 prefix + 5 suffix = 8
+        let text_content_embed = if text_content_len > 0 {
+            text_embeds.narrow(1, 3, text_content_len)? // [1, text_content_len, D]
         } else {
-            tts_pad_embed.clone()
+            // Edge case: no text content
+            Tensor::zeros((1, 0, tts_pad_embed.dim(2)?), dtype, device)?
         };
+
+        // ── 4. Build the non-streaming prefill ─────────────────────────
+        //
+        // Part A: role (3 tokens)
+        //   Already have role_embed [1, 3, D]
+        //
+        // Part B: (tts_pad * (N-2) + tts_bos) + codec_prefix[:-1]
+        //   N = codec_prefix_len
+        let part_b_text = Tensor::cat(
+            &[
+                &tts_pad_embed.repeat((1, codec_prefix_len - 2, 1))?,
+                &tts_bos_embed,
+            ],
+            1,
+        )?; // [1, N-1, D]
+        let part_b_codec = codec_input_embedding.narrow(1, 0, codec_prefix_len - 1)?; // [1, N-1, D]
+        let part_b = (part_b_text + part_b_codec)?; // [1, N-1, D]
+
+        // Part C: (text_all + tts_eos) + codec_pad * (text_content_len + 1)
+        let part_c_text_plus_eos = if text_content_len > 0 {
+            Tensor::cat(&[&text_content_embed, &tts_eos_embed], 1)? // [1, text_content_len+1, D]
+        } else {
+            tts_eos_embed.clone() // [1, 1, D]
+        };
+        let part_c_len = part_c_text_plus_eos.dim(1)?;
+        let codec_pad_ids = Tensor::new(
+            vec![cfg.codec_pad_id as u32; part_c_len].as_slice(),
+            device,
+        )?;
+        let part_c_codec = self.codec_embedding.forward(&codec_pad_ids)?.unsqueeze(0)?; // [1, part_c_len, D]
+        let part_c = (part_c_text_plus_eos + part_c_codec)?; // [1, part_c_len, D]
+
+        // Part D: tts_pad + codec_bos
+        let codec_bos_tensor = Tensor::new(&[cfg.codec_bos_id as u32], device)?;
+        let codec_bos_embed = self.codec_embedding.forward(&codec_bos_tensor)?.unsqueeze(0)?; // [1, 1, D]
+        let part_d = (tts_pad_embed.clone() + codec_bos_embed)?; // [1, 1, D]
+
+        // Concatenate all parts
+        let talker_input_embed = Tensor::cat(&[&role_embed, &part_b, &part_c, &part_d], 1)?;
+
+        // ── 5. Trailing text hidden = tts_pad (non-streaming) ──────────
+        // In non-streaming mode, all text is embedded in the prefill.
+        // The generation loop adds tts_pad_embed at every step.
+        let trailing_text_hidden = tts_pad_embed.clone();
 
         let talker_input_embed = talker_input_embed.to_dtype(dtype)?;
         let trailing_text_hidden = trailing_text_hidden.to_dtype(dtype)?;
@@ -1090,6 +1090,9 @@ impl Qwen3TTSModel {
                 text_token_ids,
                 language,
                 speaker,
+                self.config.tts_bos_token_id,
+                self.config.tts_eos_token_id,
+                self.config.tts_pad_token_id,
                 &self.device,
                 self.dtype,
             )?;
@@ -1101,6 +1104,15 @@ impl Qwen3TTSModel {
         let mut all_codes = Vec::new();
         let mut logits_processor =
             candle_transformers::generation::LogitsProcessor::new(42, Some(temperature), top_p);
+
+        // Build suppress_tokens mask: suppress [vocab_size-1024, vocab_size) except EOS
+        // These are special tokens (pad, bos, eos, language, speaker, etc.) that should
+        // not be generated as speech codes.
+        let vocab_size = self.config.talker_config.vocab_size;
+        let suppress_start = vocab_size.saturating_sub(1024);
+        let suppress_tokens: Vec<usize> = (suppress_start..vocab_size)
+            .filter(|&i| i as u32 != eos_token_id)
+            .collect();
 
         // Last hidden state from prefill
         let seq_len = hidden_states.dim(1)?;
@@ -1122,6 +1134,19 @@ impl Qwen3TTSModel {
                     repetition_penalty,
                     &recent,
                 )?
+            } else {
+                logits
+            };
+
+            // Suppress special tokens (except EOS) to prevent them from being sampled
+            let logits = if !suppress_tokens.is_empty() {
+                let mut logits_vec = logits.to_vec1::<f32>()?;
+                for &idx in &suppress_tokens {
+                    if idx < logits_vec.len() {
+                        logits_vec[idx] = f32::NEG_INFINITY;
+                    }
+                }
+                Tensor::new(logits_vec.as_slice(), logits.device())?
             } else {
                 logits
             };
@@ -1168,6 +1193,26 @@ impl Qwen3TTSModel {
             // Forward one step
             let hs = self.talker.forward_embeds(&next_input, None)?;
             past_hidden = hs.narrow(1, hs.dim(1)? - 1, 1)?;
+        }
+
+        if std::env::var("CRANE_TTS_DEBUG").map(|v| v == "1" || v == "true").unwrap_or(false) {
+            eprintln!(
+                "[CRANE_TTS_DEBUG] generate_speech_codes: generated {} frames, max_new_tokens={}",
+                all_codes.len(),
+                max_new_tokens,
+            );
+            if let Some(first_frame) = all_codes.first() {
+                eprintln!(
+                    "[CRANE_TTS_DEBUG]   first frame codes: {:?}",
+                    first_frame
+                );
+            }
+            if let Some(last_frame) = all_codes.last() {
+                eprintln!(
+                    "[CRANE_TTS_DEBUG]   last frame codes: {:?}",
+                    last_frame
+                );
+            }
         }
 
         self.clear_kv_cache();

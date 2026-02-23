@@ -124,19 +124,10 @@ impl Model {
         if codebook_size == 0 {
             return code;
         }
-
-        // Qwen3-TTS first-codebook tokens may come from the tail range of the
-        // talker vocab; map them back to local codebook ids.
-        let vocab_size = self.config.talker_config.vocab_size as u32;
-        let tail_base = vocab_size.saturating_sub(codebook_size);
-
-        let mapped = if code >= tail_base && vocab_size >= codebook_size {
-            code - tail_base
-        } else {
-            code
-        };
-
-        mapped.min(codebook_size.saturating_sub(1))
+        // Codes from the talker are already in [0, codebook_size) range
+        // (tokens >= codebook_size are suppressed during generation).
+        // Just clamp to be safe.
+        code.min(codebook_size.saturating_sub(1))
     }
 
     /// Load from a HuggingFace-style directory.
@@ -223,22 +214,19 @@ impl Model {
 
     /// Tokenize text input for TTS.
     ///
-    /// Wraps with Qwen chat-style tags:
-    /// `<|im_start|>system\nYou are Qwen...<|im_end|>\n<|im_start|>user\n<tts>text</tts><|im_end|>\n<|im_start|>assistant\n`
+    /// Uses the format expected by Qwen3-TTS:
+    /// `<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n`
+    ///
+    /// Token layout after tokenization:
+    ///   [0..3]   = role prefix (`<|im_start|>`, `assistant`, `\n`)
+    ///   [3..-5]  = actual text content
+    ///   [-5..]   = trailing (`<|im_end|>`, `\n`, `<|im_start|>`, `assistant`, `\n`)
     pub fn prepare_tts_input(
         &self,
         text: &str,
-        system_prompt: Option<&str>,
     ) -> Result<Vec<u32>> {
-        let system = system_prompt.unwrap_or(
-            "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group. \
-             You can perceive speech, text, and other multimodal information, and you can \
-             output speech and text information.",
-        );
         let chat_text = format!(
-            "<|im_start|>system\n{system}<|im_end|>\n\
-             <|im_start|>user\n<tts>{text}</tts><|im_end|>\n\
-             <|im_start|>assistant\n"
+            "<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
         );
         let encoding = self.tokenizer.encode(chat_text.as_str(), false).map_err(E::msg)?;
         Ok(encoding.get_ids().to_vec())
@@ -257,9 +245,8 @@ impl Model {
         temperature: f64,
         top_p: Option<f64>,
         repetition_penalty: f32,
-        system_prompt: Option<&str>,
     ) -> Result<(Tensor, u32)> {
-        let input_ids = self.prepare_tts_input(text, system_prompt)?;
+        let input_ids = self.prepare_tts_input(text)?;
 
         let codes = self.inner.generate_speech_codes(
             &input_ids,
@@ -318,7 +305,6 @@ impl Model {
         top_p: Option<f64>,
         repetition_penalty: f32,
         output_path: &str,
-        system_prompt: Option<&str>,
     ) -> Result<String> {
         let (audio, sr) = self.generate_speech(
             text,
@@ -328,7 +314,6 @@ impl Model {
             temperature,
             top_p,
             repetition_penalty,
-            system_prompt,
         )?;
         Self::save_wav(&audio, output_path, sr)
     }
@@ -344,9 +329,8 @@ impl Model {
         temperature: f64,
         top_p: Option<f64>,
         repetition_penalty: f32,
-        system_prompt: Option<&str>,
     ) -> Result<Vec<Vec<u32>>> {
-        let input_ids = self.prepare_tts_input(text, system_prompt)?;
+        let input_ids = self.prepare_tts_input(text)?;
         let codes = self.inner.generate_speech_codes(
             &input_ids,
             language,

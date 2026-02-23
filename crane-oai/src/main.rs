@@ -261,8 +261,6 @@ async fn main() -> Result<()> {
 
                 while let Some(req) = tts_rx.blocking_recv() {
                     let result = (|| -> Result<handlers::tts::TtsResult, String> {
-                        let system_prompt = req.instructions.as_deref();
-
                         let (audio, sr) = tts
                             .generate_speech(
                                 &req.input,
@@ -272,11 +270,11 @@ async fn main() -> Result<()> {
                                 req.temperature,
                                 req.top_p,
                                 req.repetition_penalty,
-                                system_prompt,
                             )
                             .map_err(|e| e.to_string())?;
 
                         // Build WAV bytes in memory.
+                        tracing::info!("TTS audio tensor shape: {:?}, sr={sr}", audio.dims());
                         let audio_f32 = audio
                             .to_dtype(candle_core::DType::F32)
                             .map_err(|e| e.to_string())?
@@ -285,6 +283,7 @@ async fn main() -> Result<()> {
                         let samples = audio_f32
                             .to_vec1::<f32>()
                             .map_err(|e| e.to_string())?;
+                        tracing::info!("TTS writing {} samples to WAV", samples.len());
 
                         let mut wav_buf = std::io::Cursor::new(Vec::new());
                         {

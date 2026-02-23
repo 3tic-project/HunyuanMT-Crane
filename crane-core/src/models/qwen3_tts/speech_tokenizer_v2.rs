@@ -946,7 +946,14 @@ impl NativeSpeechTokenizerDecoder {
         self.sample_rate
     }
 
+    fn tts_debug() -> bool {
+        std::env::var("CRANE_TTS_DEBUG")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    }
+
     pub fn forward(&self, codes: &Tensor) -> Result<Tensor> {
+        let debug = Self::tts_debug();
         let (_, k, _) = codes.dims3()?;
         if k != self.config.num_quantizers {
             anyhow::bail!(
@@ -955,29 +962,42 @@ impl NativeSpeechTokenizerDecoder {
                 k
             );
         }
+        if debug { eprintln!("[DECODER] input codes: {:?}", codes.dims()); }
 
         let mut hidden = self.quantizer.decode(codes)?;
+        if debug { eprintln!("[DECODER] after quantizer.decode: {:?}", hidden.dims()); }
+
         hidden = self.pre_conv.forward(&hidden)?;
+        if debug { eprintln!("[DECODER] after pre_conv: {:?}", hidden.dims()); }
 
         hidden = hidden.transpose(1, 2)?;
         hidden = self.pre_transformer.forward(&hidden)?;
         hidden = hidden.transpose(1, 2)?;
+        if debug { eprintln!("[DECODER] after pre_transformer: {:?}", hidden.dims()); }
 
-        for (up, block) in self.upsample.iter() {
+        for (i, (up, block)) in self.upsample.iter().enumerate() {
             hidden = up.forward(&hidden)?;
+            if debug { eprintln!("[DECODER] after upsample[{i}].up: {:?}", hidden.dims()); }
             hidden = block.forward(&hidden)?;
+            if debug { eprintln!("[DECODER] after upsample[{i}].block: {:?}", hidden.dims()); }
         }
 
         let mut wav = hidden;
-        for block in self.decoder.iter() {
+        for (i, block) in self.decoder.iter().enumerate() {
             wav = block.forward(&wav)?;
+            if debug { eprintln!("[DECODER] after decoder[{i}]: {:?}", wav.dims()); }
         }
 
+        if debug { eprintln!("[DECODER] final output (before clamp): {:?}", wav.dims()); }
         Ok(wav.clamp(-1.0, 1.0)?)
     }
 
     pub fn chunked_decode(&self, codes: &Tensor, chunk_size: usize, left_context_size: usize) -> Result<Tensor> {
+        let debug = Self::tts_debug();
         let (_, _, t) = codes.dims3()?;
+        if debug {
+            eprintln!("[DECODER] chunked_decode: codes={:?} chunk_size={chunk_size} total_upsample={}", codes.dims(), self.total_upsample);
+        }
         let mut wavs = Vec::new();
         let mut start = 0usize;
 
