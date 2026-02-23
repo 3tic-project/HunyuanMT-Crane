@@ -678,8 +678,8 @@ impl CodePredictor {
         first_code: u32,
         codec_embedding: &Embedding,
         device: &Device,
-        _temperature: f64,
-        _top_p: Option<f64>,
+        temperature: f64,
+        top_p: Option<f64>,
     ) -> Result<Vec<u32>> {
         fn as_btd(x: &Tensor) -> Result<Tensor> {
             match x.dims().len() {
@@ -693,6 +693,19 @@ impl CodePredictor {
         self.clear_kv_cache();
         let n_groups = self.num_code_groups - 1;
         let mut codes = Vec::with_capacity(n_groups);
+
+        // Sampling for code predictor (subtalker) — matches Python defaults:
+        //   subtalker_dosample=True, subtalker_temperature=0.9,
+        //   subtalker_top_k=50, subtalker_top_p=1.0
+        let mut logits_processor =
+            candle_transformers::generation::LogitsProcessor::from_sampling(
+                42,
+                candle_transformers::generation::Sampling::TopKThenTopP {
+                    k: 50,
+                    p: top_p.unwrap_or(1.0),
+                    temperature,
+                },
+            );
 
         // Build initial input: [talker_hidden, embed(first_code)]
         let first_embed = as_btd(&codec_embedding.forward(&Tensor::new(&[first_code], device)?)?)?;
@@ -739,14 +752,15 @@ impl CodePredictor {
         }
         hidden_states = self.norm.forward(&hidden_states)?;
 
-        // First head prediction (argmax)
+        // First head prediction (sampling)
         let logits = self.lm_heads[0].forward(
             &hidden_states.narrow(1, seq_len - 1, 1)?,
         )?;
-        let next_token = logits.flatten_all()?.argmax(0)?.to_scalar::<u32>()?;
+        let logits_f32 = logits.flatten_all()?.to_dtype(candle_core::DType::F32)?;
+        let next_token = logits_processor.sample(&logits_f32)?;
         codes.push(next_token);
 
-        // Remaining groups (argmax)
+        // Remaining groups (sampling)
         for g in 1..n_groups {
             let embed = as_btd(&self.codec_embeddings[g - 1].forward(
                 &Tensor::new(&[codes[g - 1]], device)?,
@@ -766,7 +780,8 @@ impl CodePredictor {
             }
             hs = self.norm.forward(&hs)?;
             let logits = self.lm_heads[g].forward(&hs)?;
-            let next_token = logits.flatten_all()?.argmax(0)?.to_scalar::<u32>()?;
+            let logits_f32 = logits.flatten_all()?.to_dtype(candle_core::DType::F32)?;
+            let next_token = logits_processor.sample(&logits_f32)?;
             codes.push(next_token);
         }
 
@@ -1659,7 +1674,7 @@ impl Qwen3TTSModel {
                 42,
                 candle_transformers::generation::Sampling::TopKThenTopP {
                     k: 50,
-                    p: top_p.unwrap_or(0.9),
+                    p: top_p.unwrap_or(1.0),
                     temperature,
                 },
             );
@@ -1765,7 +1780,7 @@ impl Qwen3TTSModel {
                 all_codes.len(),
                 max_new_tokens,
                 trailing_len,
-                top_p.unwrap_or(0.9),
+                top_p.unwrap_or(1.0),
                 temperature,
                 repetition_penalty,
             );
@@ -1813,17 +1828,6 @@ impl Qwen3TTSModel {
         repetition_penalty: f32,
     ) -> Result<(Vec<Vec<u32>>, usize)> {
         self.clear_kv_cache();
-
-        // ── ICL generation adjustments (matching vendor/mlx-audio) ─────
-        // Voice-clone (ICL) needs stronger repetition penalty to prevent
-        // degenerate loops, and a proportional frame cap to avoid runaway.
-        const ICL_MIN_REP_PENALTY: f32 = 1.5;
-        const ICL_MIN_FRAMES: usize = 75;
-        const ICL_FRAMES_PER_TOKEN: usize = 6;
-
-        let repetition_penalty = repetition_penalty.max(ICL_MIN_REP_PENALTY);
-        let max_new_tokens = max_new_tokens
-            .min(ICL_MIN_FRAMES.max(text_token_ids.len() * ICL_FRAMES_PER_TOKEN));
 
         // ── Phase 1: Base prefill (9 positions) ────────────────────────
         let (prefill_embeds, tts_pad_embed) =
@@ -1887,7 +1891,7 @@ impl Qwen3TTSModel {
                 42,
                 candle_transformers::generation::Sampling::TopKThenTopP {
                     k: 50,
-                    p: top_p.unwrap_or(0.9),
+                    p: top_p.unwrap_or(1.0),
                     temperature,
                 },
             );
