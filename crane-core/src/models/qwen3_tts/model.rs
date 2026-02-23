@@ -228,21 +228,13 @@ impl Model {
 
     /// Tokenize text input for TTS.
     ///
-    /// Uses the format expected by Qwen3-TTS:
-    /// `<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n`
-    ///
-    /// Token layout after tokenization:
-    ///   [0..3]   = role prefix (`<|im_start|>`, `assistant`, `\n`)
-    ///   [3..-5]  = actual text content
-    ///   [-5..]   = trailing (`<|im_end|>`, `\n`, `<|im_start|>`, `assistant`, `\n`)
+    /// Returns raw text tokens (no ChatML wrapping).
+    /// The role prefix is added by the talker prefill construction.
     pub fn prepare_tts_input(
         &self,
         text: &str,
     ) -> Result<Vec<u32>> {
-        let chat_text = format!(
-            "<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
-        );
-        let encoding = self.tokenizer.encode(chat_text.as_str(), false).map_err(E::msg)?;
+        let encoding = self.tokenizer.encode(text, false).map_err(E::msg)?;
         Ok(encoding.get_ids().to_vec())
     }
 
@@ -660,15 +652,8 @@ impl Model {
 
         // 5. Tokenize target text and reference text
         let input_ids = self.prepare_tts_input(text)?;
-        let ref_text_formatted = format!("<|im_start|>assistant\n{ref_text}<|im_end|>\n");
-        let ref_encoding = self.tokenizer.encode(ref_text_formatted.as_str(), false).map_err(E::msg)?;
-        let ref_ids_full = ref_encoding.get_ids().to_vec();
-        // ref_token_ids: tokens [3..-2] (strip role prefix and trailing \n)
-        let ref_token_ids: Vec<u32> = if ref_ids_full.len() > 5 {
-            ref_ids_full[3..ref_ids_full.len().saturating_sub(2)].to_vec()
-        } else {
-            ref_ids_full
-        };
+        let ref_encoding = self.tokenizer.encode(ref_text, false).map_err(E::msg)?;
+        let ref_token_ids = ref_encoding.get_ids().to_vec();
 
         // 6. Generate codec codes (voice-clone mode)
         let (new_codes, ref_code_len) = self.inner.generate_voice_clone_codes(
