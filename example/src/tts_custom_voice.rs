@@ -72,7 +72,7 @@ fn main() -> anyhow::Result<()> {
             speaker.as_deref(),
             2048,      // max codec tokens
             0.9,       // temperature
-            Some(0.9), // top_p (nucleus sampling)
+            Some(1.0), // top_p (matching official Python default: top_p=1.0)
             1.05,      // repetition_penalty
         )?;
         let elapsed = start.elapsed();

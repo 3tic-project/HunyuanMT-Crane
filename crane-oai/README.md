@@ -426,16 +426,16 @@ curl http://localhost:8080/v1/audio/speech \
 | `instructions` | string | `null` | Optional system-level prompt to guide speaking style |
 | `response_format` | string | `"wav"` | Output audio format: `"wav"` or `"pcm"` (raw 16-bit LE at 24 kHz). `"mp3"`, `"opus"`, `"aac"`, `"flac"` accepted but return WAV |
 | `speed` | float | `1.0` | Speaking speed multiplier (reserved, not yet applied to generation) |
-| `temperature` | float | `0.7` | Sampling temperature. Lower = more deterministic |
-| `top_p` | float | `null` | Nucleus sampling threshold |
-| `repetition_penalty` | float | `1.0` | Repetition penalty for codec token generation |
-| `max_tokens` | int | `4096` | Max codec tokens to generate. Controls maximum audio duration (~83 ms per token at 12 Hz) |
+| `temperature` | float | `0.9` | Sampling temperature. Lower = more deterministic |
+| `top_p` | float | `null` | Nucleus sampling threshold (default `null` = no nucleus filtering, equivalent to `1.0`) |
+| `repetition_penalty` | float | `1.05` | Repetition penalty for codec token generation |
+| `max_tokens` | int | `8192` | Max codec tokens to generate. Controls maximum audio duration (~83 ms per token at 12 Hz) |
 | `reference_audio` | string | `null` | Local path to reference WAV audio for voice cloning (Base model only) |
 | `reference_text` | string | `null` | Transcript of the reference audio (required when `reference_audio` is set) |
 
 **Response:** Binary audio bytes with `Content-Type: audio/wav`. Save directly to a `.wav` file.
 
-**Approximate duration cap:** `max_tokens / 12` seconds (e.g. `4096` tokens ≈ 341 seconds).
+**Approximate duration cap:** `max_tokens / 12` seconds (e.g. `8192` tokens ≈ 683 seconds, `2048` ≈ 171 seconds).
 
 **Available speakers (Qwen3-TTS-12Hz-0.6B-Base):**
 

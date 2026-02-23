@@ -1835,6 +1835,18 @@ impl Qwen3TTSModel {
     ) -> Result<(Vec<Vec<u32>>, usize)> {
         self.clear_kv_cache();
 
+        // ── ICL generation guardrails (matching vendor qwen3-tts-rs) ───
+        // ICL mode is less stable than CustomVoice, especially in BF16.
+        // Apply minimum repetition penalty and cap max tokens to prevent
+        // degenerate infinite loops.
+        const ICL_MIN_REP_PENALTY: f32 = 1.5;
+        const ICL_MIN_FRAMES: usize = 75;
+        const ICL_FRAMES_PER_TOKEN: usize = 6;
+
+        let repetition_penalty = repetition_penalty.max(ICL_MIN_REP_PENALTY);
+        let max_new_tokens = max_new_tokens
+            .min(ICL_MIN_FRAMES.max(text_token_ids.len() * ICL_FRAMES_PER_TOKEN));
+
         // ── Phase 1: Base prefill (9 positions) ────────────────────────
         let (prefill_embeds, tts_pad_embed) =
             self.talker.build_voice_clone_prefill(
@@ -1915,14 +1927,18 @@ impl Qwen3TTSModel {
         eos_suppress_data[eos_token_id as usize] = f32::NEG_INFINITY;
         let eos_suppress_mask = Tensor::new(eos_suppress_data.as_slice(), &self.device)?;
 
+        // GPU-side repetition penalty mask: tracks which tokens have been seen.
+        // Avoids expensive GPU→CPU roundtrip per step (matching vendor approach).
+        let mut penalty_seen = vec![false; vocab_size];
+
         let trailing_len = trailing_text_hidden.dim(1)?;
         let tts_debug = std::env::var("CRANE_TTS_DEBUG").map(|v| v == "1" || v == "true").unwrap_or(false);
 
         if tts_debug {
             eprintln!(
                 "[CRANE_TTS_DEBUG] voice_clone gen starting: eos_token_id={}, vocab_size={}, \
-                 suppress_start={}, offset={}, trailing_len={}, max_new_tokens={}",
-                eos_token_id, vocab_size, suppress_start, offset, trailing_len, max_new_tokens
+                 suppress_start={}, offset={}, trailing_len={}, max_new_tokens={}, rep_penalty={:.2}",
+                eos_token_id, vocab_size, suppress_start, offset, trailing_len, max_new_tokens, repetition_penalty
             );
         }
 
@@ -1931,13 +1947,26 @@ impl Qwen3TTSModel {
                 .squeeze(0)?.squeeze(0)?
                 .to_dtype(DType::F32)?;
 
+            // Apply repetition penalty (GPU-side, matching HuggingFace/vendor semantics):
+            // positive logits → divide by penalty, negative logits → multiply by penalty
             let logits = if repetition_penalty != 1.0 && !all_codes.is_empty() {
-                let recent: Vec<u32> = all_codes.iter().map(|c: &Vec<u32>| c[0]).collect();
-                candle_transformers::utils::apply_repeat_penalty(&logits, repetition_penalty, &recent)?
+                let logits_vec: Vec<f32> = logits.to_vec1()?;
+                let mut penalized = logits_vec;
+                for (idx, seen) in penalty_seen.iter().enumerate() {
+                    if *seen {
+                        if penalized[idx] >= 0.0 {
+                            penalized[idx] /= repetition_penalty;
+                        } else {
+                            penalized[idx] *= repetition_penalty;
+                        }
+                    }
+                }
+                Tensor::new(penalized.as_slice(), &self.device)?
             } else {
                 logits
             };
 
+            // Suppress special tokens + EOS for first 2 steps (min_new_tokens=2)
             let logits = if step < 2 {
                 (logits + &suppress_mask + &eos_suppress_mask)?
             } else {
@@ -1962,6 +1991,11 @@ impl Qwen3TTSModel {
             let first_code = logits_processor.sample(&logits)?;
             if first_code == eos_token_id {
                 break;
+            }
+
+            // Track seen tokens for repetition penalty
+            if (first_code as usize) < vocab_size {
+                penalty_seen[first_code as usize] = true;
             }
 
             let talker_hidden_1d = past_hidden.squeeze(0)?.squeeze(0)?;
@@ -2002,7 +2036,7 @@ impl Qwen3TTSModel {
 
         self.clear_kv_cache();
 
-        if std::env::var("CRANE_TTS_DEBUG").map(|v| v == "1" || v == "true").unwrap_or(false) {
+        if tts_debug {
             eprintln!(
                 "[CRANE_TTS_DEBUG] generate_voice_clone_codes: generated {} frames, \
                  max_new_tokens={}, trailing_text_len={}, rep_penalty={:.2}, \
