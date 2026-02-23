@@ -4,31 +4,23 @@
 //!
 //! # Model variants
 //!
-//! There are two model variants — make sure you use the correct one:
-//!
 //! | Model | Type | Speaker control |
 //! |-------|------|----------------|
-//! | `Qwen3-TTS-12Hz-0.6B-Base` | `base` | Voice cloning (needs reference audio) |
-//! | `Qwen3-TTS-12Hz-0.6B-CustomVoice` | `custom_voice` | Predefined speakers (e.g. `serena`, `ryan`) |
+//! | `Qwen3-TTS-12Hz-0.6B-Base` | `base` | Voice cloning (needs reference audio + text) |
+//! | `Qwen3-TTS-12Hz-0.6B-CustomVoice` | `custom_voice` | Predefined speakers (e.g. `serena`) |
 //!
-//! This example generates speech **without** a reference voice, so:
-//! - **Base model**: speaker = `None` (model uses a default voice)
-//! - **CustomVoice model**: speaker = one of the predefined names
-//!
-//! # Setup
+//! # Usage
 //!
 //! ```bash
-//! # Download one of the models
-//! huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base \
-//!     --local-dir checkpoints/Qwen3-TTS-12Hz-0.6B-Base
+//! # Voice cloning with Base model (default):
+//! cargo run --bin tts_simple --release -- vendor/Qwen3-TTS-12Hz-0.6B-Base
 //!
-//! # or (for predefined speakers):
-//! huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
-//!     --local-dir checkpoints/Qwen3-TTS-12Hz-0.6B-CustomVoice
-//!
-//! # Run
-//! CRANE_TTS_DEBUG=1 cargo run --bin tts_simple --release
+//! # CustomVoice model:
+//! cargo run --bin tts_simple --release -- vendor/Qwen3-TTS-12Hz-0.6B-CustomVoice
 //! ```
+//!
+//! For voice cloning, place reference audio at `data/audio/kinsenka_3.wav` and
+//! its transcript at `data/audio/kinsenka_3.txt`.
 
 fn main() -> anyhow::Result<()> {
     use crane_core::models::{DType, Device};
@@ -58,25 +50,74 @@ fn main() -> anyhow::Result<()> {
 
     let mut model = crane_core::models::qwen3_tts::Model::new(&model_path, &device, &dtype)?;
 
-    // ── Detect model type and pick speaker ─────────────────────────
-    let model_type = model.config.tts_model_type.as_deref().unwrap_or("base");
+    let model_type = model.config.tts_model_type.as_deref().unwrap_or("base").to_string();
     println!("Model type: {model_type}");
 
-    let speaker: Option<String> = match model_type {
-        "custom_voice" => {
-            // Use first available speaker from config
-            let first = model.config.talker_config.spk_id
-                .keys()
-                .next()
-                .cloned();
-            println!("Available speakers: {:?}", model.config.talker_config.spk_id.keys().collect::<Vec<_>>());
-            first
-        }
-        _ => None, // Base model: no predefined speaker
-    };
+    match model_type.as_str() {
+        "base" => run_voice_clone(&mut model)?,
+        "custom_voice" => run_custom_voice(&mut model)?,
+        other => anyhow::bail!("Unknown model type: {other}"),
+    }
+
+    println!("\nDone!");
+    Ok(())
+}
+
+/// Voice-clone mode: Base model + reference audio.
+fn run_voice_clone(model: &mut crane_core::models::qwen3_tts::Model) -> anyhow::Result<()> {
+    let ref_audio = "data/audio/kinsenka_3.wav";
+    let ref_text_path = "data/audio/kinsenka_3.txt";
+
+    let ref_text = std::fs::read_to_string(ref_text_path)
+        .unwrap_or_else(|_| {
+            eprintln!("Warning: could not read {ref_text_path}, using empty ref_text");
+            String::new()
+        });
+    let ref_text = ref_text.trim();
+
+    println!("Reference audio : {ref_audio}");
+    println!("Reference text  : {ref_text}");
 
     let examples: &[(&str, &str, &str)] = &[
-        // (text, language, output_stem)
+        ("今天天气真好，我们去公园吧！",                                    "japanese", "output_vc_zh"),
+        ("Hello! I am Crane, an ultra-fast inference engine in Rust.", "japanese", "output_vc_en"),
+    ];
+
+    for (i, (text, lang, stem)) in examples.iter().enumerate() {
+        println!("\n[{}/{}] lang={lang}", i + 1, examples.len());
+        println!("  Text: {text}");
+
+        let (audio, sr) = model.generate_voice_clone(
+            text,
+            lang,
+            ref_audio,
+            ref_text,
+            2048,      // max codec tokens
+            0.9,       // temperature
+            Some(1.0), // top_p
+            1.05,      // repetition_penalty
+        )?;
+
+        let wav_path = format!("{stem}.wav");
+        let audio_f32 = audio.to_dtype(crane_core::models::DType::F32)?.flatten_all()?;
+        let samples = audio_f32.to_vec1::<f32>()?;
+        println!("  Generated {:.1}s ({} samples @ {sr} Hz)", samples.len() as f32 / sr as f32, samples.len());
+        write_wav(&wav_path, &samples, sr)?;
+        println!("  Saved {wav_path}");
+    }
+    Ok(())
+}
+
+/// CustomVoice mode: predefined speaker.
+fn run_custom_voice(model: &mut crane_core::models::qwen3_tts::Model) -> anyhow::Result<()> {
+    let speaker = model.config.talker_config.spk_id
+        .keys()
+        .next()
+        .cloned();
+    println!("Available speakers: {:?}", model.config.talker_config.spk_id.keys().collect::<Vec<_>>());
+    println!("Using speaker: {:?}", speaker);
+
+    let examples: &[(&str, &str, &str)] = &[
         ("今天天气真好，我们去公园吧！",                                    "chinese", "output_tts_zh"),
         ("Hello! I am Crane, an ultra-fast inference engine in Rust.", "english", "output_tts_en"),
     ];
@@ -89,23 +130,19 @@ fn main() -> anyhow::Result<()> {
             text,
             lang,
             speaker.as_deref(),
-            2048,   // max codec tokens
-            0.9,    // temperature (Python default)
-            Some(1.0), // top_p (Python default)
-            1.05,   // repetition_penalty (Python default)
+            2048,
+            0.9,
+            Some(1.0),
+            1.05,
         )?;
 
         let wav_path = format!("{stem}.wav");
-        // Convert to PCM and write WAV
         let audio_f32 = audio.to_dtype(crane_core::models::DType::F32)?.flatten_all()?;
         let samples = audio_f32.to_vec1::<f32>()?;
-        println!("  Generated {:.1}s of audio ({} samples @ {sr} Hz)", samples.len() as f32 / sr as f32, samples.len());
-
+        println!("  Generated {:.1}s ({} samples @ {sr} Hz)", samples.len() as f32 / sr as f32, samples.len());
         write_wav(&wav_path, &samples, sr)?;
         println!("  Saved {wav_path}");
     }
-
-    println!("\nDone!");
     Ok(())
 }
 

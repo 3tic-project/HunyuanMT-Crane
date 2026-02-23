@@ -139,10 +139,60 @@ fn default_text_vocab_size() -> usize {
     151936
 }
 
+/// Speaker encoder config (ECAPA-TDNN).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpeakerEncoderConfig {
+    #[serde(default = "default_mel_dim")]
+    pub mel_dim: usize,
+    #[serde(default = "default_enc_dim")]
+    pub enc_dim: usize,
+    #[serde(default = "default_enc_channels")]
+    pub enc_channels: Vec<usize>,
+    #[serde(default = "default_enc_kernel_sizes")]
+    pub enc_kernel_sizes: Vec<usize>,
+    #[serde(default = "default_enc_dilations")]
+    pub enc_dilations: Vec<usize>,
+    #[serde(default = "default_enc_attention_channels")]
+    pub enc_attention_channels: usize,
+    #[serde(default = "default_enc_res2net_scale")]
+    pub enc_res2net_scale: usize,
+    #[serde(default = "default_enc_se_channels")]
+    pub enc_se_channels: usize,
+    #[serde(default = "default_speaker_sample_rate")]
+    pub sample_rate: u32,
+}
+fn default_mel_dim() -> usize { 128 }
+fn default_enc_dim() -> usize { 1024 }
+fn default_enc_channels() -> Vec<usize> { vec![512, 512, 512, 512, 1536] }
+fn default_enc_kernel_sizes() -> Vec<usize> { vec![5, 3, 3, 3, 1] }
+fn default_enc_dilations() -> Vec<usize> { vec![1, 2, 3, 4, 1] }
+fn default_enc_attention_channels() -> usize { 128 }
+fn default_enc_res2net_scale() -> usize { 8 }
+fn default_enc_se_channels() -> usize { 128 }
+fn default_speaker_sample_rate() -> u32 { 24000 }
+
+impl Default for SpeakerEncoderConfig {
+    fn default() -> Self {
+        Self {
+            mel_dim: default_mel_dim(),
+            enc_dim: default_enc_dim(),
+            enc_channels: default_enc_channels(),
+            enc_kernel_sizes: default_enc_kernel_sizes(),
+            enc_dilations: default_enc_dilations(),
+            enc_attention_channels: default_enc_attention_channels(),
+            enc_res2net_scale: default_enc_res2net_scale(),
+            enc_se_channels: default_enc_se_channels(),
+            sample_rate: default_speaker_sample_rate(),
+        }
+    }
+}
+
 /// Top-level Qwen3-TTS config (loaded from `config.json`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Qwen3TTSConfig {
     pub talker_config: TalkerConfig,
+    #[serde(default)]
+    pub speaker_encoder_config: SpeakerEncoderConfig,
     #[serde(default)]
     pub tts_model_type: Option<String>,
     #[serde(default)]
@@ -1066,11 +1116,471 @@ impl TalkerModel {
         self.codec_head.forward(hidden_state)
     }
 
+    /// Build ICL (in-context learning / voice-clone) prefill embeddings.
+    ///
+    /// Matches Python `generate_icl_prompt` + surrounding prefill construction.
+    ///
+    /// Layout (non-streaming, which is what we use):
+    ///   [role(3)] + [codec_tags + spk_embed + codec_pad + codec_bos]
+    ///   + [ref_text + text + tts_eos + codec_pad*(ref+text+1)] + [ref_codes + tts_pad]
+    ///
+    /// Returns `(prefill_embeds, tts_pad_embed)`.
+    /// `trailing_text_hidden` is always `tts_pad_embed` in non-streaming mode.
+    pub fn build_prefill_embeds_icl(
+        &self,
+        text_token_ids: &[u32],
+        ref_token_ids: &[u32],
+        ref_codes: &Tensor,           // [T_ref, num_code_groups]
+        spk_embed: &Tensor,           // [enc_dim] speaker x-vector
+        language: &str,
+        tts_bos_token_id: u32,
+        tts_eos_token_id: u32,
+        tts_pad_token_id: u32,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let cfg = &self.config;
+
+        // ── tts_bos / tts_eos / tts_pad embeddings ──────────────────────
+        let tts_token_ids = Tensor::new(
+            &[[tts_bos_token_id, tts_eos_token_id, tts_pad_token_id]],
+            device,
+        )?;
+        let tts_embeds = self.text_embedding.forward(&tts_token_ids)?;
+        let tts_projected = self.text_projection.forward(&tts_embeds)?;
+        let tts_bos_embed = tts_projected.narrow(1, 0, 1)?;
+        let tts_eos_embed = tts_projected.narrow(1, 1, 1)?;
+        let tts_pad_embed = tts_projected.narrow(1, 2, 1)?;
+
+        // ── language id ──────────────────────────────────────────────────
+        let language_id = if language.to_lowercase() == "auto" {
+            None
+        } else {
+            cfg.codec_language_id.get(&language.to_lowercase()).copied()
+        };
+
+        // ── codec prefix tags ────────────────────────────────────────────
+        let mut codec_prefill: Vec<u32> = Vec::new();
+        if let Some(lid) = language_id {
+            codec_prefill.extend_from_slice(&[
+                cfg.codec_think_id as u32,
+                cfg.codec_think_bos_id as u32,
+                lid as u32,
+                cfg.codec_think_eos_id as u32,
+            ]);
+        } else {
+            codec_prefill.extend_from_slice(&[
+                cfg.codec_nothink_id as u32,
+                cfg.codec_think_bos_id as u32,
+                cfg.codec_think_eos_id as u32,
+            ]);
+        }
+        let codec_prefill_tensor = Tensor::new(codec_prefill.as_slice(), device)?;
+        let codec_embed_0 = self.codec_embedding.forward(&codec_prefill_tensor)?.unsqueeze(0)?;
+
+        // speaker embed: [enc_dim] → [1, 1, enc_dim] for insertion into codec prefix
+        let spk_embed_btd = spk_embed.reshape((1, 1, spk_embed.elem_count()))?;
+
+        let codec_suffix = Tensor::new(&[cfg.codec_pad_id as u32, cfg.codec_bos_id as u32], device)?;
+        let codec_embed_1 = self.codec_embedding.forward(&codec_suffix)?.unsqueeze(0)?;
+
+        // codec_input_embedding: [1, prefix_len+2, D] (with speaker embed inserted)
+        let codec_input_embedding = Tensor::cat(&[&codec_embed_0, &spk_embed_btd.to_dtype(codec_embed_0.dtype())?, &codec_embed_1], 1)?;
+        let codec_prefix_len = codec_input_embedding.dim(1)?;
+
+        // ── role prefix (first 3 text tokens) ───────────────────────────
+        let all_ids = Tensor::new(text_token_ids, device)?.unsqueeze(0)?;
+        let text_embeds = self.text_embedding.forward(&all_ids)?;
+        let text_embeds = self.text_projection.forward(&text_embeds)?;
+        let role_embed = text_embeds.narrow(1, 0, 3)?;
+
+        // ── base prefix: codec_tags + spk_embed + codec_pad + codec_bos ─
+        // tts_pad*(prefix_len-2) + tts_bos + codec_input_embedding[:-1]
+        let n_pad = codec_prefix_len.saturating_sub(2);
+        let pad_part = tts_pad_embed.expand((1, n_pad, tts_pad_embed.dim(2)?))?;
+        let base_text = Tensor::cat(&[&pad_part, &tts_bos_embed], 1)?;
+        let base_embed = (base_text + codec_input_embedding.narrow(1, 0, codec_prefix_len - 1)?)?;
+
+        // ── ICL: ref_text + text + eos (text side) ──────────────────────
+        // ref_token_ids: tokens [3..-2] of "<|im_start|>assistant\n{ref}<|im_end|>\n"
+        // text_token_ids: tokens [3..-5] of the target text prompt
+        let ref_len = ref_token_ids.len();
+        let text_content_len = text_token_ids.len().saturating_sub(8);
+
+        let ref_ids_tensor = Tensor::new(ref_token_ids, device)?.unsqueeze(0)?;
+        let ref_text_embeds = self.text_embedding.forward(&ref_ids_tensor)?;
+        let ref_text_embeds = self.text_projection.forward(&ref_text_embeds)?;
+
+        let text_content_embed = if text_content_len > 0 {
+            text_embeds.narrow(1, 3, text_content_len)?
+        } else {
+            Tensor::zeros((1, 0, tts_pad_embed.dim(2)?), dtype, device)?
+        };
+
+        // combined: [ref_text + text_content + tts_eos]
+        let icl_text_embed = Tensor::cat(&[&ref_text_embeds, &text_content_embed, &tts_eos_embed], 1)?;
+        let icl_text_len = icl_text_embed.dim(1)?;
+
+        // ── ICL: ref_codes (codec side) ──────────────────────────────────
+        // ref_codes: [T_ref, num_code_groups]
+        let t_ref = ref_codes.dim(0)?;
+        let num_groups = ref_codes.dim(1)?;
+
+        // Sum all codebook embeddings per timestep
+        let ref_codes_u32 = ref_codes.to_dtype(DType::U32)?;
+        let mut codec_sum = self.codec_embedding.forward(
+            &ref_codes_u32.narrow(1, 0, 1)?.squeeze(1)?.contiguous()?
+        )?; // [T_ref, D]
+        for g in 1..num_groups {
+            let g_codes = ref_codes_u32.narrow(1, g, 1)?.squeeze(1)?.contiguous()?;
+            let g_embed = if g - 1 < self.code_predictor.codec_embeddings.len() {
+                self.code_predictor.codec_embeddings[g - 1].forward(&g_codes)?
+            } else {
+                self.codec_embedding.forward(&g_codes)?
+            };
+            codec_sum = (codec_sum + g_embed)?;
+        }
+        // codec_bos + ref_codes_sum: [1, 1+T_ref, D]
+        let codec_bos_embed = self.codec_embedding.forward(
+            &Tensor::new(&[cfg.codec_bos_id as u32], device)?
+        )?.unsqueeze(0)?; // [1, 1, D]
+        let codec_sum_btd = codec_sum.unsqueeze(0)?; // [1, T_ref, D]
+        let icl_codec_embed = Tensor::cat(&[&codec_bos_embed, &codec_sum_btd], 1)?; // [1, 1+T_ref, D]
+        let icl_codec_len = icl_codec_embed.dim(1)?;
+
+        // ── Combine text + codec (non-streaming mode) ────────────────────
+        // text_embed + codec_pad_ids, then codec_embed + tts_pad
+        let codec_pad_ids = Tensor::new(
+            vec![cfg.codec_pad_id as u32; icl_text_len].as_slice(),
+            device,
+        )?.unsqueeze(0)?;
+        let codec_pad_embeds = self.codec_embedding.forward(&codec_pad_ids.squeeze(0)?)?.unsqueeze(0)?;
+        let icl_input_embed = (icl_text_embed + codec_pad_embeds)?;
+
+        // pad tts_pad to match codec len
+        let tts_pad_for_codec = tts_pad_embed.expand((1, icl_codec_len, tts_pad_embed.dim(2)?))?;
+        let icl_codec_with_pad = (icl_codec_embed + tts_pad_for_codec)?;
+
+        // ── Phase 5: final codec_bos (generation start token) ────────────
+        // Last position of codec_input_embedding is codec_bos
+        let final_codec_bos = codec_input_embedding.narrow(1, codec_prefix_len - 1, 1)?;
+        let final_bos = (tts_pad_embed.clone() + final_codec_bos)?;
+
+        // ── Assemble full prefill ─────────────────────────────────────────
+        // [role(3)] + [base_embed] + [icl_text+codec_pad] + [codec_bos+ref_codes+tts_pad] + [final_bos]
+        let _ = ref_len; // suppress unused
+        let _ = t_ref;   // suppress unused
+        let talker_input_embed = Tensor::cat(&[
+            &role_embed,
+            &base_embed,
+            &icl_input_embed,
+            &icl_codec_with_pad,
+            &final_bos,
+        ], 1)?;
+
+        let talker_input_embed = talker_input_embed.to_dtype(dtype)?;
+        let tts_pad_embed = tts_pad_embed.to_dtype(dtype)?;
+
+        Ok((talker_input_embed, tts_pad_embed.clone(), tts_pad_embed))
+    }
+
     pub fn clear_kv_cache(&mut self) {
         for layer in &mut self.layers {
             layer.clear_kv_cache();
         }
         self.code_predictor.clear_kv_cache();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Speaker Encoder (ECAPA-TDNN)
+// ═══════════════════════════════════════════════════════════════════════
+
+use candle_nn::{Conv1d, Conv1dConfig};
+
+/// Apply 1D reflect padding to a `[B, C, T]` tensor along the time dimension.
+/// Uses index_select to avoid contiguity issues with narrow+flip.
+fn reflect_pad_1d(x: &Tensor, pad_left: usize, pad_right: usize) -> Result<Tensor> {
+    if pad_left == 0 && pad_right == 0 {
+        return Ok(x.clone());
+    }
+    let x = &x.contiguous()?;
+    let (_b, _c, t) = x.dims3()?;
+    let mut indices = Vec::with_capacity(pad_left + t + pad_right);
+    for i in (1..=pad_left).rev() {
+        indices.push(i.min(t - 1) as i64);
+    }
+    for i in 0..t {
+        indices.push(i as i64);
+    }
+    for i in 0..pad_right {
+        indices.push((t.saturating_sub(2).saturating_sub(i)).max(0) as i64);
+    }
+    let idx = Tensor::new(indices.as_slice(), x.device())?;
+    x.index_select(&idx, 2)
+}
+
+/// 1D convolution with reflect padding (matches Python `padding="same", padding_mode="reflect"`).
+struct ReflectConv1d {
+    conv: Conv1d,
+    pad_left: usize,
+    pad_right: usize,
+}
+
+impl ReflectConv1d {
+    fn new(in_c: usize, out_c: usize, kernel: usize, dilation: usize, vb: VarBuilder) -> Result<Self> {
+        let total_pad = dilation * (kernel - 1);
+        let pad_left = total_pad / 2;
+        let pad_right = total_pad - pad_left;
+        let cfg = Conv1dConfig { padding: 0, dilation, ..Default::default() };
+        let conv = candle_nn::conv1d(in_c, out_c, kernel, cfg, vb)?;
+        Ok(Self { conv, pad_left, pad_right })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let padded = reflect_pad_1d(x, self.pad_left, self.pad_right)?;
+        self.conv.forward(&padded)
+    }
+}
+
+/// TimeDelayNetBlock: reflect-padded Conv1d + ReLU.
+struct TdnnBlock {
+    conv: ReflectConv1d,
+}
+
+impl TdnnBlock {
+    fn new(in_c: usize, out_c: usize, kernel: usize, dilation: usize, vb: VarBuilder) -> Result<Self> {
+        Ok(Self { conv: ReflectConv1d::new(in_c, out_c, kernel, dilation, vb.pp("conv"))? })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.conv.forward(x)?.relu()
+    }
+}
+
+/// Res2Net block (scale=8 chunks, residual accumulation).
+struct Res2NetBlock {
+    blocks: Vec<TdnnBlock>,
+    scale: usize,
+}
+
+impl Res2NetBlock {
+    fn new(in_c: usize, out_c: usize, scale: usize, kernel: usize, dilation: usize, vb: VarBuilder) -> Result<Self> {
+        let ch = in_c / scale;
+        let och = out_c / scale;
+        let mut blocks = Vec::with_capacity(scale - 1);
+        for i in 0..(scale - 1) {
+            blocks.push(TdnnBlock::new(ch, och, kernel, dilation, vb.pp("blocks").pp(i))?);
+        }
+        Ok(Self { blocks, scale })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let chunks = x.chunk(self.scale, 1)?;
+        let mut outputs: Vec<Tensor> = Vec::with_capacity(self.scale);
+        let mut prev: Option<Tensor> = None;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let out = if i == 0 {
+                chunk.clone()
+            } else {
+                let inp = match &prev {
+                    Some(p) => (chunk + p)?,
+                    None => chunk.clone(),
+                };
+                let out = self.blocks[i - 1].forward(&inp)?;
+                prev = Some(out.clone());
+                out
+            };
+            if i > 0 { prev = Some(out.clone()); }
+            outputs.push(out);
+        }
+        Tensor::cat(&outputs, 1)
+    }
+}
+
+/// Squeeze-Excitation block (uses plain Conv1d since kernel=1).
+struct SeBlock {
+    conv1: Conv1d,
+    conv2: Conv1d,
+}
+
+impl SeBlock {
+    fn new(in_c: usize, se_c: usize, out_c: usize, vb: VarBuilder) -> Result<Self> {
+        let cfg = Conv1dConfig::default();
+        Ok(Self {
+            conv1: candle_nn::conv1d(in_c, se_c, 1, cfg, vb.pp("conv1"))?,
+            conv2: candle_nn::conv1d(se_c, out_c, 1, cfg, vb.pp("conv2"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mean = x.mean(2)?.unsqueeze(2)?;
+        let h = self.conv1.forward(&mean)?.relu()?;
+        let scale = candle_nn::ops::sigmoid(&self.conv2.forward(&h)?)?;
+        x.broadcast_mul(&scale)
+    }
+}
+
+/// SqueezeExcitationRes2NetBlock: TDNN1 → Res2Net → TDNN2 → SE + residual.
+struct SeRes2NetBlock {
+    tdnn1: TdnnBlock,
+    res2net: Res2NetBlock,
+    tdnn2: TdnnBlock,
+    se: SeBlock,
+}
+
+impl SeRes2NetBlock {
+    fn new(in_c: usize, out_c: usize, scale: usize, se_c: usize, kernel: usize, dilation: usize, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            tdnn1: TdnnBlock::new(in_c, out_c, 1, 1, vb.pp("tdnn1"))?,
+            res2net: Res2NetBlock::new(out_c, out_c, scale, kernel, dilation, vb.pp("res2net_block"))?,
+            tdnn2: TdnnBlock::new(out_c, out_c, 1, 1, vb.pp("tdnn2"))?,
+            se: SeBlock::new(out_c, se_c, out_c, vb.pp("se_block"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let h = self.tdnn1.forward(x)?;
+        let h = self.res2net.forward(&h)?;
+        let h = self.tdnn2.forward(&h)?;
+        let h = self.se.forward(&h)?;
+        (h + x)
+    }
+}
+
+/// Attentive Statistics Pooling.
+struct AttentiveStatisticsPooling {
+    tdnn: TdnnBlock,
+    conv: Conv1d,
+}
+
+impl AttentiveStatisticsPooling {
+    fn new(channels: usize, attn_channels: usize, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            tdnn: TdnnBlock::new(channels * 3, attn_channels, 1, 1, vb.pp("tdnn"))?,
+            conv: candle_nn::conv1d(attn_channels, channels, 1, Conv1dConfig::default(), vb.pp("conv"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, c, t) = x.dims3()?;
+        // Global statistics
+        let mean = x.mean(2)?.unsqueeze(2)?;        // [B, C, 1]
+        let diff = x.broadcast_sub(&mean)?;
+        let var = diff.sqr()?.mean(2)?.unsqueeze(2)?; // [B, C, 1]
+        let std = (var + 1e-5)?.sqrt()?;
+
+        let mean_exp = mean.broadcast_as((b, c, t))?;
+        let std_exp = std.broadcast_as((b, c, t))?;
+
+        // [x, mean, std] → [B, 3C, T]
+        let attn_in = Tensor::cat(&[x, &mean_exp, &std_exp], 1)?;
+
+        // Attention: TDNN(3C→attn_ch, +ReLU) → Tanh → Conv(attn_ch→C) → Softmax
+        let attn = self.tdnn.forward(&attn_in)?;
+        let attn = attn.tanh()?;
+        let attn = self.conv.forward(&attn)?;
+        let attn = candle_nn::ops::softmax_last_dim(&attn)?; // softmax over T
+
+        // Weighted mean
+        let w_mean = x.broadcast_mul(&attn)?.sum(2)?.unsqueeze(2)?; // [B, C, 1]
+        // Weighted std
+        let w_diff = x.broadcast_sub(&w_mean)?;
+        let w_var = w_diff.sqr()?.broadcast_mul(&attn)?.sum(2)?.unsqueeze(2)?;
+        let w_std = (w_var + 1e-5)?.sqrt()?;
+
+        // Output: [B, 2C, 1]
+        Ok(Tensor::cat(&[&w_mean, &w_std], 1)?)
+    }
+}
+
+/// ECAPA-TDNN speaker encoder.
+pub struct SpeakerEncoder {
+    blocks: Vec<EcapaBlock>,
+    mfa: TdnnBlock,
+    asp: AttentiveStatisticsPooling,
+    fc: Conv1d,
+}
+
+enum EcapaBlock {
+    Tdnn(TdnnBlock),
+    SeRes2Net(SeRes2NetBlock),
+}
+
+impl EcapaBlock {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Tdnn(b) => b.forward(x),
+            Self::SeRes2Net(b) => b.forward(x),
+        }
+    }
+}
+
+impl SpeakerEncoder {
+    pub fn new(cfg: &SpeakerEncoderConfig, vb: VarBuilder) -> Result<Self> {
+        let n = cfg.enc_channels.len();
+        let mut blocks: Vec<EcapaBlock> = Vec::with_capacity(n - 1);
+
+        // Block 0: initial TDNN
+        blocks.push(EcapaBlock::Tdnn(TdnnBlock::new(
+            cfg.mel_dim,
+            cfg.enc_channels[0],
+            cfg.enc_kernel_sizes[0],
+            cfg.enc_dilations[0],
+            vb.pp("blocks").pp(0),
+        )?));
+
+        // Blocks 1..n-2: SE-Res2Net
+        for i in 1..(n - 1) {
+            blocks.push(EcapaBlock::SeRes2Net(SeRes2NetBlock::new(
+                cfg.enc_channels[i - 1],
+                cfg.enc_channels[i],
+                cfg.enc_res2net_scale,
+                cfg.enc_se_channels,
+                cfg.enc_kernel_sizes[i],
+                cfg.enc_dilations[i],
+                vb.pp("blocks").pp(i),
+            )?));
+        }
+
+        // MFA: uses last enc_channels entry
+        let mfa_in = cfg.enc_channels[1..(n - 1)].iter().sum::<usize>();
+        let mfa = TdnnBlock::new(
+            mfa_in,
+            cfg.enc_channels[n - 1],
+            cfg.enc_kernel_sizes[n - 1],
+            cfg.enc_dilations[n - 1],
+            vb.pp("mfa"),
+        )?;
+
+        let asp = AttentiveStatisticsPooling::new(cfg.enc_channels[n - 1], cfg.enc_attention_channels, vb.pp("asp"))?;
+        let fc = candle_nn::conv1d(cfg.enc_channels[n - 1] * 2, cfg.enc_dim, 1, Conv1dConfig::default(), vb.pp("fc"))?;
+
+        Ok(Self { blocks, mfa, asp, fc })
+    }
+
+    /// Forward: input mel `[B, n_mels, T]` → speaker embedding `[B, enc_dim]`.
+    pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
+        // blocks[0]: initial TDNN
+        let mut x = self.blocks[0].forward(mel)?;
+
+        // blocks[1..]: SE-Res2Net, collect outputs for MFA
+        let mut se_outputs = Vec::with_capacity(self.blocks.len() - 1);
+        for block in &self.blocks[1..] {
+            x = block.forward(&x)?;
+            se_outputs.push(x.clone());
+        }
+
+        // MFA: concatenate SE-Res2Net outputs along channel dim
+        let mfa_in = Tensor::cat(&se_outputs, 1)?;
+        let h = self.mfa.forward(&mfa_in)?;
+
+        // ASP: attentive statistics pooling → [B, 2C, 1]
+        let pooled = self.asp.forward(&h)?;
+
+        // FC: project to embedding dimension → [B, enc_dim, 1]
+        let embed = self.fc.forward(&pooled)?;
+        embed.squeeze(2) // [B, enc_dim]
     }
 }
 
@@ -1082,6 +1592,7 @@ impl TalkerModel {
 /// Code-to-waveform conversion is handled by the speech tokenizer decoder backend.
 pub struct Qwen3TTSModel {
     pub talker: TalkerModel,
+    pub speaker_encoder: Option<SpeakerEncoder>,
     pub config: Qwen3TTSConfig,
     pub device: Device,
     pub dtype: DType,
@@ -1092,8 +1603,20 @@ impl Qwen3TTSModel {
         let device = vb.device().clone();
         let dtype = vb.dtype();
         let talker = TalkerModel::new(&config.talker_config, vb.pp("talker"))?;
+        let speaker_encoder = if config.tts_model_type.as_deref() == Some("base") {
+            match SpeakerEncoder::new(&config.speaker_encoder_config, vb.pp("speaker_encoder")) {
+                Ok(enc) => Some(enc),
+                Err(e) => {
+                    eprintln!("Warning: failed to load speaker_encoder weights: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             talker,
+            speaker_encoder,
             config: config.clone(),
             device,
             dtype,
@@ -1283,5 +1806,140 @@ impl Qwen3TTSModel {
 
         self.clear_kv_cache();
         Ok(all_codes)
+    }
+
+    /// Generate speech codec tokens using voice-clone (ICL) mode.
+    ///
+    /// `ref_codes`: `[T_ref, num_code_groups]` — codec codes from the reference audio.
+    /// `spk_embed`: `[enc_dim]` — speaker x-vector from the speaker encoder.
+    /// `ref_token_ids`: tokenized reference text (tokens [3..-2] of `<|im_start|>assistant\n{ref}<|im_end|>\n`).
+    ///
+    /// Returns `(new_codes, ref_code_len)` where `new_codes` are the generated frames
+    /// and `ref_code_len` is the number of reference frames prepended for decoding.
+    pub fn generate_voice_clone_codes(
+        &mut self,
+        text_token_ids: &[u32],
+        ref_token_ids: &[u32],
+        ref_codes: &Tensor,
+        spk_embed: &Tensor,
+        language: &str,
+        max_new_tokens: usize,
+        temperature: f64,
+        top_p: Option<f64>,
+        repetition_penalty: f32,
+    ) -> Result<(Vec<Vec<u32>>, usize)> {
+        self.clear_kv_cache();
+
+        let (prefill_embeds, trailing_text_hidden, tts_pad_embed) =
+            self.talker.build_prefill_embeds_icl(
+                text_token_ids,
+                ref_token_ids,
+                ref_codes,
+                spk_embed,
+                language,
+                self.config.tts_bos_token_id,
+                self.config.tts_eos_token_id,
+                self.config.tts_pad_token_id,
+                &self.device,
+                self.dtype,
+            )?;
+
+        let prefill_len = prefill_embeds.dim(1)?;
+        let causal_mask = Self::build_causal_mask(prefill_len, &self.device, self.dtype)?;
+        let hidden_states = self.talker.forward_embeds(&prefill_embeds, Some(&causal_mask), 0)?;
+
+        let eos_token_id = self.config.talker_config.codec_eos_token_id as u32;
+        let mut all_codes = Vec::new();
+        let mut logits_processor =
+            candle_transformers::generation::LogitsProcessor::from_sampling(
+                42,
+                candle_transformers::generation::Sampling::TopKThenTopP {
+                    k: 50,
+                    p: top_p.unwrap_or(1.0),
+                    temperature,
+                },
+            );
+
+        let vocab_size = self.config.talker_config.vocab_size;
+        let suppress_start = vocab_size.saturating_sub(1024);
+        let mut suppress_mask_data = vec![0f32; vocab_size];
+        for i in suppress_start..vocab_size {
+            if i as u32 != eos_token_id {
+                suppress_mask_data[i] = f32::NEG_INFINITY;
+            }
+        }
+        let suppress_mask = Tensor::new(suppress_mask_data.as_slice(), &self.device)?;
+        let mut eos_suppress_data = vec![0f32; vocab_size];
+        eos_suppress_data[eos_token_id as usize] = f32::NEG_INFINITY;
+        let eos_suppress_mask = Tensor::new(eos_suppress_data.as_slice(), &self.device)?;
+
+        let seq_len = hidden_states.dim(1)?;
+        let mut past_hidden = hidden_states.narrow(1, seq_len - 1, 1)?;
+        let trailing_len = trailing_text_hidden.dim(1)?;
+
+        for step in 0..max_new_tokens {
+            let logits = self.talker.predict_first_code(&past_hidden)?
+                .squeeze(0)?.squeeze(0)?
+                .to_dtype(DType::F32)?;
+
+            let logits = if repetition_penalty != 1.0 && !all_codes.is_empty() {
+                let recent: Vec<u32> = all_codes.iter().map(|c: &Vec<u32>| c[0]).collect();
+                candle_transformers::utils::apply_repeat_penalty(&logits, repetition_penalty, &recent)?
+            } else {
+                logits
+            };
+
+            let logits = if step < 2 {
+                (logits + &suppress_mask + &eos_suppress_mask)?
+            } else {
+                (logits + &suppress_mask)?
+            };
+
+            let first_code = logits_processor.sample(&logits)?;
+            if first_code == eos_token_id {
+                break;
+            }
+
+            let talker_hidden_1d = past_hidden.squeeze(0)?.squeeze(0)?;
+            let remaining_codes = self.talker.code_predictor.predict(
+                &talker_hidden_1d,
+                first_code,
+                &self.talker.codec_embedding,
+                &self.device,
+                temperature,
+                top_p,
+            )?;
+
+            let mut frame_codes = vec![first_code];
+            frame_codes.extend(remaining_codes);
+            all_codes.push(frame_codes.clone());
+
+            let mut sum_embed = self.talker.codec_embedding.forward(
+                &Tensor::new(&[first_code], &self.device)?,
+            )?;
+            for (i, &code) in frame_codes[1..].iter().enumerate() {
+                let embed = self.talker.code_predictor.codec_embeddings[i].forward(
+                    &Tensor::new(&[code], &self.device)?,
+                )?;
+                sum_embed = (sum_embed + embed)?;
+            }
+
+            let text_contrib = if step < trailing_len {
+                trailing_text_hidden.squeeze(0)?.narrow(0, step, 1)?
+            } else {
+                tts_pad_embed.squeeze(0)?
+            };
+            let next_input = (sum_embed + text_contrib)?.unsqueeze(0)?;
+
+            let pos_offset = prefill_len + step;
+            let hs = self.talker.forward_embeds(&next_input, None, pos_offset)?;
+            past_hidden = hs.narrow(1, hs.dim(1)? - 1, 1)?;
+        }
+
+        self.clear_kv_cache();
+
+        // ref_code_len: number of reference frames in ref_codes (for trimming after decode)
+        let ref_code_len = ref_codes.dim(0)?;
+        Ok((all_codes, ref_code_len))
     }
 }
