@@ -1835,17 +1835,11 @@ impl Qwen3TTSModel {
     ) -> Result<(Vec<Vec<u32>>, usize)> {
         self.clear_kv_cache();
 
-        // ── ICL generation guardrails (matching vendor qwen3-tts-rs) ───
-        // ICL mode is less stable than CustomVoice, especially in BF16.
-        // Apply minimum repetition penalty and cap max tokens to prevent
-        // degenerate infinite loops.
-        const ICL_MIN_REP_PENALTY: f32 = 1.5;
-        const ICL_MIN_FRAMES: usize = 75;
-        const ICL_FRAMES_PER_TOKEN: usize = 6;
-
-        let repetition_penalty = repetition_penalty.max(ICL_MIN_REP_PENALTY);
-        let max_new_tokens = max_new_tokens
-            .min(ICL_MIN_FRAMES.max(text_token_ids.len() * ICL_FRAMES_PER_TOKEN));
+        // Use caller-provided parameters directly, matching official Python
+        // (no ICL-specific capping or penalty floor).
+        // Python default: max_new_tokens=8192, repetition_penalty=1.05
+        let repetition_penalty = repetition_penalty;
+        let max_new_tokens = max_new_tokens;
 
         // ── Phase 1: Base prefill (9 positions) ────────────────────────
         let (prefill_embeds, tts_pad_embed) =
