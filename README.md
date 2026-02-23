@@ -259,6 +259,11 @@ cargo run --bin tts_simple --release -- vendor/Qwen3-TTS-12Hz-0.6B-Base
 
 All TTS examples save generated audio files to `data/audio/output`.
 
+### TTS Audio Samples
+
+- Base (voice clone): [vc1_base.wav](data/audio/output/vc1_base.wav), [vc2_base.wav](data/audio/output/vc2_base.wav)
+- CustomVoice: [custom_voice_zh.wav](data/audio/output/custom_voice_zh.wav), [custom_voice_en.wav](data/audio/output/custom_voice_en.wav), [custom_voice_ja.wav](data/audio/output/custom_voice_ja.wav)
+
 ✨ **Multimodal & Vision support**: For models like PaddleOCR-VL, the endpoints accept OpenAI's structured `messages.[]content.[{type: "image_url", image_url: {url: "..."}}]` payload or SGLang's `image_url` field. See [crane-oai/README.md](crane-oai/README.md) for full API documentation with request/response examples.
 
 Now you can run LLM extremly fast (about 6x faster than vanilla transformers on M1)!
