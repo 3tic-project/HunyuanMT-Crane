@@ -396,7 +396,13 @@ impl TokenizerAttention {
             * scale)?;
         let mask = causal_sliding_mask(t, self.sliding_window, hidden.device())?.to_dtype(scores.dtype())?;
         let scores = scores.broadcast_add(&mask)?;
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?.contiguous()?;
+        // Compute softmax in F32 for numeric stability
+        let input_dtype = scores.dtype();
+        let probs = candle_nn::ops::softmax_last_dim(
+            &scores.to_dtype(candle_core::DType::F32)?,
+        )?
+        .to_dtype(input_dtype)?
+        .contiguous()?;
         let out = probs
             .matmul(&v)
             .map_err(|e| anyhow::anyhow!(
@@ -1096,7 +1102,13 @@ impl EncoderTransformerLayer {
         let mask = causal_sliding_mask(t, self.sliding_window, x.device())?
             .to_dtype(x.dtype())?;
         let attn_w = attn_w.broadcast_add(&mask)?;
-        let attn_w = candle_nn::ops::softmax_last_dim(&attn_w)?;
+        // Compute softmax in F32 for numeric stability
+        let input_dtype = attn_w.dtype();
+        let attn_w = candle_nn::ops::softmax_last_dim(
+            &attn_w.to_dtype(candle_core::DType::F32)?,
+        )?
+        .to_dtype(input_dtype)?;
+
 
         let attn_out = attn_w.matmul(&v.contiguous()?)?
             .transpose(1, 2)?.contiguous()?.reshape((b, t, h * hd))?;

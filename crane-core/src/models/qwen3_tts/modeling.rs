@@ -440,7 +440,13 @@ impl Attention {
             Some(mask) => attn_weights.broadcast_add(mask)?,
             None => attn_weights,
         };
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        // Compute softmax in F32 for numeric stability, matching PyTorch's
+        // `F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)`
+        let input_dtype = attn_weights.dtype();
+        let attn_weights = candle_nn::ops::softmax_last_dim(
+            &attn_weights.to_dtype(DType::F32)?,
+        )?
+        .to_dtype(input_dtype)?;
         let attn_output = attn_weights.matmul(&v)?;
 
         let attn_output = attn_output
