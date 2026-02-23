@@ -1232,25 +1232,22 @@ impl TalkerModel {
         let tts_pad_raw = self.text_embedding.forward(&tts_pad_id)?;
         let tts_pad_embed = self.text_projection.forward(&tts_pad_raw)?; // [1, 1, D]
 
-        // Streaming mode: element-wise overlay
-        let (icl_embed, trailing) = if n_text > n_codec {
-            // Text is longer: head aligns with codec, tail becomes trailing
-            let text_head = text_embed.narrow(1, 0, n_codec)?;
-            let icl = (text_head + codec_embed)?;
-            let trailing = text_embed.narrow(1, n_codec, n_text - n_codec)?;
-            (icl, trailing)
-        } else {
-            // Codec is longer or equal: pad text with tts_pad
-            let padded_text = if n_codec > n_text {
-                let pad_count = n_codec - n_text;
-                let pad = tts_pad_embed.expand((1, pad_count, tts_pad_embed.dim(2)?))?;
-                Tensor::cat(&[&text_embed, &pad], 1)?
-            } else {
-                text_embed
-            };
-            let icl = (padded_text + codec_embed)?;
-            (icl, tts_pad_embed.clone())
-        };
+        // Non-streaming mode (matching Python non_streaming_mode=True):
+        // Text and codec are kept as separate sequential blocks, giving the
+        // model complete text context before any codec tokens.
+        //   [text + codec_pad_embed || codec + tts_pad_embed]
+        // Trailing is just tts_pad_embed since all text is in the prefix.
+        let cfg = &self.config;
+        let codec_pad_id = Tensor::new(&[cfg.codec_pad_id as u32], device)?;
+        let codec_pad_embed = self.codec_embedding.forward(&codec_pad_id)?.unsqueeze(0)?; // [1, 1, D]
+        let codec_pad_broadcast = codec_pad_embed.expand((1, n_text, codec_pad_embed.dim(2)?))?;
+        let text_with_codec_pad = (&text_embed + &codec_pad_broadcast)?;
+
+        let tts_pad_broadcast = tts_pad_embed.expand((1, n_codec, tts_pad_embed.dim(2)?))?;
+        let codec_with_tts_pad = (&codec_embed + &tts_pad_broadcast)?;
+
+        let icl_embed = Tensor::cat(&[&text_with_codec_pad, &codec_with_tts_pad], 1)?;
+        let trailing = tts_pad_embed.clone();
 
         let icl_embed = icl_embed.to_dtype(dtype)?;
         let trailing = trailing.to_dtype(dtype)?;
@@ -1841,7 +1838,7 @@ impl Qwen3TTSModel {
         let repetition_penalty = repetition_penalty;
         let max_new_tokens = max_new_tokens;
 
-        // ── Phase 1: Base prefill (9 positions) ────────────────────────
+        // ── Phase 1: Build prefill (9 positions) ───────────────────────
         let (prefill_embeds, tts_pad_embed) =
             self.talker.build_voice_clone_prefill(
                 spk_embed,
@@ -1852,13 +1849,7 @@ impl Qwen3TTSModel {
                 self.dtype,
             )?;
 
-        let prefill_len = prefill_embeds.dim(1)?;
-        let causal_mask = Self::build_causal_mask(prefill_len, &self.device, self.dtype)?;
-        let hidden_states = self.talker.forward_embeds(&prefill_embeds, Some(&causal_mask), 0)?;
-        let mut offset = prefill_len;
-        let mut past_hidden = hidden_states.narrow(1, hidden_states.dim(1)? - 1, 1)?;
-
-        // ── Phase 2: ICL extension ─────────────────────────────────────
+        // ── Phase 2: Build ICL prompt ──────────────────────────────────
         // Sum reference codec embeddings across all codebook groups
         let ref_codes_u32 = ref_codes.to_dtype(DType::U32)?;
         let num_groups = ref_codes.dim(1)?;
@@ -1886,13 +1877,23 @@ impl Qwen3TTSModel {
             self.dtype,
         )?;
 
-        // Run ICL embed through talker layers (extends KV cache)
-        let icl_len = icl_embed.dim(1)?;
-        if icl_len > 0 {
-            let icl_mask = Self::build_causal_mask_with_offset(icl_len, offset, &self.device, self.dtype)?;
-            let icl_hidden = self.talker.forward_embeds(&icl_embed, Some(&icl_mask), offset)?;
-            offset += icl_len;
-            past_hidden = icl_hidden.narrow(1, icl_hidden.dim(1)? - 1, 1)?;
+        // ── Combined prefill: run [prefill + ICL] in a single forward pass ──
+        // This matches the Python implementation which concatenates prefill and
+        // ICL embeddings before calling model forward, ensuring a single unified
+        // KV cache population and attention computation.
+        let combined_embeds = Tensor::cat(&[&prefill_embeds, &icl_embed], 1)?;
+        let combined_len = combined_embeds.dim(1)?;
+        let causal_mask = Self::build_causal_mask(combined_len, &self.device, self.dtype)?;
+        let hidden_states = self.talker.forward_embeds(&combined_embeds, Some(&causal_mask), 0)?;
+        let offset = combined_len;
+        let mut past_hidden = hidden_states.narrow(1, hidden_states.dim(1)? - 1, 1)?;
+
+        if std::env::var("CRANE_TTS_DEBUG").map(|v| v == "1" || v == "true").unwrap_or(false) {
+            let h_norm: f32 = past_hidden.to_dtype(DType::F32)?.sqr()?.sum_all()?.sqrt()?.to_scalar()?;
+            eprintln!(
+                "[CRANE_TTS_DEBUG] combined prefill: len={}, last_hidden_norm={:.4}",
+                combined_len, h_norm,
+            );
         }
 
         // ── Phase 3: Autoregressive generation ─────────────────────────
@@ -2026,6 +2027,15 @@ impl Qwen3TTSModel {
             let pos_offset = offset + step;
             let hs = self.talker.forward_embeds(&next_input, None, pos_offset)?;
             past_hidden = hs.narrow(1, hs.dim(1)? - 1, 1)?;
+
+            // Diagnostic: hidden state norm at select steps
+            if tts_debug && (step < 5 || step % 100 == 0 || step == max_new_tokens - 1) {
+                let h_norm: f32 = past_hidden.to_dtype(DType::F32)?.sqr()?.sum_all()?.sqrt()?.to_scalar()?;
+                let inp_norm: f32 = next_input.to_dtype(DType::F32)?.sqr()?.sum_all()?.sqrt()?.to_scalar()?;
+                eprintln!(
+                    "[CRANE_TTS_DEBUG] step={step}: hidden_norm={h_norm:.4} input_norm={inp_norm:.4} code={first_code}",
+                );
+            }
         }
 
         self.clear_kv_cache();
