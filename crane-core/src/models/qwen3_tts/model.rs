@@ -624,11 +624,22 @@ impl Model {
         }
 
         // 3. Extract speaker embedding via ECAPA-TDNN
+        //    Speaker encoder runs in F32 for precision (matching vendor).
+        //    The embedding is later cast to model dtype in build_voice_clone_prefill.
         let spk_embed = {
             let enc = self.inner.speaker_encoder.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Speaker encoder not loaded (base model required)"))?;
-            let mels = Self::compute_mel_spectrogram(&ref_samples_spk, &self.device, self.dtype)?;
-            enc.forward(&mels)?.squeeze(0)? // [enc_dim]
+            let mels = Self::compute_mel_spectrogram(&ref_samples_spk, &self.device, DType::F32)?;
+            let embed = enc.forward(&mels)?.squeeze(0)?; // [enc_dim], F32
+            if Self::tts_debug_enabled() {
+                let norm: f32 = embed.sqr()?.sum_all()?.sqrt()?.to_scalar()?;
+                eprintln!(
+                    "[CRANE_TTS_DEBUG] speaker_embed: dtype={:?}, shape={:?}, norm={:.4}, \
+                     mel_shape={:?}, ref_samples={}",
+                    embed.dtype(), embed.dims(), norm, mels.dims(), ref_samples_spk.len(),
+                );
+            }
+            embed
         };
 
         // 4. Encode reference audio to codec codes using speech tokenizer encoder
@@ -641,7 +652,14 @@ impl Model {
                     // Encode: samples [1, 1, N] → codes [1, T, n_q] → squeeze → [T, n_q]
                     let ref_tensor = Tensor::new(ref_samples_spk.as_slice(), &self.device)?
                         .unsqueeze(0)?.unsqueeze(0)?; // [1, 1, N]
-                    native.encode(&ref_tensor)?.squeeze(0)? // [T, n_q]
+                    let codes = native.encode(&ref_tensor)?.squeeze(0)?; // [T, n_q]
+                    if Self::tts_debug_enabled() {
+                        eprintln!(
+                            "[CRANE_TTS_DEBUG] ref_codes: shape={:?}, dtype={:?}",
+                            codes.dims(), codes.dtype(),
+                        );
+                    }
+                    codes
                 }
                 #[cfg(feature = "onnx")]
                 SpeechDecoderBackend::Onnx(_) => {

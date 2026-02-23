@@ -1557,7 +1557,11 @@ impl Qwen3TTSModel {
         let dtype = vb.dtype();
         let talker = TalkerModel::new(&config.talker_config, vb.pp("talker"))?;
         let speaker_encoder = if config.tts_model_type.as_deref() == Some("base") {
-            match SpeakerEncoder::new(&config.speaker_encoder_config, vb.pp("speaker_encoder")) {
+            // Speaker encoder must run in F32 for accurate x-vector extraction.
+            // BF16 loses too much precision in the ECAPA-TDNN and produces
+            // wrong speaker embeddings (voice not cloned). Matches vendor.
+            let se_vb = vb.pp("speaker_encoder").set_dtype(DType::F32);
+            match SpeakerEncoder::new(&config.speaker_encoder_config, se_vb) {
                 Ok(enc) => Some(enc),
                 Err(e) => {
                     eprintln!("Warning: failed to load speaker_encoder weights: {e}");
