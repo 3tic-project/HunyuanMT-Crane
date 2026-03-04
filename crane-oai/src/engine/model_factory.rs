@@ -8,7 +8,7 @@ use candle_core::{DType, Device};
 use serde::Deserialize;
 use std::path::Path;
 
-use super::backend::{HunyuanBackend, ModelBackend, Qwen25Backend, Qwen3Backend};
+use super::backend::{HunyuanBackend, ModelBackend, Qwen25Backend, Qwen35Backend, Qwen3Backend};
 use crate::chat_template::{AutoChatTemplate, ChatTemplateProcessor, HunyuanChatTemplate};
 
 // ─────────────────────────────────────────────────────────────
@@ -22,6 +22,7 @@ pub enum ModelType {
     HunyuanDense,
     Qwen25,
     Qwen3,
+    Qwen35,
     Qwen3TTS,
     PaddleOcrVl,
 }
@@ -31,6 +32,7 @@ impl ModelType {
         match s.to_lowercase().as_str() {
             "hunyuan" | "hunyuan_dense" | "hunyuandense" => Self::HunyuanDense,
             "qwen25" | "qwen2.5" | "qwen2" => Self::Qwen25,
+            "qwen35" | "qwen3.5" | "qwen3_5" | "qwen-3.5" => Self::Qwen35,
             "qwen3" => Self::Qwen3,
             "qwen3_tts" | "qwen3tts" | "qwen3-tts" | "tts" => Self::Qwen3TTS,
             "paddleocr_vl" | "paddleocrv" | "paddleocr" | "paddle_ocr_vl" | "paddleocrvl" => Self::PaddleOcrVl,
@@ -44,6 +46,7 @@ impl ModelType {
             Self::HunyuanDense => "hunyuan",
             Self::Qwen25 => "qwen25",
             Self::Qwen3 => "qwen3",
+            Self::Qwen35 => "qwen35",
             Self::Qwen3TTS => "qwen3_tts",
             Self::PaddleOcrVl => "paddleocr_vl",
         }
@@ -106,6 +109,9 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                 // 1. Check `model_type` field
                 if let Some(ref mt) = config.model_type {
                     match mt.to_lowercase().as_str() {
+                        "qwen3_5" | "qwen3.5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => {
+                            return ModelType::Qwen35
+                        }
                         "qwen2" | "qwen2.5" => return ModelType::Qwen25,
                         "qwen3" => return ModelType::Qwen3,
                         "qwen3_tts" | "qwen3tts" => return ModelType::Qwen3TTS,
@@ -119,6 +125,9 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
                 if let Some(ref archs) = config.architectures {
                     for arch in archs {
                         let a = arch.to_lowercase();
+                        if a.contains("qwen3.5") || a.contains("qwen3_5") {
+                            return ModelType::Qwen35;
+                        }
                         if a.contains("paddleocr") {
                             return ModelType::PaddleOcrVl;
                         }
@@ -146,6 +155,11 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
         ModelType::PaddleOcrVl
     } else if path_lower.contains("hunyuan") {
         ModelType::HunyuanDense
+    } else if path_lower.contains("qwen3.5")
+        || path_lower.contains("qwen3_5")
+        || path_lower.contains("qwen35")
+    {
+        ModelType::Qwen35
     } else if path_lower.contains("qwen3-tts") || path_lower.contains("qwen3_tts") || path_lower.contains("qwen3tts") {
         ModelType::Qwen3TTS
     } else if path_lower.contains("qwen3") {
@@ -195,6 +209,7 @@ pub fn create_backend(
         }
         ModelType::Qwen25 => Ok(Box::new(Qwen25Backend::new(model_path, device, dtype)?)),
         ModelType::Qwen3 => Ok(Box::new(Qwen3Backend::new(model_path, device, dtype)?)),
+        ModelType::Qwen35 => Ok(Box::new(Qwen35Backend::new(model_path, device, dtype)?)),
         ModelType::PaddleOcrVl => {
             anyhow::bail!("PaddleOCR-VL is a VLM model — use create_vlm_model() instead of create_backend()")
         }
@@ -272,6 +287,8 @@ mod tests {
         assert_eq!(ModelType::from_str("QWEN2"), ModelType::Qwen25);
         assert_eq!(ModelType::from_str("qwen3"), ModelType::Qwen3);
         assert_eq!(ModelType::from_str("QWEN3"), ModelType::Qwen3);
+        assert_eq!(ModelType::from_str("qwen3.5"), ModelType::Qwen35);
+        assert_eq!(ModelType::from_str("QWEN35"), ModelType::Qwen35);
     }
 
     #[test]
@@ -287,6 +304,7 @@ mod tests {
         assert_eq!(ModelType::HunyuanDense.display_name(), "hunyuan");
         assert_eq!(ModelType::Qwen25.display_name(), "qwen25");
         assert_eq!(ModelType::Qwen3.display_name(), "qwen3");
+        assert_eq!(ModelType::Qwen35.display_name(), "qwen35");
     }
 
     // ── ModelFormat::from_str ──
@@ -318,6 +336,15 @@ mod tests {
         std::fs::write(&config, r#"{"model_type": "qwen3"}"#).unwrap();
         let result = detect_model_type(dir.path().to_str().unwrap());
         assert_eq!(result, ModelType::Qwen3);
+    }
+
+    #[test]
+    fn detect_from_config_json_model_type_qwen35() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, r#"{"model_type": "qwen3_5_text"}"#).unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::Qwen35);
     }
 
     #[test]
@@ -360,6 +387,19 @@ mod tests {
     }
 
     #[test]
+    fn detect_from_config_json_architectures_qwen35() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(
+            &config,
+            r#"{"architectures": ["Qwen3_5ForCausalLM"]}"#,
+        )
+        .unwrap();
+        let result = detect_model_type(dir.path().to_str().unwrap());
+        assert_eq!(result, ModelType::Qwen35);
+    }
+
+    #[test]
     fn detect_path_heuristic_hunyuan() {
         let result = detect_model_type("/models/Hunyuan-Dense-7B");
         assert_eq!(result, ModelType::HunyuanDense);
@@ -369,6 +409,12 @@ mod tests {
     fn detect_path_heuristic_qwen3() {
         let result = detect_model_type("/models/Qwen3-8B");
         assert_eq!(result, ModelType::Qwen3);
+    }
+
+    #[test]
+    fn detect_path_heuristic_qwen35() {
+        let result = detect_model_type("/models/Qwen3.5-8B");
+        assert_eq!(result, ModelType::Qwen35);
     }
 
     #[test]

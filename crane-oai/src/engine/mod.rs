@@ -537,16 +537,23 @@ impl InferenceEngine {
         }
 
         while self.tracked_kv_bytes > budget && !self.scheduler.running.is_empty() {
-            // Find the running sequence with the most generated tokens (largest KV).
+            // Find the running sequence with the largest actual KV footprint.
+            // Fallback tie-breaker uses token length.
             let victim_id = self
                 .scheduler
                 .running
                 .iter()
                 .filter_map(|id| {
-                    self.sequences.get(id).map(|seq| (id.clone(), seq.tokens.len()))
+                    self.sequences.get(id).map(|seq| {
+                        (
+                            id.clone(),
+                            sequence::kv_cache_bytes(&seq.kv_caches),
+                            seq.tokens.len(),
+                        )
+                    })
                 })
-                .max_by_key(|(_, len)| *len)
-                .map(|(id, _)| id);
+                .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)))
+                .map(|(id, _, _)| id);
 
             let victim_id = match victim_id {
                 Some(id) => id,
@@ -861,10 +868,21 @@ impl InferenceEngine {
             .map(|id| self.sequences.get(id).unwrap().kv_caches.clone())
             .collect();
 
+        // In high-concurrency decode, reserve more headroom to reduce
+        // cache reallocation/reshape churn between rounds.
+        let adaptive_extra_room = if batch_size >= 16 {
+            self.decode_tokens_per_seq.saturating_mul(2)
+        } else if batch_size >= 8 {
+            self.decode_tokens_per_seq
+                .saturating_add((self.decode_tokens_per_seq / 2).max(1))
+        } else {
+            self.decode_tokens_per_seq
+        };
+
         let (kv_lens, original_max_kv) =
             match self
                 .model
-                .setup_batch_decode(&kv_caches, self.decode_tokens_per_seq)
+                .setup_batch_decode(&kv_caches, adaptive_extra_room)
             {
                 Ok(r) => r,
                 Err(e) => {
@@ -891,7 +909,7 @@ impl InferenceEngine {
         let t_setup = t0.elapsed();
 
         // Pre-build attention mask.
-        let max_total_width = original_max_kv + self.decode_tokens_per_seq;
+        let max_total_width = original_max_kv + adaptive_extra_room;
         let full_mask = match self.model.build_batch_decode_mask(
             &kv_lens,
             original_max_kv,

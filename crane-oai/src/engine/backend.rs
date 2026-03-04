@@ -249,6 +249,75 @@ impl ModelBackend for HunyuanBackend {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  Qwen 3.5 Backend
+// ─────────────────────────────────────────────────────────────
+
+pub struct Qwen35Backend {
+    pub model: crane_core::models::qwen35::Model,
+    dtype: DType,
+}
+
+impl Qwen35Backend {
+    pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
+        let model = crane_core::models::qwen35::Model::new(model_path, device, dtype)?;
+        Ok(Self {
+            model,
+            dtype: *dtype,
+        })
+    }
+}
+
+impl ModelBackend for Qwen35Backend {
+    fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor> {
+        self.model
+            .forward_step(input_ids, start_pos)
+            .map_err(Into::into)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.model.clear_kv_cache();
+    }
+
+    fn num_layers(&self) -> usize {
+        0
+    }
+
+    fn device(&self) -> &Device {
+        self.model.device()
+    }
+
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn tokenizer(&self) -> &tokenizers::Tokenizer {
+        self.model.tokenizer()
+    }
+
+    fn eos_token_id(&self) -> Vec<u32> {
+        // Qwen3.5 chat models stop at <|im_end|> (151645).
+        // Also include <|endoftext|> (151643) as a fallback.
+        let tok = self.model.tokenizer();
+        let mut ids = Vec::new();
+        if let Some(id) = tok.token_to_id("<|im_end|>") {
+            ids.push(id);
+        }
+        if let Some(id) = tok.token_to_id("<|endoftext|>") {
+            ids.push(id);
+        }
+        if ids.is_empty() {
+            ids.push(151645);
+            ids.push(151643);
+        }
+        ids
+    }
+
+    fn warmup(&mut self) {
+        self.model.warmup();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
 //  Qwen 2.5 Backend
 // ─────────────────────────────────────────────────────────────
 

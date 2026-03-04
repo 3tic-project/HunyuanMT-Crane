@@ -39,7 +39,7 @@ struct Args {
     #[arg(long)]
     model_path: String,
 
-    /// Model architecture: auto, hunyuan, qwen25, qwen3, qwen3_tts, paddleocr_vl
+    /// Model architecture: auto, hunyuan, qwen25, qwen3, qwen35, qwen3_tts, paddleocr_vl
     #[arg(long, default_value = "auto")]
     model_type: String,
 
