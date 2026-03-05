@@ -966,21 +966,10 @@ impl InferenceEngine {
             }
         }
 
-        // In high-concurrency decode, reserve more headroom to reduce
-        // cache reallocation/reshape churn between rounds.
-        let adaptive_extra_room = if batch_size >= 16 {
-            self.decode_tokens_per_seq.saturating_mul(2)
-        } else if batch_size >= 8 {
-            self.decode_tokens_per_seq
-                .saturating_add((self.decode_tokens_per_seq / 2).max(1))
-        } else {
-            self.decode_tokens_per_seq
-        };
-
         let (kv_lens, original_max_kv) =
             match self
                 .model
-                .setup_batch_decode(&kv_caches, adaptive_extra_room)
+                .setup_batch_decode(&kv_caches, self.decode_tokens_per_seq)
             {
                 Ok(r) => r,
                 Err(e) => {
@@ -1007,7 +996,7 @@ impl InferenceEngine {
         let t_setup = t0.elapsed();
 
         // Pre-build attention mask.
-        let max_total_width = original_max_kv + adaptive_extra_room;
+        let max_total_width = original_max_kv + self.decode_tokens_per_seq;
         let full_mask = match self.model.build_batch_decode_mask(
             &kv_lens,
             original_max_kv,

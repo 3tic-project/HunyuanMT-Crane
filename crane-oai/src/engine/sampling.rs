@@ -214,7 +214,7 @@ pub fn sample(
                 .ok()
                 .as_deref()
                 == Some("1")
-                || (auto_cpu_topk_enabled && !force_gpu_topk && vocab > 65536);
+                || (auto_cpu_topk_enabled && !force_gpu_topk && vocab > 200_000);
 
             if prefer_cpu_topk {
                 let vals = logits.to_vec1::<f32>()?;
