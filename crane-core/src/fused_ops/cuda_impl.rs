@@ -653,7 +653,7 @@ pub fn qwen35_linear_scan_f32(
 
     fn extract_cuda_f32_slice(
         t: &Tensor,
-    ) -> Result<candle_core::cuda_backend::cudarc::driver::CudaView<'_, f32>> {
+    ) -> Result<candle_core::cuda_backend::cudarc::driver::CudaSlice<f32>> {
         let (storage, layout) = t.storage_and_layout();
         let cuda_storage = match &*storage {
             Storage::Cuda(s) => s,
@@ -662,8 +662,11 @@ pub fn qwen35_linear_scan_f32(
         let (o1, o2) = layout
             .contiguous_offsets()
             .ok_or_else(|| candle_core::Error::Msg("expected contiguous tensor".into()))?;
+        if o1 != 0 || o2 != t.elem_count() {
+            candle_core::bail!("expected full contiguous tensor view");
+        }
         match &cuda_storage.slice {
-            CudaStorageSlice::F32(s) => Ok(s.slice(o1..o2)),
+            CudaStorageSlice::F32(s) => Ok(s.clone()),
             _ => candle_core::bail!("expected f32 CUDA slice"),
         }
     }
