@@ -166,6 +166,14 @@ pub fn sample(
         let top_p_active = top_p > 0.0 && top_p < 1.0;
         let vocab = logits.dim(0)?;
         let temperature = seq.temperature.unwrap_or(1.0);
+        let force_gpu_topk = std::env::var("CRANE_FORCE_GPU_TOPK")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let auto_cpu_topk_enabled = std::env::var("CRANE_AUTO_CPU_TOPK")
+            .ok()
+            .as_deref()
+            != Some("0");
 
         let mut top_k = seq.top_k.unwrap_or(0);
         if top_k == 0 && top_p_active {
@@ -202,6 +210,58 @@ pub fn sample(
         top_k = top_k.min(64).min(vocab);
 
         if top_k > 0 && top_k < vocab {
+            let prefer_cpu_topk = std::env::var("CRANE_TOPK_SAMPLE_ON_CPU")
+                .ok()
+                .as_deref()
+                == Some("1")
+                || (auto_cpu_topk_enabled && !force_gpu_topk && vocab > 65536);
+
+            if prefer_cpu_topk {
+                let vals = logits.to_vec1::<f32>()?;
+                let mut pairs: Vec<(f32, u32)> = vals
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| (v, i as u32))
+                    .collect();
+                let kth = top_k.saturating_sub(1);
+                pairs.select_nth_unstable_by(kth, |a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Greater)
+                });
+                pairs.truncate(top_k);
+                pairs.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Greater)
+                });
+
+                let topk_idx_cpu: Vec<u32> = pairs.iter().map(|(_, i)| *i).collect();
+                let topk_logits_cpu: Vec<f32> = pairs.into_iter().map(|(v, _)| v).collect();
+                let cpu_logits = Tensor::from_vec(topk_logits_cpu, top_k, &Device::Cpu)?;
+
+                let pos = seq.logits_processor.sample(&cpu_logits)?;
+                let token = topk_idx_cpu
+                    .get(pos as usize)
+                    .copied()
+                    .unwrap_or_else(|| topk_idx_cpu[0]);
+
+                if trace {
+                    let t_done = Instant::now();
+                    debug!(
+                        id = %seq_id,
+                        top_k,
+                        vocab,
+                        top_p = ?seq.top_p,
+                        temp = ?seq.temperature,
+                        prep_us = t_after_prep.duration_since(t0).as_micros() as u64,
+                        rep_us = t_after_rep.duration_since(t_after_prep).as_micros() as u64,
+                        total_us = t_done.duration_since(t0).as_micros() as u64,
+                        "sample(cpu_topk_fallback)"
+                    );
+                }
+
+                return Ok(token);
+            }
+
             let topk_idx = crane_core::fused_ops::topk_indices(&logits, top_k).map_err(anyhow::Error::from)?;
             let topk_logits = logits.gather(&topk_idx, candle_core::D::Minus1)?;
             let t_after_topk = Instant::now();
