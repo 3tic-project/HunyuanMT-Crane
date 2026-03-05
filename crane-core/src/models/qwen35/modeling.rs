@@ -855,10 +855,12 @@ impl LinearAttention {
 
         if hidden_states.device().is_cuda() {
             let bh = b * self.num_v_heads;
-            let q_seq = query
+            let q_norm = (l2norm_last_dim(&query, 1e-6)? * scale)?;
+            let k_norm = l2norm_last_dim(&key, 1e-6)?;
+            let q_seq = q_norm
                 .reshape((bh, seq_len, self.head_k_dim))?
                 .contiguous()?;
-            let k_seq = key
+            let k_seq = k_norm
                 .reshape((bh, seq_len, self.head_k_dim))?
                 .contiguous()?;
             let v_seq = value
