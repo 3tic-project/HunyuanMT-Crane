@@ -641,6 +641,55 @@ impl LinearAttention {
         let (b, s, conv_dim) = mixed_qkv.dims3()?;
         let mixed_qkv = mixed_qkv.transpose(1, 2)?; // [B, conv_dim, S]
 
+        if s == 1 {
+            let history = if let Some(prev) = &self.conv_history {
+                Tensor::cat(&[prev, &mixed_qkv], 2)?
+            } else {
+                mixed_qkv.clone()
+            };
+
+            let total_len = history.dim(2)?;
+            let keep = self.conv_kernel_dim.saturating_sub(1);
+            if keep > 0 {
+                let keep_len = keep.min(total_len);
+                self.conv_history = Some(
+                    history
+                        .narrow(2, total_len - keep_len, keep_len)?
+                        .contiguous()?,
+                );
+            } else {
+                self.conv_history = None;
+            }
+
+            let window = if total_len >= self.conv_kernel_dim {
+                history.narrow(2, total_len - self.conv_kernel_dim, self.conv_kernel_dim)?
+            } else {
+                let pad_len = self.conv_kernel_dim - total_len;
+                let left_pad = Tensor::zeros((b, conv_dim, pad_len), history.dtype(), history.device())?;
+                Tensor::cat(&[&left_pad, &history], 2)?
+            };
+
+            let mut weight = self
+                .conv1d
+                .weight()
+                .reshape((1, conv_dim, self.conv_kernel_dim))?;
+            if weight.dtype() != window.dtype() {
+                weight = weight.to_dtype(window.dtype())?;
+            }
+
+            let mut conv_cur = window.broadcast_mul(&weight)?.sum(2)?; // [B, conv_dim]
+            if let Some(bias) = self.conv1d.bias() {
+                let mut bias = bias.reshape((1, conv_dim))?;
+                if bias.dtype() != conv_cur.dtype() {
+                    bias = bias.to_dtype(conv_cur.dtype())?;
+                }
+                conv_cur = conv_cur.broadcast_add(&bias)?;
+            }
+
+            let conv_cur = silu(&conv_cur.unsqueeze(2)?)?; // [B, conv_dim, 1]
+            return conv_cur.transpose(1, 2)?.reshape((b, s, conv_dim));
+        }
+
         let history = if let Some(prev) = &self.conv_history {
             Tensor::cat(&[prev, &mixed_qkv], 2)?
         } else {
@@ -739,8 +788,45 @@ impl LinearAttention {
             )?
         };
 
-        let mut outputs: Vec<Tensor> = Vec::with_capacity(seq_len);
         let scale = 1.0 / (self.head_k_dim as f64).sqrt();
+
+        if seq_len == 1 {
+            let q_t = query.squeeze(1)?;
+            let k_t = key.squeeze(1)?;
+            let v_t = value.squeeze(1)?;
+            let beta_t = beta.squeeze(1)?;
+            let g_t = g.squeeze(1)?;
+
+            let q_t = (l2norm_last_dim(&q_t, 1e-6)? * scale)?;
+            let k_t = l2norm_last_dim(&k_t, 1e-6)?;
+
+            let g_decay = g_t.exp()?.unsqueeze(2)?.unsqueeze(3)?;
+            state = state.broadcast_mul(&g_decay)?;
+
+            let kv_mem = state.broadcast_mul(&k_t.unsqueeze(3)?)?.sum(2)?;
+            let delta = v_t
+                .broadcast_sub(&kv_mem)?
+                .broadcast_mul(&beta_t.unsqueeze(2)?)?;
+
+            let k_delta = k_t.unsqueeze(3)?.broadcast_mul(&delta.unsqueeze(2)?)?;
+            state = state.broadcast_add(&k_delta)?;
+
+            let core = state.broadcast_mul(&q_t.unsqueeze(3)?)?.sum(2)?.unsqueeze(1)?;
+
+            self.recurrent_state = Some(state);
+
+            let core_2d = core.reshape(((), self.head_v_dim))?;
+            let z_2d = z.to_dtype(DType::F32)?.reshape(((), self.head_v_dim))?;
+            let core_2d = rms_norm_gated(&core_2d, &z_2d, &self.norm_weight, self.rms_norm_eps)?;
+            let core = core_2d
+                .reshape((b, seq_len, self.num_v_heads, self.head_v_dim))?
+                .reshape((b, seq_len, self.value_dim))?
+                .to_dtype(hidden_states.dtype())?;
+
+            return self.out_proj.forward(&core);
+        }
+
+        let mut outputs: Vec<Tensor> = Vec::with_capacity(seq_len);
 
         for t in 0..seq_len {
             let q_t = query.narrow(1, t, 1)?.squeeze(1)?;
