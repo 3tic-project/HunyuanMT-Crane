@@ -709,9 +709,45 @@ impl LinearAttention {
             self.conv_history = None;
         }
 
-        let conv_full = self.conv1d.forward(&history)?; // [B, conv_dim, total_len + k - 1]
-        let conv_causal = conv_full.narrow(2, 0, total_len)?;
-        let conv_cur = conv_causal.narrow(2, total_len.saturating_sub(s), s)?;
+        // Fast depthwise causal conv1d.
+        //
+        // candle's generic Conv1d with `groups = conv_dim` decomposes into
+        // `conv_dim` separate single-group convolutions (one CUDA kernel launch
+        // each).  For conv_dim = 6144 × 18 layers this causes >100 k kernel
+        // launches and ~3 s of overhead.
+        //
+        // Instead we left-pad the history and accumulate K shifted
+        // broadcast-multiplies – only K=4 kernels per layer.
+        let kernel_size = self.conv_kernel_dim;
+        let pad_len = kernel_size - 1;
+        let left_pad = Tensor::zeros(
+            (b, conv_dim, pad_len),
+            history.dtype(),
+            history.device(),
+        )?;
+        let padded = Tensor::cat(&[&left_pad, &history], 2)?; // [B, C, pad+total]
+
+        let mut conv_weight = self
+            .conv1d
+            .weight()
+            .reshape((conv_dim, kernel_size))?; // [C, K]
+        if conv_weight.dtype() != padded.dtype() {
+            conv_weight = conv_weight.to_dtype(padded.dtype())?;
+        }
+
+        // output[b,c,t] = Σ_k  padded[b,c,t+k] * weight[c,k]
+        let mut conv_out = {
+            let shifted = padded.narrow(2, 0, total_len)?;
+            let wk = conv_weight.narrow(1, 0, 1)?.reshape((1, conv_dim, 1))?;
+            shifted.broadcast_mul(&wk)?
+        };
+        for k in 1..kernel_size {
+            let shifted = padded.narrow(2, k, total_len)?;
+            let wk = conv_weight.narrow(1, k, 1)?.reshape((1, conv_dim, 1))?;
+            conv_out = (conv_out + shifted.broadcast_mul(&wk)?)?;
+        }
+
+        let conv_cur = conv_out.narrow(2, total_len.saturating_sub(s), s)?;
         let conv_cur = silu(&conv_cur)?;
 
         conv_cur.transpose(1, 2)?.reshape((b, s, conv_dim))
