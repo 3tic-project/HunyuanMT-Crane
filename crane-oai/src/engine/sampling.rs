@@ -118,7 +118,7 @@ pub fn sample(
     seq_id: &str,
     seq: &mut Sequence,
     logits: &Tensor,
-    buffers: &mut SamplingBuffers,
+    _buffers: &mut SamplingBuffers,
 ) -> Result<u32> {
     let trace = std::env::var("CRANE_SAMPLE_TRACE").ok().as_deref() == Some("1");
     let t0 = Instant::now();
@@ -166,42 +166,11 @@ pub fn sample(
         let top_p_active = top_p > 0.0 && top_p < 1.0;
         let vocab = logits.dim(0)?;
         let temperature = seq.temperature.unwrap_or(1.0);
-        let force_gpu_topk = std::env::var("CRANE_FORCE_GPU_TOPK")
-            .ok()
-            .as_deref()
-            == Some("1");
-        let auto_cpu_topk_enabled = std::env::var("CRANE_AUTO_CPU_TOPK")
-            .ok()
-            .as_deref()
-            != Some("0");
 
         let mut top_k = seq.top_k.unwrap_or(0);
         if top_k == 0 && top_p_active {
-            // For large vocabularies (>64 K tokens) where top_k was NOT
-            // explicitly requested, avoid the expensive GPU topk kernel.
-            // Fall back to CPU LogitsProcessor which handles temperature +
-            // top-p natively and only needs a ~600 KB DtoH copy.
-            // Set CRANE_FORCE_GPU_TOPK=1 to override this heuristic.
-            if vocab > 65536
-                && std::env::var("CRANE_FORCE_GPU_TOPK")
-                    .ok()
-                    .as_deref()
-                    != Some("1")
-            {
-                let next_token = seq.logits_processor.sample(&logits)?;
-                if trace {
-                    let t_done = Instant::now();
-                    debug!(
-                        id = %seq_id,
-                        vocab,
-                        top_p = ?seq.top_p,
-                        temp = ?seq.temperature,
-                        total_us = t_done.duration_since(t0).as_micros() as u64,
-                        "sample(cpu_logits_processor)"
-                    );
-                }
-                return Ok(next_token);
-            }
+            // No explicit top_k but top_p is active — use a default top_k
+            // so we can use the fused GPU kernel instead of CPU fallback.
             top_k = std::env::var("CRANE_TOPP_FALLBACK_TOPK")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -210,126 +179,46 @@ pub fn sample(
         top_k = top_k.min(64).min(vocab);
 
         if top_k > 0 && top_k < vocab {
-            let prefer_cpu_topk = std::env::var("CRANE_TOPK_SAMPLE_ON_CPU")
-                .ok()
-                .as_deref()
-                == Some("1")
-                || (auto_cpu_topk_enabled && !force_gpu_topk && vocab > 200_000);
+            // ── Fused GPU top-k + Gumbel-max sampling ──
+            // Single kernel: topk + (optional top-p) + Gumbel noise → 1 u32 DtoH.
+            // No CPU round-trip, no intermediate GPU tensors.
+            let seed = rand_seed();
 
-            if prefer_cpu_topk {
-                let vals = logits.to_vec1::<f32>()?;
-                let mut pairs: Vec<(f32, u32)> = vals
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, v)| (v, i as u32))
-                    .collect();
-                let kth = top_k.saturating_sub(1);
-                pairs.select_nth_unstable_by(kth, |a, b| {
-                    b.0.partial_cmp(&a.0)
-                        .unwrap_or(std::cmp::Ordering::Greater)
-                });
-                pairs.truncate(top_k);
-                pairs.sort_by(|a, b| {
-                    b.0.partial_cmp(&a.0)
-                        .unwrap_or(std::cmp::Ordering::Greater)
-                });
+            let token = if top_p_active {
+                crane_core::fused_ops::topk_topp_gumbel_sample(
+                    &logits,
+                    top_k,
+                    temperature as f32,
+                    top_p as f32,
+                    seed,
+                )
+                .map_err(anyhow::Error::from)?
+            } else {
+                crane_core::fused_ops::topk_gumbel_sample(
+                    &logits,
+                    top_k,
+                    temperature as f32,
+                    seed,
+                )
+                .map_err(anyhow::Error::from)?
+            };
 
-                let topk_idx_cpu: Vec<u32> = pairs.iter().map(|(_, i)| *i).collect();
-                let topk_logits_cpu: Vec<f32> = pairs.into_iter().map(|(v, _)| v).collect();
-                let cpu_logits = Tensor::from_vec(topk_logits_cpu, top_k, &Device::Cpu)?;
-
-                let pos = seq.logits_processor.sample(&cpu_logits)?;
-                let token = topk_idx_cpu
-                    .get(pos as usize)
-                    .copied()
-                    .unwrap_or_else(|| topk_idx_cpu[0]);
-
-                if trace {
-                    let t_done = Instant::now();
-                    debug!(
-                        id = %seq_id,
-                        top_k,
-                        vocab,
-                        top_p = ?seq.top_p,
-                        temp = ?seq.temperature,
-                        prep_us = t_after_prep.duration_since(t0).as_micros() as u64,
-                        rep_us = t_after_rep.duration_since(t_after_prep).as_micros() as u64,
-                        total_us = t_done.duration_since(t0).as_micros() as u64,
-                        "sample(cpu_topk_fallback)"
-                    );
-                }
-
-                return Ok(token);
+            if trace {
+                let t_done = Instant::now();
+                debug!(
+                    id = %seq_id,
+                    top_k,
+                    vocab,
+                    top_p = ?seq.top_p,
+                    temp = ?seq.temperature,
+                    prep_us = t_after_prep.duration_since(t0).as_micros() as u64,
+                    rep_us = t_after_rep.duration_since(t_after_prep).as_micros() as u64,
+                    total_us = t_done.duration_since(t0).as_micros() as u64,
+                    "sample(fused_gpu_topk_gumbel)"
+                );
             }
 
-            let topk_idx = crane_core::fused_ops::topk_indices(&logits, top_k).map_err(anyhow::Error::from)?;
-            let topk_logits = logits.gather(&topk_idx, candle_core::D::Minus1)?;
-            let t_after_topk = Instant::now();
-
-            if std::env::var("CRANE_TOPK_SAMPLE_ON_CPU").ok().as_deref() == Some("1") {
-                let idx_cpu = topk_idx.to_vec1::<u32>()?;
-                let logits_cpu = topk_logits.to_vec1::<f32>()?;
-                let cpu_logits = Tensor::from_vec(logits_cpu, top_k, &Device::Cpu)?;
-
-                let pos = seq.logits_processor.sample(&cpu_logits)?;
-                let token = idx_cpu
-                    .get(pos as usize)
-                    .copied()
-                    .unwrap_or_else(|| idx_cpu[0]);
-
-                if trace {
-                    let t_done = Instant::now();
-                    debug!(
-                        id = %seq_id,
-                        top_k,
-                        top_p = ?seq.top_p,
-                        temp = ?seq.temperature,
-                        prep_us = t_after_prep.duration_since(t0).as_micros() as u64,
-                        rep_us = t_after_rep.duration_since(t_after_prep).as_micros() as u64,
-                        topk_us = t_after_topk.duration_since(t_after_rep).as_micros() as u64,
-                        total_us = t_done.duration_since(t0).as_micros() as u64,
-                        "sample(topk->cpu)"
-                    );
-                }
-                return Ok(token);
-            }
-
-            if top_p_active {
-                let scaled = (&topk_logits / temperature)?;
-                let probs = candle_nn::ops::softmax_last_dim(&scaled)?;
-                let cumsum_mat = buffers.get_topk_cumsum_mat(top_k, logits.device())?;
-                let cumsum = probs
-                    .reshape((1, top_k))?
-                    .matmul(&cumsum_mat)?
-                    .reshape(top_k)?;
-                let mask_le = cumsum.le(top_p)?;
-
-                let shift =
-                    buffers.get_topk_shift_buf(top_k, logits.device(), mask_le.dtype())?;
-                shift.zero_set()?;
-                if top_k > 1 {
-                    let idx = buffers.get_topk_shift_idx(top_k, logits.device())?;
-                    let src = mask_le.narrow(candle_core::D::Minus1, 0, top_k - 1)?;
-                    shift.scatter_set(&idx, &src, candle_core::D::Minus1)?;
-                }
-                let mask = (&mask_le + &shift)?.gt(0f64)?;
-
-                let neg = buffers.get_topk_neg_vec(top_k, logits.device())?;
-                let masked = mask.where_cond(&topk_logits, &neg)?;
-                let mut pos = sample_gumbel_max_idx(&masked, temperature)?;
-                if pos.rank() == 0 {
-                    pos = pos.unsqueeze(0)?;
-                }
-                let token = topk_idx.gather(&pos, candle_core::D::Minus1)?;
-                return Ok(token.squeeze(0)?.to_scalar::<u32>()?);
-            }
-
-            let mut pos = sample_gumbel_max_idx(&topk_logits, temperature)?;
-            if pos.rank() == 0 {
-                pos = pos.unsqueeze(0)?;
-            }
-            let token = topk_idx.gather(&pos, candle_core::D::Minus1)?;
-            return Ok(token.squeeze(0)?.to_scalar::<u32>()?);
+            return Ok(token);
         }
     }
 

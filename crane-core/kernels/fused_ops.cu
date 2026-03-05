@@ -532,7 +532,250 @@ extern "C" __global__ void topk_stage2_f32(
 }
 
 // =====================================================================
-// 7. Qwen3.5 linear-attention recurrent scan (f32)
+// 7. Fused TopK + Gumbel-Max Sampling
+//
+//    Single kernel: takes f32 logits, temperature, random seed →
+//    returns ONE u32 token id.
+//
+//    Algorithm:
+//      Phase 1 (per-thread): each thread scans a chunk of vocab,
+//              maintaining a sorted top-k list via insertion sort.
+//      Phase 2 (shared mem merge): thread 0 merges all per-thread
+//              top-k lists into a single global top-k.
+//      Phase 3 (Gumbel-max): thread 0 applies temperature scaling +
+//              Gumbel noise to the k winners, picks argmax.
+//
+//    Only 4 bytes DtoH (the token id).
+//
+//    NOTE: k ≤ 64, uses same insertion sort as topk_stage1.
+//    Uses a simple xoshiro128+ PRNG seeded per-call.
+// =====================================================================
+
+// xoshiro128+ state for Gumbel noise generation
+struct Xoshiro128Plus {
+    uint32_t s[4];
+};
+
+__device__ __forceinline__ uint32_t xoshiro128plus_rotl(uint32_t x, int k) {
+    return (x << k) | (x >> (32 - k));
+}
+
+__device__ __forceinline__ uint32_t xoshiro128plus_next(Xoshiro128Plus &state) {
+    const uint32_t result = state.s[0] + state.s[3];
+    const uint32_t t = state.s[1] << 9;
+    state.s[2] ^= state.s[0];
+    state.s[3] ^= state.s[1];
+    state.s[1] ^= state.s[2];
+    state.s[0] ^= state.s[3];
+    state.s[2] ^= t;
+    state.s[3] = xoshiro128plus_rotl(state.s[3], 11);
+    return result;
+}
+
+// Convert u32 to uniform float in (0, 1) — open interval to avoid log(0)
+__device__ __forceinline__ float xoshiro128plus_uniform(Xoshiro128Plus &state) {
+    uint32_t v = xoshiro128plus_next(state);
+    // Map to (2^-33, 1 - 2^-33) approximately — avoids exact 0
+    return (float)(v >> 8) * (1.0f / 16777216.0f) + (1.0f / 33554432.0f);
+}
+
+extern "C" __global__ void topk_gumbel_sample_f32(
+    const float * __restrict__ x,    // [vocab_size] f32 logits
+    const uint32_t vocab_size,
+    const uint32_t k,                // top-k (≤ 64)
+    const float temperature,         // > 0
+    const uint64_t seed,             // random seed
+    uint32_t * __restrict__ out_token // [1] output token id
+) {
+    // ── Phase 1: per-thread top-k via insertion sort ──
+    float vals[64];
+    uint32_t idx[64];
+#pragma unroll
+    for (int j = 0; j < 64; ++j) {
+        vals[j] = -INFINITY;
+        idx[j] = 0;
+    }
+
+    for (uint32_t i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+        topk_insert(x[i], i, vals, idx, (int)k);
+    }
+
+    // ── Phase 2: merge all threads' top-k in shared memory ──
+    extern __shared__ uint8_t smem_tgs[];
+    float * block_vals = (float *)smem_tgs;
+    uint32_t * block_idx = (uint32_t *)(block_vals + (uint32_t)blockDim.x * k);
+
+    const uint32_t base = (uint32_t)threadIdx.x * k;
+    for (uint32_t j = 0; j < k; ++j) {
+        block_vals[base + j] = vals[j];
+        block_idx[base + j] = idx[j];
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        // Merge into final top-k
+        float fvals[64];
+        uint32_t fidx[64];
+#pragma unroll
+        for (int j = 0; j < 64; ++j) {
+            fvals[j] = -INFINITY;
+            fidx[j] = 0;
+        }
+        for (uint32_t t = 0; t < (uint32_t)blockDim.x; ++t) {
+            const uint32_t tb = t * k;
+            for (uint32_t j = 0; j < k; ++j) {
+                topk_insert(block_vals[tb + j], block_idx[tb + j], fvals, fidx, (int)k);
+            }
+        }
+
+        // ── Phase 3: Gumbel-max sampling on the k winners ──
+        // Initialize PRNG from seed
+        Xoshiro128Plus rng;
+        rng.s[0] = (uint32_t)(seed & 0xFFFFFFFF);
+        rng.s[1] = (uint32_t)((seed >> 32) & 0xFFFFFFFF);
+        rng.s[2] = rng.s[0] ^ 0x9E3779B9u;
+        rng.s[3] = rng.s[1] ^ 0x6A09E667u;
+        // Warm up
+        for (int w = 0; w < 8; ++w) xoshiro128plus_next(rng);
+
+        float best_score = -INFINITY;
+        uint32_t best_token = 0;
+
+        for (uint32_t j = 0; j < k; ++j) {
+            if (fvals[j] <= -INFINITY) continue;
+            float logit = fvals[j] / temperature;
+            // Gumbel noise: -log(-log(u)), u ~ Uniform(0,1)
+            float u = xoshiro128plus_uniform(rng);
+            float gumbel = -logf(-logf(u));
+            float score = logit + gumbel;
+            if (score > best_score) {
+                best_score = score;
+                best_token = fidx[j];
+            }
+        }
+
+        *out_token = best_token;
+    }
+}
+
+// =====================================================================
+// 8. Fused TopK + Top-P + Gumbel-Max Sampling
+//
+//    Like topk_gumbel_sample_f32 but with nucleus (top-p) filtering.
+//    After finding top-k, sorts by value (already sorted from insertion),
+//    computes softmax + cumsum, masks out tokens exceeding top_p threshold,
+//    then applies Gumbel-max on the remaining tokens.
+// =====================================================================
+
+extern "C" __global__ void topk_topp_gumbel_sample_f32(
+    const float * __restrict__ x,    // [vocab_size] f32 logits
+    const uint32_t vocab_size,
+    const uint32_t k,                // top-k (≤ 64)
+    const float temperature,         // > 0
+    const float top_p,               // (0, 1)
+    const uint64_t seed,             // random seed
+    uint32_t * __restrict__ out_token // [1] output token id
+) {
+    // ── Phase 1: per-thread top-k via insertion sort ──
+    float vals[64];
+    uint32_t idx[64];
+#pragma unroll
+    for (int j = 0; j < 64; ++j) {
+        vals[j] = -INFINITY;
+        idx[j] = 0;
+    }
+
+    for (uint32_t i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+        topk_insert(x[i], i, vals, idx, (int)k);
+    }
+
+    // ── Phase 2: merge all threads' top-k in shared memory ──
+    extern __shared__ uint8_t smem_tpgs[];
+    float * block_vals = (float *)smem_tpgs;
+    uint32_t * block_idx = (uint32_t *)(block_vals + (uint32_t)blockDim.x * k);
+
+    const uint32_t base = (uint32_t)threadIdx.x * k;
+    for (uint32_t j = 0; j < k; ++j) {
+        block_vals[base + j] = vals[j];
+        block_idx[base + j] = idx[j];
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        // Merge into final top-k (already sorted descending by value)
+        float fvals[64];
+        uint32_t fidx[64];
+#pragma unroll
+        for (int j = 0; j < 64; ++j) {
+            fvals[j] = -INFINITY;
+            fidx[j] = 0;
+        }
+        for (uint32_t t = 0; t < (uint32_t)blockDim.x; ++t) {
+            const uint32_t tb = t * k;
+            for (uint32_t j = 0; j < k; ++j) {
+                topk_insert(block_vals[tb + j], block_idx[tb + j], fvals, fidx, (int)k);
+            }
+        }
+
+        // ── Phase 3: softmax + cumsum + top-p mask ──
+        // Find max for numerical stability
+        float maxv = fvals[0]; // already sorted, fvals[0] is the largest
+
+        // Compute exp(logit/temp - max/temp) for softmax
+        float exps[64];
+        float sum_exp = 0.0f;
+        uint32_t valid_k = 0;
+        for (uint32_t j = 0; j < k; ++j) {
+            if (fvals[j] <= -INFINITY) break;
+            valid_k = j + 1;
+            exps[j] = expf((fvals[j] - maxv) / temperature);
+            sum_exp += exps[j];
+        }
+
+        // Normalize to probabilities + compute cumsum
+        float cumsum = 0.0f;
+        uint32_t cutoff = valid_k; // how many tokens pass the top-p filter
+        for (uint32_t j = 0; j < valid_k; ++j) {
+            float prob = exps[j] / sum_exp;
+            cumsum += prob;
+            if (cumsum > top_p && j > 0) {
+                // This token pushed us over top_p — exclude it and all after
+                cutoff = j;
+                break;
+            }
+        }
+        if (cutoff == 0) cutoff = 1; // always keep at least 1 token
+
+        // ── Phase 4: Gumbel-max on the surviving tokens ──
+        Xoshiro128Plus rng;
+        rng.s[0] = (uint32_t)(seed & 0xFFFFFFFF);
+        rng.s[1] = (uint32_t)((seed >> 32) & 0xFFFFFFFF);
+        rng.s[2] = rng.s[0] ^ 0x9E3779B9u;
+        rng.s[3] = rng.s[1] ^ 0x6A09E667u;
+        for (int w = 0; w < 8; ++w) xoshiro128plus_next(rng);
+
+        float best_score = -INFINITY;
+        uint32_t best_token = fidx[0];
+
+        for (uint32_t j = 0; j < cutoff; ++j) {
+            float logit = fvals[j] / temperature;
+            float u = xoshiro128plus_uniform(rng);
+            float gumbel = -logf(-logf(u));
+            float score = logit + gumbel;
+            if (score > best_score) {
+                best_score = score;
+                best_token = fidx[j];
+            }
+        }
+
+        *out_token = best_token;
+    }
+}
+
+// =====================================================================
+// 9. Qwen3.5 linear-attention recurrent scan (f32)
 //
 //    Per (batch, head) block, scans all timesteps and updates recurrent
 //    state in-place while emitting outputs for each timestep.

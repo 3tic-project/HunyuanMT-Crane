@@ -74,6 +74,25 @@ mod fallback {
     ) -> Result<(Tensor, Tensor)> {
         candle_core::bail!("qwen35_linear_scan_f32 requires cuda feature")
     }
+
+    pub fn topk_gumbel_sample(
+        _logits: &Tensor,
+        _k: usize,
+        _temperature: f32,
+        _seed: u64,
+    ) -> Result<u32> {
+        candle_core::bail!("topk_gumbel_sample requires cuda feature")
+    }
+
+    pub fn topk_topp_gumbel_sample(
+        _logits: &Tensor,
+        _k: usize,
+        _temperature: f32,
+        _top_p: f32,
+        _seed: u64,
+    ) -> Result<u32> {
+        candle_core::bail!("topk_topp_gumbel_sample requires cuda feature")
+    }
 }
 
 #[cfg(not(feature = "cuda"))]

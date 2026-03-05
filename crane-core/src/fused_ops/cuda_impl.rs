@@ -570,6 +570,153 @@ pub fn copy_from_tensor_f32(src_tensor: &Tensor) -> Result<Tensor> {
     src_tensor.contiguous()
 }
 
+/// Fused top-k + Gumbel-max sampling on GPU.
+///
+/// Takes 1D f32 logits, returns a single u32 token ID.
+/// Only 4 bytes DtoH — no intermediate GPU tensors, no CPU round-trip.
+///
+/// `k` ≤ 64, `temperature` > 0, `seed` is a random u64.
+#[cfg(feature = "cuda")]
+pub fn topk_gumbel_sample(logits: &Tensor, k: usize, temperature: f32, seed: u64) -> Result<u32> {
+    if !logits.is_contiguous() {
+        candle_core::bail!("topk_gumbel_sample requires contiguous input");
+    }
+    if logits.rank() != 1 {
+        candle_core::bail!("topk_gumbel_sample expects a 1D tensor");
+    }
+    if k == 0 || k > 64 {
+        candle_core::bail!("topk_gumbel_sample expects 0 < k <= 64");
+    }
+    let vocab_size = logits.dims1()?;
+    if logits.dtype() != DType::F32 {
+        candle_core::bail!("topk_gumbel_sample requires f32 logits");
+    }
+
+    let dev = match logits.device() {
+        Device::Cuda(dev) => dev,
+        _ => candle_core::bail!("topk_gumbel_sample requires CUDA device"),
+    };
+
+    let (storage, layout) = logits.storage_and_layout();
+    let cuda_storage = match &*storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("expected CUDA storage"),
+    };
+    let (o1, o2) = layout
+        .contiguous_offsets()
+        .ok_or_else(|| candle_core::Error::Msg("expected contiguous".into()))?;
+    let x = cuda_storage.as_cuda_slice::<f32>()?.slice(o1..o2);
+
+    let out_token: candle_core::cuda_backend::cudarc::driver::CudaSlice<u32> =
+        unsafe { dev.alloc::<u32>(1)? };
+
+    let func = load_func!(dev, "topk_gumbel_sample_f32")?;
+
+    let block_dim = 256u32;
+    let shared_mem =
+        block_dim as usize * k * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>());
+
+    let vocab_u32 = vocab_size as u32;
+    let k_u32 = k as u32;
+
+    {
+        let mut builder = func.builder();
+        builder.arg(&x);
+        builder.arg(&vocab_u32);
+        builder.arg(&k_u32);
+        builder.arg(&temperature);
+        builder.arg(&seed);
+        builder.arg(&out_token);
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: shared_mem as u32,
+            })
+        }
+        .w()?;
+    }
+
+    let result = dev.clone_dtoh(&out_token)?;
+    Ok(result[0])
+}
+
+/// Fused top-k + top-p + Gumbel-max sampling on GPU.
+///
+/// Like `topk_gumbel_sample` but additionally applies nucleus (top-p) filtering.
+/// Returns a single u32 token ID with only 4 bytes DtoH.
+#[cfg(feature = "cuda")]
+pub fn topk_topp_gumbel_sample(
+    logits: &Tensor,
+    k: usize,
+    temperature: f32,
+    top_p: f32,
+    seed: u64,
+) -> Result<u32> {
+    if !logits.is_contiguous() {
+        candle_core::bail!("topk_topp_gumbel_sample requires contiguous input");
+    }
+    if logits.rank() != 1 {
+        candle_core::bail!("topk_topp_gumbel_sample expects a 1D tensor");
+    }
+    if k == 0 || k > 64 {
+        candle_core::bail!("topk_topp_gumbel_sample expects 0 < k <= 64");
+    }
+    let vocab_size = logits.dims1()?;
+    if logits.dtype() != DType::F32 {
+        candle_core::bail!("topk_topp_gumbel_sample requires f32 logits");
+    }
+
+    let dev = match logits.device() {
+        Device::Cuda(dev) => dev,
+        _ => candle_core::bail!("topk_topp_gumbel_sample requires CUDA device"),
+    };
+
+    let (storage, layout) = logits.storage_and_layout();
+    let cuda_storage = match &*storage {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("expected CUDA storage"),
+    };
+    let (o1, o2) = layout
+        .contiguous_offsets()
+        .ok_or_else(|| candle_core::Error::Msg("expected contiguous".into()))?;
+    let x = cuda_storage.as_cuda_slice::<f32>()?.slice(o1..o2);
+
+    let out_token: candle_core::cuda_backend::cudarc::driver::CudaSlice<u32> =
+        unsafe { dev.alloc::<u32>(1)? };
+
+    let func = load_func!(dev, "topk_topp_gumbel_sample_f32")?;
+
+    let block_dim = 256u32;
+    let shared_mem =
+        block_dim as usize * k * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>());
+
+    let vocab_u32 = vocab_size as u32;
+    let k_u32 = k as u32;
+
+    {
+        let mut builder = func.builder();
+        builder.arg(&x);
+        builder.arg(&vocab_u32);
+        builder.arg(&k_u32);
+        builder.arg(&temperature);
+        builder.arg(&top_p);
+        builder.arg(&seed);
+        builder.arg(&out_token);
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: shared_mem as u32,
+            })
+        }
+        .w()?;
+    }
+
+    let result = dev.clone_dtoh(&out_token)?;
+    Ok(result[0])
+}
+
 /// Fused recurrent scan for Qwen3.5 linear-attention blocks on CUDA.
 ///
 /// Input shapes:
