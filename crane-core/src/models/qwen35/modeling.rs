@@ -800,18 +800,43 @@ impl LinearAttention {
             let q_t = (l2norm_last_dim(&q_t, 1e-6)? * scale)?;
             let k_t = l2norm_last_dim(&k_t, 1e-6)?;
 
-            let g_decay = g_t.exp()?.unsqueeze(2)?.unsqueeze(3)?;
-            state = state.broadcast_mul(&g_decay)?;
+            let core = if hidden_states.device().is_cuda() {
+                let bh = b * self.num_v_heads;
+                let mut state_batched = state.reshape((bh, self.head_k_dim, self.head_v_dim))?;
 
-            let kv_mem = state.broadcast_mul(&k_t.unsqueeze(3)?)?.sum(2)?;
-            let delta = v_t
-                .broadcast_sub(&kv_mem)?
-                .broadcast_mul(&beta_t.unsqueeze(2)?)?;
+                let q_b = q_t.reshape((bh, self.head_k_dim))?;
+                let k_b = k_t.reshape((bh, self.head_k_dim))?;
+                let v_b = v_t.reshape((bh, self.head_v_dim))?;
+                let beta_b = beta_t.reshape((bh, 1))?;
+                let g_decay = g_t.exp()?.reshape((bh, 1, 1))?;
 
-            let k_delta = k_t.unsqueeze(3)?.broadcast_mul(&delta.unsqueeze(2)?)?;
-            state = state.broadcast_add(&k_delta)?;
+                state_batched = state_batched.broadcast_mul(&g_decay)?;
 
-            let core = state.broadcast_mul(&q_t.unsqueeze(3)?)?.sum(2)?.unsqueeze(1)?;
+                let kv_mem = k_b.unsqueeze(1)?.matmul(&state_batched)?.squeeze(1)?;
+                let delta = v_b.broadcast_sub(&kv_mem)?.broadcast_mul(&beta_b)?;
+
+                let k_delta = k_b.unsqueeze(2)?.matmul(&delta.unsqueeze(1)?)?;
+                state_batched = state_batched.broadcast_add(&k_delta)?;
+
+                let out_b = q_b.unsqueeze(1)?.matmul(&state_batched)?.squeeze(1)?;
+                state = state_batched.reshape((b, self.num_v_heads, self.head_k_dim, self.head_v_dim))?;
+                out_b
+                    .reshape((b, self.num_v_heads, self.head_v_dim))?
+                    .unsqueeze(1)?
+            } else {
+                let g_decay = g_t.exp()?.unsqueeze(2)?.unsqueeze(3)?;
+                state = state.broadcast_mul(&g_decay)?;
+
+                let kv_mem = state.broadcast_mul(&k_t.unsqueeze(3)?)?.sum(2)?;
+                let delta = v_t
+                    .broadcast_sub(&kv_mem)?
+                    .broadcast_mul(&beta_t.unsqueeze(2)?)?;
+
+                let k_delta = k_t.unsqueeze(3)?.broadcast_mul(&delta.unsqueeze(2)?)?;
+                state = state.broadcast_add(&k_delta)?;
+
+                state.broadcast_mul(&q_t.unsqueeze(3)?)?.sum(2)?.unsqueeze(1)?
+            };
 
             self.recurrent_state = Some(state);
 
@@ -828,29 +853,68 @@ impl LinearAttention {
 
         let mut outputs: Vec<Tensor> = Vec::with_capacity(seq_len);
 
-        for t in 0..seq_len {
-            let q_t = query.narrow(1, t, 1)?.squeeze(1)?;
-            let k_t = key.narrow(1, t, 1)?.squeeze(1)?;
-            let v_t = value.narrow(1, t, 1)?.squeeze(1)?;
-            let beta_t = beta.narrow(1, t, 1)?.squeeze(1)?;
-            let g_t = g.narrow(1, t, 1)?.squeeze(1)?;
+        if hidden_states.device().is_cuda() {
+            let bh = b * self.num_v_heads;
+            let mut state_batched = state.reshape((bh, self.head_k_dim, self.head_v_dim))?;
 
-            let q_t = (l2norm_last_dim(&q_t, 1e-6)? * scale)?;
-            let k_t = l2norm_last_dim(&k_t, 1e-6)?;
+            for t in 0..seq_len {
+                let q_t = query.narrow(1, t, 1)?.squeeze(1)?;
+                let k_t = key.narrow(1, t, 1)?.squeeze(1)?;
+                let v_t = value.narrow(1, t, 1)?.squeeze(1)?;
+                let beta_t = beta.narrow(1, t, 1)?.squeeze(1)?;
+                let g_t = g.narrow(1, t, 1)?.squeeze(1)?;
 
-            let g_decay = g_t.exp()?.unsqueeze(2)?.unsqueeze(3)?;
-            state = state.broadcast_mul(&g_decay)?;
+                let q_t = (l2norm_last_dim(&q_t, 1e-6)? * scale)?;
+                let k_t = l2norm_last_dim(&k_t, 1e-6)?;
 
-            let kv_mem = state.broadcast_mul(&k_t.unsqueeze(3)?)?.sum(2)?;
-            let delta = v_t
-                .broadcast_sub(&kv_mem)?
-                .broadcast_mul(&beta_t.unsqueeze(2)?)?;
+                let q_b = q_t.reshape((bh, self.head_k_dim))?;
+                let k_b = k_t.reshape((bh, self.head_k_dim))?;
+                let v_b = v_t.reshape((bh, self.head_v_dim))?;
+                let beta_b = beta_t.reshape((bh, 1))?;
+                let g_decay = g_t.exp()?.reshape((bh, 1, 1))?;
 
-            let k_delta = k_t.unsqueeze(3)?.broadcast_mul(&delta.unsqueeze(2)?)?;
-            state = state.broadcast_add(&k_delta)?;
+                state_batched = state_batched.broadcast_mul(&g_decay)?;
 
-            let out_t = state.broadcast_mul(&q_t.unsqueeze(3)?)?.sum(2)?;
-            outputs.push(out_t.unsqueeze(1)?);
+                let kv_mem = k_b.unsqueeze(1)?.matmul(&state_batched)?.squeeze(1)?;
+                let delta = v_b.broadcast_sub(&kv_mem)?.broadcast_mul(&beta_b)?;
+
+                let k_delta = k_b.unsqueeze(2)?.matmul(&delta.unsqueeze(1)?)?;
+                state_batched = state_batched.broadcast_add(&k_delta)?;
+
+                let out_b = q_b.unsqueeze(1)?.matmul(&state_batched)?.squeeze(1)?;
+                outputs.push(
+                    out_b
+                        .reshape((b, self.num_v_heads, self.head_v_dim))?
+                        .unsqueeze(1)?,
+                );
+            }
+
+            state = state_batched.reshape((b, self.num_v_heads, self.head_k_dim, self.head_v_dim))?;
+        } else {
+            for t in 0..seq_len {
+                let q_t = query.narrow(1, t, 1)?.squeeze(1)?;
+                let k_t = key.narrow(1, t, 1)?.squeeze(1)?;
+                let v_t = value.narrow(1, t, 1)?.squeeze(1)?;
+                let beta_t = beta.narrow(1, t, 1)?.squeeze(1)?;
+                let g_t = g.narrow(1, t, 1)?.squeeze(1)?;
+
+                let q_t = (l2norm_last_dim(&q_t, 1e-6)? * scale)?;
+                let k_t = l2norm_last_dim(&k_t, 1e-6)?;
+
+                let g_decay = g_t.exp()?.unsqueeze(2)?.unsqueeze(3)?;
+                state = state.broadcast_mul(&g_decay)?;
+
+                let kv_mem = state.broadcast_mul(&k_t.unsqueeze(3)?)?.sum(2)?;
+                let delta = v_t
+                    .broadcast_sub(&kv_mem)?
+                    .broadcast_mul(&beta_t.unsqueeze(2)?)?;
+
+                let k_delta = k_t.unsqueeze(3)?.broadcast_mul(&delta.unsqueeze(2)?)?;
+                state = state.broadcast_add(&k_delta)?;
+
+                let out_t = state.broadcast_mul(&q_t.unsqueeze(3)?)?.sum(2)?;
+                outputs.push(out_t.unsqueeze(1)?);
+            }
         }
 
         let out_refs: Vec<&Tensor> = outputs.iter().collect();

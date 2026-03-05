@@ -34,6 +34,9 @@ pub struct Scheduler {
     /// exceed the KV budget again. Reset to `None` when a sequence finishes
     /// naturally, allowing the system to try admitting more.
     pub effective_max_running: Option<usize>,
+    /// When both waiting and running have work, alternate prefill/decode.
+    /// This avoids long decode starvation while the scheduler fills all slots.
+    prefer_decode_next: bool,
 }
 
 impl Scheduler {
@@ -43,6 +46,7 @@ impl Scheduler {
             running: VecDeque::new(),
             max_running,
             effective_max_running: None,
+            prefer_decode_next: false,
         }
     }
 
@@ -62,20 +66,17 @@ impl Scheduler {
     /// Returns `None` if there is no work (engine should wait for new requests).
     ///
     /// Prioritizes prefilling waiting sequences up to `max_running` (or `effective_max_running`)
-    /// to build up the batch size for efficient decoding.
+    /// to build up the batch size for efficient decoding, but interleaves decode
+    /// steps when both queues are non-empty to reduce per-request latency.
     pub fn schedule(&mut self) -> Option<SchedulerOutput> {
-        // Priority 1: Prefill a waiting sequence if there's capacity.
         let max = self.effective_max_running.unwrap_or(self.max_running);
-        if !self.waiting.is_empty() && self.running.len() < max {
-            let seq_id = self.waiting.pop_front().unwrap();
-            return Some(SchedulerOutput {
-                batch: vec![seq_id],
-                is_prefill: true,
-            });
-        }
+        let can_prefill = !self.waiting.is_empty() && self.running.len() < max;
+        let has_running = !self.running.is_empty();
 
-        // Priority 2: Decode all running sequences.
-        if !self.running.is_empty() {
+        // When both queues have work and we still have prefill capacity,
+        // alternate prefill and decode.
+        if can_prefill && has_running && self.prefer_decode_next {
+            self.prefer_decode_next = false;
             let batch: Vec<String> = self.running.iter().cloned().collect();
             return Some(SchedulerOutput {
                 batch,
@@ -83,10 +84,31 @@ impl Scheduler {
             });
         }
 
-        // Priority 3: Nothing running but waiting has items — prefill.
+        // Prefill one waiting sequence when capacity allows.
+        if can_prefill {
+            let seq_id = self.waiting.pop_front().unwrap();
+            self.prefer_decode_next = true;
+            return Some(SchedulerOutput {
+                batch: vec![seq_id],
+                is_prefill: true,
+            });
+        }
+
+        // Decode all running sequences.
+        if has_running {
+            self.prefer_decode_next = false;
+            let batch: Vec<String> = self.running.iter().cloned().collect();
+            return Some(SchedulerOutput {
+                batch,
+                is_prefill: false,
+            });
+        }
+
+        // Nothing running but waiting has items — prefill.
         // (This happens if max is 0, which shouldn't normally happen, but just in case).
         if !self.waiting.is_empty() {
             let seq_id = self.waiting.pop_front().unwrap();
+            self.prefer_decode_next = true;
             return Some(SchedulerOutput {
                 batch: vec![seq_id],
                 is_prefill: true,
@@ -148,6 +170,29 @@ mod tests {
         // Should prefill req-2 first (priority 1: waiting has items and capacity available).
         assert!(out.is_prefill);
         assert_eq!(out.batch, vec!["req-2".to_string()]);
+    }
+
+    #[test]
+    fn schedule_alternates_prefill_and_decode_when_both_exist() {
+        let mut s = Scheduler::new(4);
+        s.promote_to_running("req-1".into());
+        s.add("req-2".into());
+
+        let out1 = s.schedule().unwrap();
+        assert!(out1.is_prefill);
+        assert_eq!(out1.batch, vec!["req-2".to_string()]);
+
+        // Put req-2 into running to emulate post-prefill promote in engine.
+        s.promote_to_running("req-2".into());
+        s.add("req-3".into());
+
+        let out2 = s.schedule().unwrap();
+        assert!(!out2.is_prefill);
+        assert_eq!(out2.batch.len(), 2);
+
+        let out3 = s.schedule().unwrap();
+        assert!(out3.is_prefill);
+        assert_eq!(out3.batch, vec!["req-3".to_string()]);
     }
 
     #[test]
