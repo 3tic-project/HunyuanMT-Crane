@@ -74,6 +74,33 @@ pub trait ModelBackend: Send + 'static {
         0
     }
 
+    // ── Optional KV cache quantization hooks (for swapped-out states) ──
+
+    /// Whether this backend can quantize inactive KV caches for memory savings.
+    fn supports_kv_cache_quantization(&self) -> bool {
+        false
+    }
+
+    /// Quantize swapped-out KV caches in-place.
+    ///
+    /// Default: no-op.
+    fn quantize_kv_caches_inplace(
+        &self,
+        _caches: &mut [Option<(Tensor, Tensor)>],
+    ) -> candle_core::Result<()> {
+        Ok(())
+    }
+
+    /// Dequantize swapped-out KV caches in-place before loading into the model.
+    ///
+    /// Default: no-op.
+    fn dequantize_kv_caches_inplace(
+        &self,
+        _caches: &mut [Option<(Tensor, Tensor)>],
+    ) -> candle_core::Result<()> {
+        Ok(())
+    }
+
 
     // ── Batch decode (GPU-efficient concurrent serving) ───────
 
@@ -142,6 +169,38 @@ impl HunyuanBackend {
             crane_core::models::hunyuan_dense::Model::new_with_format(model_path, device, dtype, format)?;
         Ok(Self { model })
     }
+
+    /// Quantize inactive KV tensors only when runtime dtype is fp32.
+    ///
+    /// For fp16/bf16 runtime there is no memory win, so keep native dtype.
+    fn kv_quant_dtype(&self) -> Option<DType> {
+        match self.model.dtype {
+            DType::F32 => Some(DType::F16),
+            _ => None,
+        }
+    }
+
+    fn cast_kv_caches_dtype(
+        caches: &mut [Option<(Tensor, Tensor)>],
+        target: DType,
+    ) -> candle_core::Result<()> {
+        for cache in caches.iter_mut() {
+            if let Some((k, v)) = cache.take() {
+                let k = if k.dtype() == target {
+                    k
+                } else {
+                    k.to_dtype(target)?
+                };
+                let v = if v.dtype() == target {
+                    v
+                } else {
+                    v.to_dtype(target)?
+                };
+                *cache = Some((k, v));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ModelBackend for HunyuanBackend {
@@ -195,6 +254,27 @@ impl ModelBackend for HunyuanBackend {
 
     fn active_kv_cache_bytes(&self) -> u64 {
         self.model.active_kv_cache_bytes()
+    }
+
+    fn supports_kv_cache_quantization(&self) -> bool {
+        self.kv_quant_dtype().is_some()
+    }
+
+    fn quantize_kv_caches_inplace(
+        &self,
+        caches: &mut [Option<(Tensor, Tensor)>],
+    ) -> candle_core::Result<()> {
+        if let Some(target) = self.kv_quant_dtype() {
+            Self::cast_kv_caches_dtype(caches, target)?;
+        }
+        Ok(())
+    }
+
+    fn dequantize_kv_caches_inplace(
+        &self,
+        caches: &mut [Option<(Tensor, Tensor)>],
+    ) -> candle_core::Result<()> {
+        Self::cast_kv_caches_dtype(caches, self.model.dtype)
     }
 
     // ── Batch decode ──
@@ -255,15 +335,96 @@ impl ModelBackend for HunyuanBackend {
 pub struct Qwen35Backend {
     pub model: crane_core::models::qwen35::Model,
     dtype: DType,
+    layer_is_full_attn: Vec<bool>,
 }
 
 impl Qwen35Backend {
     pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
         let model = crane_core::models::qwen35::Model::new(model_path, device, dtype)?;
+        let layer_is_full_attn = model.layer_is_full_attn();
         Ok(Self {
             model,
             dtype: *dtype,
+            layer_is_full_attn,
         })
+    }
+
+    fn kv_to_layer_states(
+        &self,
+        caches: &[Option<(Tensor, Tensor)>],
+    ) -> Vec<crane_core::models::qwen35::modeling::LayerState> {
+        let mut states = Vec::with_capacity(self.layer_is_full_attn.len());
+        for (idx, is_full) in self.layer_is_full_attn.iter().copied().enumerate() {
+            let cache = caches.get(idx).cloned().unwrap_or(None);
+            if is_full {
+                states.push(crane_core::models::qwen35::modeling::LayerState::FullAttn {
+                    kv_cache: cache,
+                });
+            } else {
+                let (recurrent_state, conv_history) = match cache {
+                    Some((state, history)) => (Some(state), Some(history)),
+                    None => (None, None),
+                };
+                states.push(crane_core::models::qwen35::modeling::LayerState::LinearAttn {
+                    recurrent_state,
+                    conv_history,
+                });
+            }
+        }
+        states
+    }
+
+    fn layer_states_to_kv(
+        &self,
+        states: Vec<crane_core::models::qwen35::modeling::LayerState>,
+    ) -> Vec<Option<(Tensor, Tensor)>> {
+        states
+            .into_iter()
+            .map(|state| match state {
+                crane_core::models::qwen35::modeling::LayerState::FullAttn { kv_cache } => {
+                    kv_cache
+                }
+                crane_core::models::qwen35::modeling::LayerState::LinearAttn {
+                    recurrent_state,
+                    conv_history,
+                } => match (recurrent_state, conv_history) {
+                    (Some(state), Some(history)) => Some((state, history)),
+                    _ => None,
+                },
+            })
+            .collect()
+    }
+
+    /// Quantize inactive KV/state tensors only when runtime dtype is fp32.
+    ///
+    /// For fp16/bf16 runtime there is no memory win, so keep native dtype.
+    fn kv_quant_dtype(&self) -> Option<DType> {
+        match self.dtype {
+            DType::F32 => Some(DType::F16),
+            _ => None,
+        }
+    }
+
+    fn cast_kv_caches_dtype(
+        caches: &mut [Option<(Tensor, Tensor)>],
+        target: DType,
+    ) -> candle_core::Result<()> {
+        for cache in caches.iter_mut() {
+            if let Some((k, v)) = cache.take() {
+                let k = if k.dtype() == target {
+                    k
+                } else {
+                    k.to_dtype(target)?
+                };
+                let v = if v.dtype() == target {
+                    v
+                } else {
+                    v.to_dtype(target)?
+                };
+                *cache = Some((k, v));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -279,7 +440,7 @@ impl ModelBackend for Qwen35Backend {
     }
 
     fn num_layers(&self) -> usize {
-        0
+        self.model.num_layers()
     }
 
     fn device(&self) -> &Device {
@@ -314,6 +475,106 @@ impl ModelBackend for Qwen35Backend {
 
     fn warmup(&mut self) {
         self.model.warmup();
+    }
+
+    // ── KV swap ──
+
+    fn supports_kv_swap(&self) -> bool {
+        true
+    }
+
+    fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.layer_states_to_kv(self.model.save_full_state())
+    }
+
+    fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+        let states = self.kv_to_layer_states(&caches);
+        self.model.restore_full_state(states);
+    }
+
+    fn active_kv_cache_bytes(&self) -> u64 {
+        self.model.active_kv_cache_bytes()
+    }
+
+    fn supports_kv_cache_quantization(&self) -> bool {
+        self.kv_quant_dtype().is_some()
+    }
+
+    fn quantize_kv_caches_inplace(
+        &self,
+        caches: &mut [Option<(Tensor, Tensor)>],
+    ) -> candle_core::Result<()> {
+        if let Some(target) = self.kv_quant_dtype() {
+            Self::cast_kv_caches_dtype(caches, target)?;
+        }
+        Ok(())
+    }
+
+    fn dequantize_kv_caches_inplace(
+        &self,
+        caches: &mut [Option<(Tensor, Tensor)>],
+    ) -> candle_core::Result<()> {
+        Self::cast_kv_caches_dtype(caches, self.dtype)
+    }
+
+    // ── Batch decode ──
+
+    fn supports_batch_decode(&self) -> bool {
+        true
+    }
+
+    fn setup_batch_decode(
+        &mut self,
+        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        extra_room: usize,
+    ) -> candle_core::Result<(Vec<usize>, usize)> {
+        let seq_states: Vec<Vec<crane_core::models::qwen35::modeling::LayerState>> =
+            seq_kv_caches
+                .iter()
+                .map(|c| self.kv_to_layer_states(c))
+                .collect();
+        self.model.setup_batch_decode(&seq_states, extra_room)
+    }
+
+    fn step_batch_decode(
+        &mut self,
+        input_ids: &Tensor,
+        positions: &[usize],
+        attention_mask: Option<&Tensor>,
+        batch_kv_info: Option<(&[usize], usize)>,
+    ) -> candle_core::Result<Tensor> {
+        self.model
+            .step_batch_decode_with_input_ids(input_ids, positions, attention_mask, batch_kv_info)
+    }
+
+    fn extract_batch_kv(
+        &mut self,
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        rounds_done: usize,
+    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        let seq_states = self
+            .model
+            .extract_batch_state(kv_lens, original_max_kv, rounds_done)?;
+        Ok(seq_states
+            .into_iter()
+            .map(|s| self.layer_states_to_kv(s))
+            .collect())
+    }
+
+    fn build_batch_decode_mask(
+        &self,
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        max_total_width: usize,
+    ) -> candle_core::Result<Option<Tensor>> {
+        crane_core::models::qwen35::modeling::build_batch_decode_mask(
+            kv_lens,
+            original_max_kv,
+            max_total_width,
+            self.device(),
+            self.dtype(),
+        )
     }
 }
 
@@ -395,6 +656,38 @@ impl Qwen3Backend {
             dtype: *dtype,
         })
     }
+
+    /// Quantize inactive KV tensors only when runtime dtype is fp32.
+    ///
+    /// For fp16/bf16 runtime there is no memory win, so keep native dtype.
+    fn kv_quant_dtype(&self) -> Option<DType> {
+        match self.dtype {
+            DType::F32 => Some(DType::F16),
+            _ => None,
+        }
+    }
+
+    fn cast_kv_caches_dtype(
+        caches: &mut [Option<(Tensor, Tensor)>],
+        target: DType,
+    ) -> candle_core::Result<()> {
+        for cache in caches.iter_mut() {
+            if let Some((k, v)) = cache.take() {
+                let k = if k.dtype() == target {
+                    k
+                } else {
+                    k.to_dtype(target)?
+                };
+                let v = if v.dtype() == target {
+                    v
+                } else {
+                    v.to_dtype(target)?
+                };
+                *cache = Some((k, v));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ModelBackend for Qwen3Backend {
@@ -417,7 +710,7 @@ impl ModelBackend for Qwen3Backend {
     }
 
     fn dtype(&self) -> DType {
-        self.model.dtype
+        self.dtype
     }
 
     fn tokenizer(&self) -> &tokenizers::Tokenizer {
@@ -455,6 +748,27 @@ impl ModelBackend for Qwen3Backend {
 
     fn active_kv_cache_bytes(&self) -> u64 {
         self.model.active_kv_cache_bytes()
+    }
+
+    fn supports_kv_cache_quantization(&self) -> bool {
+        self.kv_quant_dtype().is_some()
+    }
+
+    fn quantize_kv_caches_inplace(
+        &self,
+        caches: &mut [Option<(Tensor, Tensor)>],
+    ) -> candle_core::Result<()> {
+        if let Some(target) = self.kv_quant_dtype() {
+            Self::cast_kv_caches_dtype(caches, target)?;
+        }
+        Ok(())
+    }
+
+    fn dequantize_kv_caches_inplace(
+        &self,
+        caches: &mut [Option<(Tensor, Tensor)>],
+    ) -> candle_core::Result<()> {
+        Self::cast_kv_caches_dtype(caches, self.dtype)
     }
 
     // ── Batch decode ──

@@ -165,6 +165,8 @@ pub async fn server_info(State(state): State<Arc<AppState>>) -> impl IntoRespons
         decode_tokens_per_seq: state.decode_tokens_per_seq,
         max_seq_len: state.max_seq_len,
         gpu_memory_limit: state.gpu_memory_limit.clone(),
+        kv_cache_compression: state.kv_cache_compression.clone(),
+        kv_cache_compression_ratio: state.kv_cache_compression_ratio,
         stats,
     })
 }

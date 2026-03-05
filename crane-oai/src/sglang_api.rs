@@ -188,6 +188,8 @@ pub struct ServerInfoResponse {
     pub decode_tokens_per_seq: usize,
     pub max_seq_len: usize,
     pub gpu_memory_limit: String,
+    pub kv_cache_compression: String,
+    pub kv_cache_compression_ratio: f32,
     /// Live engine statistics snapshot.
     pub stats: crate::engine::StatsSnapshot,
 }

@@ -177,6 +177,57 @@ fn format_bytes_engine(bytes: u64) -> String {
     }
 }
 
+/// KV cache compression strategy for swapped-out sequence states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvCompressionMode {
+    /// Never compress swapped-out KV caches.
+    Off,
+    /// Compress adaptively when KV usage reaches a configured ratio of budget.
+    Auto,
+    /// Always compress swapped-out KV caches.
+    Always,
+}
+
+impl KvCompressionMode {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "off" | "none" | "false" => Self::Off,
+            "always" | "on" | "true" => Self::Always,
+            _ => Self::Auto,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::Always => "always",
+        }
+    }
+}
+
+/// KV cache compression configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct KvCompressionConfig {
+    pub mode: KvCompressionMode,
+    /// For `Auto` mode, trigger compression when `tracked_kv / kv_budget >= ratio`.
+    pub auto_trigger_ratio: f32,
+}
+
+impl KvCompressionConfig {
+    pub fn new(mode: KvCompressionMode, auto_trigger_ratio: f32) -> Self {
+        let ratio = if auto_trigger_ratio.is_finite() {
+            auto_trigger_ratio.clamp(0.0, 1.0)
+        } else {
+            0.85
+        };
+        Self {
+            mode,
+            auto_trigger_ratio: ratio,
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 //  InferenceEngine
 // ─────────────────────────────────────────────────────────────
@@ -216,6 +267,8 @@ pub struct InferenceEngine {
     sampling_buffers: SamplingBuffers,
     /// Memory configuration for VRAM limits.
     memory_config: MemoryConfig,
+    /// KV cache compression policy for swapped-out sequence states.
+    kv_compression: KvCompressionConfig,
     /// Timestamp of last memory-limit warning (to throttle log spam).
     last_mem_warn: Instant,
     /// Tracked total KV cache bytes across all sequences (not relying on
@@ -235,6 +288,7 @@ impl InferenceEngine {
         max_concurrent: usize,
         decode_tokens_per_seq: usize,
         memory_config: MemoryConfig,
+        kv_compression: KvCompressionConfig,
     ) -> (Self, EngineHandle) {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let num_layers = model.num_layers();
@@ -267,6 +321,7 @@ impl InferenceEngine {
             step_counter: 0,
             sampling_buffers: SamplingBuffers::new(),
             memory_config,
+            kv_compression,
             last_mem_warn: Instant::now() - std::time::Duration::from_secs(60),
             tracked_kv_bytes: 0,
             eviction_cooldown: 0,
@@ -311,6 +366,11 @@ impl InferenceEngine {
             self.scheduler.max_running,
             self.decode_tokens_per_seq,
             if self.memory_config.max_seq_len == 0 { "unlimited".to_string() } else { self.memory_config.max_seq_len.to_string() },
+        );
+        info!(
+            "KV compression: mode={}, auto_trigger_ratio={:.2}",
+            self.kv_compression.mode.as_str(),
+            self.kv_compression.auto_trigger_ratio,
         );
 
         loop {
@@ -459,6 +519,32 @@ impl InferenceEngine {
         }
         let raw = limit.saturating_sub(self.memory_config.baseline_gpu_bytes);
         raw / KV_GPU_OVERHEAD_FACTOR
+    }
+
+    /// Whether compression/decompression hooks are enabled at all.
+    fn kv_compression_enabled(&self) -> bool {
+        self.kv_compression.mode != KvCompressionMode::Off
+            && self.model.supports_kv_cache_quantization()
+    }
+
+    /// Whether swapped-out caches should be quantized at this moment.
+    fn should_quantize_swapped_kv(&self) -> bool {
+        if !self.kv_compression_enabled() {
+            return false;
+        }
+        match self.kv_compression.mode {
+            KvCompressionMode::Off => false,
+            KvCompressionMode::Always => true,
+            KvCompressionMode::Auto => {
+                let budget = self.kv_budget_bytes();
+                if budget == u64::MAX || budget == 0 {
+                    return false;
+                }
+                let trigger =
+                    (budget as f64 * self.kv_compression.auto_trigger_ratio as f64) as u64;
+                self.tracked_kv_bytes >= trigger
+            }
+        }
     }
 
     /// Check whether the engine should block new prefills due to memory
@@ -853,7 +939,12 @@ impl InferenceEngine {
         // Flush model's internal KV cache state.
         if let Some(ref prev_id) = self.active_seq_id.take() {
             if self.sequences.contains_key(prev_id) {
-                let caches = self.model.get_kv_caches();
+                let mut caches = self.model.get_kv_caches();
+                if self.should_quantize_swapped_kv() {
+                    if let Err(e) = self.model.quantize_kv_caches_inplace(&mut caches) {
+                        warn!(id = %prev_id, "KV cache quantization failed on swap-out: {e}");
+                    }
+                }
                 if let Some(seq) = self.sequences.get_mut(prev_id) {
                     seq.kv_caches = caches;
                 }
@@ -863,10 +954,17 @@ impl InferenceEngine {
         self.recount_kv_bytes();
 
         // Collect KV caches and setup batched decode.
-        let kv_caches: Vec<Vec<Option<(Tensor, Tensor)>>> = batch
+        let mut kv_caches: Vec<Vec<Option<(Tensor, Tensor)>>> = batch
             .iter()
             .map(|id| self.sequences.get(id).unwrap().kv_caches.clone())
             .collect();
+        if self.kv_compression_enabled() {
+            for (i, seq_id) in batch.iter().enumerate() {
+                if let Err(e) = self.model.dequantize_kv_caches_inplace(&mut kv_caches[i]) {
+                    warn!(id = %seq_id, "KV cache dequantization failed before batched decode: {e}");
+                }
+            }
+        }
 
         // In high-concurrency decode, reserve more headroom to reduce
         // cache reallocation/reshape churn between rounds.
@@ -1059,12 +1157,17 @@ impl InferenceEngine {
             {
                 Ok(extracted) => {
                     for (i, seq_id) in batch.iter().enumerate() {
-                        if alive[i] {
-                            if let Some(seq) = self.sequences.get_mut(seq_id) {
-                                if i < extracted.len() {
-                                    seq.kv_caches = extracted[i].clone();
-                                }
+                        if !alive[i] || i >= extracted.len() {
+                            continue;
+                        }
+                        let mut caches = extracted[i].clone();
+                        if self.should_quantize_swapped_kv() {
+                            if let Err(e) = self.model.quantize_kv_caches_inplace(&mut caches) {
+                                warn!(id = %seq_id, "KV cache quantization failed after batched decode: {e}");
                             }
+                        }
+                        if let Some(seq) = self.sequences.get_mut(seq_id) {
+                            seq.kv_caches = caches;
                         }
                     }
                     // KV caches changed for multiple sequences — recount.
@@ -1244,18 +1347,28 @@ impl InferenceEngine {
 
         // Save previous active sequence's KV cache from the model.
         if let Some(ref prev_id) = self.active_seq_id.clone() {
-            let caches = self.model.get_kv_caches();
+            let mut caches = self.model.get_kv_caches();
+            if self.should_quantize_swapped_kv() {
+                if let Err(e) = self.model.quantize_kv_caches_inplace(&mut caches) {
+                    warn!(id = %prev_id, "KV cache quantization failed on swap-out: {e}");
+                }
+            }
             if let Some(prev_seq) = self.sequences.get_mut(prev_id) {
                 prev_seq.kv_caches = caches;
             }
         }
 
         // Load new sequence's KV cache into the model.
-        let caches = self
+        let mut caches = self
             .sequences
             .get(seq_id)
             .map(|s| s.kv_caches.clone())
             .unwrap_or_else(|| vec![None; self.num_layers]);
+        if self.kv_compression_enabled() {
+            if let Err(e) = self.model.dequantize_kv_caches_inplace(&mut caches) {
+                warn!(id = %seq_id, "KV cache dequantization failed on swap-in: {e}");
+            }
+        }
         self.model.set_kv_caches(caches);
         self.active_seq_id = Some(seq_id.to_string());
 

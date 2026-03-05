@@ -49,6 +49,10 @@ path = "src/tts_voice_clone.rs"
 name = "hunyuan_simple"
 path = "src/hunyuan_simple.rs"
 
+[[bin]]
+name = "qwen35_simple"
+path = "src/qwen35_simple.rs"
+
 [features]
 default = []
 onnx = ["crane/onnx"]

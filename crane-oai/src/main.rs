@@ -19,7 +19,10 @@ use tracing::info;
 
 use chat_template::ChatTemplateProcessor;
 use engine::model_factory::{ModelFormat, ModelType};
-use engine::{EngineHandle, InferenceEngine, MemoryConfig};
+use engine::{
+    EngineHandle, InferenceEngine, KvCompressionConfig, KvCompressionMode,
+    MemoryConfig,
+};
 use handlers::tts::TtsGenerateRequest;
 use handlers::vlm::VlmRequest;
 use openai_api::ErrorResponse;
@@ -83,6 +86,19 @@ struct Args {
     /// until existing ones complete and free memory.
     #[arg(long)]
     gpu_memory_limit: Option<String>,
+
+    /// KV cache compression mode for swapped-out sequence states.
+    ///
+    /// - off: disable KV compression
+    /// - auto: enable when KV usage reaches `kv_cache_compression_ratio`
+    /// - always: always compress on swap-out
+    #[arg(long, default_value = "auto")]
+    kv_cache_compression: String,
+
+    /// Trigger ratio for `--kv-cache-compression auto`.
+    /// Compression activates when `tracked_kv / kv_budget >= ratio`.
+    #[arg(long, default_value_t = 0.85)]
+    kv_cache_compression_ratio: f32,
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -115,6 +131,8 @@ pub struct AppState {
     pub decode_tokens_per_seq: usize,
     pub max_seq_len: usize,
     pub gpu_memory_limit: String,
+    pub kv_cache_compression: String,
+    pub kv_cache_compression_ratio: f32,
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -480,16 +498,30 @@ async fn main() -> Result<()> {
         );
         memory_config.record_baseline(&device);
         let baseline_gpu = memory_config.baseline_gpu_bytes;
+
+        let kv_compression_mode = KvCompressionMode::from_str(&args.kv_cache_compression);
+        let kv_compression_cfg =
+            KvCompressionConfig::new(kv_compression_mode, args.kv_cache_compression_ratio);
+
         info!(
             "Memory config: max_seq_len={}, gpu_limit={}, baseline_gpu={}",
             if memory_config.max_seq_len == 0 { "unlimited".to_string() } else { memory_config.max_seq_len.to_string() },
             if memory_config.gpu_memory_limit_bytes == 0 { "unlimited".to_string() } else { format_bytes(memory_config.gpu_memory_limit_bytes) },
             format_bytes(baseline_gpu),
         );
+        info!(
+            "KV compression config: mode={}, auto_trigger_ratio={:.2}",
+            kv_compression_mode.as_str(),
+            kv_compression_cfg.auto_trigger_ratio,
+        );
 
         // ── Start engine on dedicated thread ──
         let (engine, handle) = InferenceEngine::new(
-            backend, args.max_concurrent, args.decode_tokens_per_seq, memory_config,
+            backend,
+            args.max_concurrent,
+            args.decode_tokens_per_seq,
+            memory_config,
+            kv_compression_cfg,
         );
 
         std::thread::Builder::new()
@@ -536,6 +568,10 @@ async fn main() -> Result<()> {
         decode_tokens_per_seq: args.decode_tokens_per_seq,
         max_seq_len: args.max_seq_len,
         gpu_memory_limit: gpu_memory_limit_display,
+        kv_cache_compression: KvCompressionMode::from_str(&args.kv_cache_compression)
+            .as_str()
+            .to_string(),
+        kv_cache_compression_ratio: args.kv_cache_compression_ratio.clamp(0.0, 1.0),
     });
 
     let app = build_router(state.clone());
@@ -559,12 +595,17 @@ async fn main() -> Result<()> {
         println!("  Mode    : TTS (text-to-speech) — engine bypassed");
     }
     println!("  Listen  : http://{local_addr}");
-    if !is_vlm {
+    if state.engine.is_some() {
         if args.max_seq_len > 0 || state.gpu_memory_limit != "unlimited" {
             let seq_str = if args.max_seq_len == 0 { "unlimited".to_string() } else { args.max_seq_len.to_string() };
             let mem_str = state.gpu_memory_limit.clone();
             println!("  Memory  : seq_len={seq_str}  gpu_limit={mem_str}");
         }
+        println!(
+            "  KV Comp : mode={}  ratio={:.2}",
+            state.kv_cache_compression,
+            state.kv_cache_compression_ratio,
+        );
         println!("  Batch   : max_concurrent={}  decode_tokens_per_seq={}", args.max_concurrent, args.decode_tokens_per_seq);
     }
     println!("  {sep2}");

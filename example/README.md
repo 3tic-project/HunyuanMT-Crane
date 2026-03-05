@@ -8,6 +8,7 @@ This directory contains simple, user-friendly examples showing how to use the Cr
 - `chat_simple.rs`: Basic chat functionality — send a message and get a response
 - `chat_streaming.rs`: Chat with real-time streaming responses — token-by-token output
 - `hunyuan_simple.rs`: Hunyuan Dense model inference 
+- `qwen35_simple.rs`: Qwen3.5 model inference
 
 ### Audio Examples
 - `asr_simple.rs`: Automatic Speech Recognition — transcribe audio to text (requires ONNX feature)
@@ -39,6 +40,16 @@ cargo run --bin ocr_simple --release
 
 # Hunyuan Dense
 cargo run --bin hunyuan_simple --release
+
+# Qwen3.5
+cargo run --bin qwen35_simple --release -- /Users/parsle/Code/Qwen3.5-0.8B
+
+# Qwen3.5 + KV compression (crane-oai continuous batching)
+cargo run -p crane-oai --release -- \
+    --model-path /Users/parsle/Code/Qwen3.5-0.8B \
+    --model-type qwen35 \
+    --kv-cache-compression auto \
+    --kv-cache-compression-ratio 0.85
 
 # TTS — CustomVoice (predefined speakers)
 cargo run --bin tts_custom_voice --release -- vendor/Qwen3-TTS-12Hz-0.6B-CustomVoice

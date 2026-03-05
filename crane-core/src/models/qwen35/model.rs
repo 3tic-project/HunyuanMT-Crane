@@ -18,7 +18,7 @@ use crate::generation::GenerationConfig;
 use crate::utils::token_output_stream::TokenOutputStream;
 use crate::utils::utils;
 
-use super::modeling::{Config, Qwen35Model};
+use super::modeling::{Config, LayerState, Qwen35Model};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelFormat {
@@ -34,6 +34,25 @@ fn config_path_for(model_path: &str) -> Option<PathBuf> {
     } else {
         Some(p.join("config.json"))
     }
+}
+
+fn detect_model_prefix_from_index(model_path: &str) -> Option<String> {
+    let index_path = Path::new(model_path).join("model.safetensors.index.json");
+    let data = std::fs::read(index_path).ok()?;
+    let root: Value = serde_json::from_slice(&data).ok()?;
+    let weight_map = root.get("weight_map")?.as_object()?;
+
+    if weight_map.contains_key("model.language_model.embed_tokens.weight") {
+        return Some("model.language_model".to_string());
+    }
+    if weight_map.contains_key("model.embed_tokens.weight") {
+        return Some("model".to_string());
+    }
+    if weight_map.contains_key("language_model.embed_tokens.weight") {
+        return Some("language_model".to_string());
+    }
+
+    None
 }
 
 pub struct Model {
@@ -102,9 +121,50 @@ impl Model {
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
 
         let filenames = utils::get_safetensors_files(model_path)?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, *dtype, device) }?;
         let config = Self::load_text_config(model_path)?;
-        let inner = Qwen35Model::new(&config, vb)?;
+
+        let mut prefixes = Vec::new();
+        if let Some(detected) = detect_model_prefix_from_index(model_path) {
+            prefixes.push(detected);
+        }
+        for fallback in ["model", "model.language_model", "language_model"] {
+            if !prefixes.iter().any(|p| p == fallback) {
+                prefixes.push(fallback.to_string());
+            }
+        }
+
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut inner = None;
+        for prefix in prefixes.iter() {
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, *dtype, device) }?;
+            match Qwen35Model::new_with_model_prefix(&config, vb, prefix.as_str()) {
+                Ok(m) => {
+                    inner = Some(m);
+                    break;
+                }
+                Err(err) => {
+                    last_err = Some(anyhow::anyhow!(
+                        "prefix '{}' failed: {}",
+                        prefix,
+                        err
+                    ));
+                }
+            }
+        }
+
+        let inner = match inner {
+            Some(m) => m,
+            None => {
+                let detail = last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown error".to_string());
+                anyhow::bail!(
+                    "Failed to load Qwen3.5 weights with tried prefixes {:?}: {}",
+                    prefixes,
+                    detail
+                );
+            }
+        };
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
@@ -138,6 +198,10 @@ impl Model {
         self.inner.num_layers()
     }
 
+    pub fn layer_is_full_attn(&self) -> Vec<bool> {
+        self.inner.layer_is_full_attn()
+    }
+
     pub fn warmup(&mut self) {
         if let Err(e) = self.generate(
             &[45, 546, 456],
@@ -159,6 +223,72 @@ impl Model {
 
     pub fn dtype(&self) -> DType {
         self.dtype
+    }
+
+    // ── KV cache management (for continuous-batching engine) ────────────
+
+    pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.inner.get_kv_caches()
+    }
+
+    pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+        self.inner.set_kv_caches(caches);
+    }
+
+    pub fn active_kv_cache_bytes(&self) -> u64 {
+        self.inner.active_kv_cache_bytes()
+    }
+
+    pub fn save_full_state(&self) -> Vec<LayerState> {
+        self.inner.save_full_state()
+    }
+
+    pub fn restore_full_state(&mut self, states: Vec<LayerState>) {
+        self.inner.restore_full_state(states);
+    }
+
+    // ── Batched decode (GPU-efficient concurrent serving) ───────────────
+
+    pub fn setup_batch_decode(
+        &mut self,
+        seq_states: &[Vec<LayerState>],
+        extra_room: usize,
+    ) -> candle_core::Result<(Vec<usize>, usize)> {
+        self.inner.setup_batch_decode(seq_states, extra_room)
+    }
+
+    pub fn step_batch_decode(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        attention_mask: Option<&Tensor>,
+        batch_kv_info: Option<(&[usize], usize)>,
+    ) -> candle_core::Result<Tensor> {
+        let n = positions.len();
+        let input = Tensor::new(tokens, &self.device)?.reshape((n, 1))?;
+        self.inner
+            .step_batch_decode(&input, positions, attention_mask, batch_kv_info)
+    }
+
+    pub fn step_batch_decode_with_input_ids(
+        &mut self,
+        input_ids: &Tensor,
+        positions: &[usize],
+        attention_mask: Option<&Tensor>,
+        batch_kv_info: Option<(&[usize], usize)>,
+    ) -> candle_core::Result<Tensor> {
+        self.inner
+            .step_batch_decode(input_ids, positions, attention_mask, batch_kv_info)
+    }
+
+    pub fn extract_batch_state(
+        &mut self,
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        rounds_done: usize,
+    ) -> candle_core::Result<Vec<Vec<LayerState>>> {
+        self.inner
+            .extract_batch_state(kv_lens, original_max_kv, rounds_done)
     }
 }
 

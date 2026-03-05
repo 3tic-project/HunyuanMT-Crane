@@ -106,7 +106,8 @@ impl ChatTemplateProcessor for HunyuanChatTemplate {
 
 #[cfg(test)]
 mod tests {
-    use crate::openai_api::ChatMessageContent;
+    use super::{ChatTemplateProcessor, HunyuanChatTemplate};
+    use crate::openai_api::{ChatMessage, ChatMessageContent};
 
     fn make_messages(pairs: &[(&str, &str)]) -> Vec<ChatMessage> {
         pairs

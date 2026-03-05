@@ -454,12 +454,12 @@ mod tests {
     fn chat_message_serde_roundtrip() {
         let msg = ChatMessage {
             role: "user".into(),
-            content: "Hello!".into(),
+            content: ChatMessageContent::Text("Hello!".into()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ChatMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.role, "user");
-        assert_eq!(parsed.content, "Hello!");
+        assert_eq!(parsed.text_content(), "Hello!");
     }
 
     // ── ChatCompletionRequest deserialization ──
@@ -577,7 +577,7 @@ mod tests {
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".into(),
-                    content: "Hello!".into(),
+                    content: ChatMessageContent::Text("Hello!".into()),
                 },
                 finish_reason: Some("stop".into()),
             }],

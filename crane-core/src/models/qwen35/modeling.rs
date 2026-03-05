@@ -307,9 +307,7 @@ fn apply_partial_rope(x: &Tensor, cos: &Tensor, sin: &Tensor, rotary_dim: usize)
 }
 
 struct FullAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
+    qgkv_proj: Linear,
     o_proj: Linear,
     q_norm: Option<Qwen35RmsNorm>,
     k_norm: Option<Qwen35RmsNorm>,
@@ -320,6 +318,7 @@ struct FullAttention {
     q_dim: usize,
     kv_dim: usize,
     kv_cache: Option<(Tensor, Tensor)>,
+    cache_seq_len: usize,
 }
 
 impl FullAttention {
@@ -349,6 +348,16 @@ impl FullAttention {
             linear_no_bias(q_dim, config.hidden_size, vb.pp("o_proj"))?
         };
 
+        let qgkv_w = Tensor::cat(
+            &[q_proj.weight(), k_proj.weight(), v_proj.weight()],
+            0,
+        )?;
+        let qgkv_b = match (q_proj.bias(), k_proj.bias(), v_proj.bias()) {
+            (Some(qb), Some(kb), Some(vb)) => Some(Tensor::cat(&[qb, kb, vb], 0)?),
+            _ => None,
+        };
+        let qgkv_proj = Linear::new(qgkv_w, qgkv_b);
+
         let (q_norm, k_norm) = if config.use_qk_norm {
             (
                 Some(Qwen35RmsNorm::new(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?),
@@ -359,9 +368,7 @@ impl FullAttention {
         };
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qgkv_proj,
             o_proj,
             q_norm,
             k_norm,
@@ -372,18 +379,59 @@ impl FullAttention {
             q_dim,
             kv_dim,
             kv_cache: None,
+            cache_seq_len: 0,
         })
     }
 
     fn update_kv_cache(&mut self, k: Tensor, v: Tensor) -> Result<(Tensor, Tensor)> {
-        if let Some((prev_k, prev_v)) = &self.kv_cache {
-            let k = Tensor::cat(&[prev_k, &k], 2)?;
-            let v = Tensor::cat(&[prev_v, &v], 2)?;
-            self.kv_cache = Some((k.clone(), v.clone()));
-            Ok((k, v))
-        } else {
-            self.kv_cache = Some((k.clone(), v.clone()));
-            Ok((k, v))
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+        let new_seq_len = k.dim(2)?;
+        let cache_seq_len = self.cache_seq_len;
+
+        match self.kv_cache.take() {
+            Some((buf_k, buf_v)) => {
+                let buf_len = buf_k.dim(2)?;
+                let new_total = cache_seq_len + new_seq_len;
+
+                if new_total <= buf_len {
+                    buf_k.slice_set(&k, 2, cache_seq_len)?;
+                    buf_v.slice_set(&v, 2, cache_seq_len)?;
+                    let k_view = buf_k.narrow(2, 0, new_total)?;
+                    let v_view = buf_v.narrow(2, 0, new_total)?;
+                    self.kv_cache = Some((buf_k, buf_v));
+                    self.cache_seq_len = new_total;
+                    Ok((k_view, v_view))
+                } else {
+                    let cur_k = buf_k.narrow(2, 0, cache_seq_len)?;
+                    let cur_v = buf_v.narrow(2, 0, cache_seq_len)?;
+                    drop(buf_k);
+                    drop(buf_v);
+                    let full_k = Tensor::cat(&[&cur_k, &k], 2)?;
+                    let full_v = Tensor::cat(&[&cur_v, &v], 2)?;
+                    let total = full_k.dim(2)?;
+                    let room = 256;
+                    let (b, h, _, d) = full_k.dims4()?;
+                    let new_buf_k = Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
+                    let new_buf_v = Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
+                    new_buf_k.slice_set(&full_k, 2, 0)?;
+                    new_buf_v.slice_set(&full_v, 2, 0)?;
+                    self.kv_cache = Some((new_buf_k, new_buf_v));
+                    self.cache_seq_len = total;
+                    Ok((full_k, full_v))
+                }
+            }
+            None => {
+                let (b, h, s, d) = k.dims4()?;
+                let room = 256;
+                let buf_k = Tensor::zeros((b, h, s + room, d), k.dtype(), k.device())?;
+                let buf_v = Tensor::zeros((b, h, s + room, d), v.dtype(), v.device())?;
+                buf_k.slice_set(&k, 2, 0)?;
+                buf_v.slice_set(&v, 2, 0)?;
+                self.kv_cache = Some((buf_k, buf_v));
+                self.cache_seq_len = s;
+                Ok((k, v))
+            }
         }
     }
 
@@ -396,11 +444,18 @@ impl FullAttention {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = hidden_states.dims3()?;
 
-        let qg = self.q_proj.forward(hidden_states)?;
-        let q = qg.narrow(D::Minus1, 0, self.q_dim)?;
-        let gate = qg.narrow(D::Minus1, self.q_dim, self.q_dim)?;
-        let k = self.k_proj.forward(hidden_states)?;
-        let v = self.v_proj.forward(hidden_states)?;
+        let qgkv = self.qgkv_proj.forward(hidden_states)?;
+        let qg = qgkv
+            .narrow(D::Minus1, 0, self.q_dim * 2)?
+            .reshape((b_sz, seq_len, self.num_heads, self.head_dim * 2))?;
+        let q = qg
+            .narrow(D::Minus1, 0, self.head_dim)?
+            .reshape((b_sz, seq_len, self.q_dim))?;
+        let gate = qg
+            .narrow(D::Minus1, self.head_dim, self.head_dim)?
+            .reshape((b_sz, seq_len, self.q_dim))?;
+        let k = qgkv.narrow(D::Minus1, self.q_dim * 2, self.kv_dim)?;
+        let v = qgkv.narrow(D::Minus1, self.q_dim * 2 + self.kv_dim, self.kv_dim)?;
 
         let q = q
             .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
@@ -427,8 +482,30 @@ impl FullAttention {
         let k = apply_partial_rope(&k, cos, sin, self.rotary_dim)?;
 
         let (k, v) = self.update_kv_cache(k, v)?;
+        let gate = sigmoid(&gate)?;
 
         let n_rep = self.num_heads / self.num_kv_heads;
+
+        if n_rep > 1 && seq_len == 1 {
+            let scale = 1.0 / (self.head_dim as f64).sqrt();
+            let q_g = (q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))? * scale)?
+                .contiguous()?;
+            let k_t = k.transpose(2, 3)?.contiguous()?;
+            let v = v.contiguous()?;
+            let attn_weights = q_g.matmul(&k_t)?;
+            let attn_weights = match attention_mask {
+                Some(mask) => attn_weights.broadcast_add(mask)?,
+                None => attn_weights,
+            };
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_output = attn_weights.matmul(&v)?;
+            let attn_output = attn_output
+                .reshape((b_sz, self.num_heads, self.head_dim))?
+                .reshape((b_sz, 1, self.q_dim))?;
+            let attn_output = attn_output.broadcast_mul(&gate)?;
+            return self.o_proj.forward(&attn_output);
+        }
+
         let k = if n_rep > 1 {
             let (b, kv_heads, s, d) = k.dims4()?;
             k.unsqueeze(2)?
@@ -447,7 +524,10 @@ impl FullAttention {
         };
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
+        let q = q.contiguous()?;
+        let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+        let v = v.contiguous()?;
+        let attn_weights = (q.matmul(&k_t)? * scale)?;
         let attn_weights = match attention_mask {
             Some(mask) => attn_weights.broadcast_add(mask)?,
             None => attn_weights,
@@ -459,8 +539,6 @@ impl FullAttention {
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b_sz, seq_len, self.q_dim))?;
-
-        let gate = sigmoid(&gate)?;
         let attn_output = attn_output.broadcast_mul(&gate)?;
 
         self.o_proj.forward(&attn_output)
@@ -468,14 +546,13 @@ impl FullAttention {
 
     fn clear_cache(&mut self) {
         self.kv_cache = None;
+        self.cache_seq_len = 0;
     }
 }
 
 struct LinearAttention {
-    in_proj_qkv: Linear,
-    in_proj_z: Linear,
-    in_proj_b: Linear,
-    in_proj_a: Linear,
+    in_proj_qkvz: Linear,
+    in_proj_ba: Linear,
     conv1d: Conv1d,
     dt_bias: Tensor,
     a_log: Tensor,
@@ -487,6 +564,7 @@ struct LinearAttention {
     head_v_dim: usize,
     key_dim: usize,
     value_dim: usize,
+    conv_kernel_dim: usize,
     rms_norm_eps: f64,
     conv_history: Option<Tensor>,
     recurrent_state: Option<Tensor>,
@@ -504,8 +582,17 @@ impl LinearAttention {
 
         let in_proj_qkv = linear_no_bias(config.hidden_size, conv_dim, vb.pp("in_proj_qkv"))?;
         let in_proj_z = linear_no_bias(config.hidden_size, value_dim, vb.pp("in_proj_z"))?;
+        let in_proj_qkvz = Linear::new(
+            Tensor::cat(&[in_proj_qkv.weight(), in_proj_z.weight()], 0)?,
+            None,
+        );
+
         let in_proj_b = linear_no_bias(config.hidden_size, num_v_heads, vb.pp("in_proj_b"))?;
         let in_proj_a = linear_no_bias(config.hidden_size, num_v_heads, vb.pp("in_proj_a"))?;
+        let in_proj_ba = Linear::new(
+            Tensor::cat(&[in_proj_b.weight(), in_proj_a.weight()], 0)?,
+            None,
+        );
 
         let conv_cfg = Conv1dConfig {
             padding: config.linear_conv_kernel_dim.saturating_sub(1),
@@ -526,10 +613,8 @@ impl LinearAttention {
         let out_proj = linear_no_bias(value_dim, config.hidden_size, vb.pp("out_proj"))?;
 
         Ok(Self {
-            in_proj_qkv,
-            in_proj_z,
-            in_proj_b,
-            in_proj_a,
+            in_proj_qkvz,
+            in_proj_ba,
             conv1d,
             dt_bias,
             a_log,
@@ -541,6 +626,7 @@ impl LinearAttention {
             head_v_dim,
             key_dim,
             value_dim,
+            conv_kernel_dim: config.linear_conv_kernel_dim,
             rms_norm_eps: config.rms_norm_eps,
             conv_history: None,
             recurrent_state: None,
@@ -559,7 +645,17 @@ impl LinearAttention {
         };
 
         let total_len = history.dim(2)?;
-        self.conv_history = Some(history.clone());
+        let keep = self.conv_kernel_dim.saturating_sub(1);
+        if keep > 0 {
+            let keep_len = keep.min(total_len);
+            self.conv_history = Some(
+                history
+                    .narrow(2, total_len - keep_len, keep_len)?
+                    .contiguous()?,
+            );
+        } else {
+            self.conv_history = None;
+        }
 
         let conv_full = self.conv1d.forward(&history)?; // [B, conv_dim, total_len + k - 1]
         let conv_causal = conv_full.narrow(2, 0, total_len)?;
@@ -572,15 +668,17 @@ impl LinearAttention {
     fn forward(&mut self, hidden_states: &Tensor) -> Result<Tensor> {
         let (b, seq_len, _) = hidden_states.dims3()?;
 
-        let mixed_qkv = self.in_proj_qkv.forward(hidden_states)?;
+        let mixed_qkvz = self.in_proj_qkvz.forward(hidden_states)?;
+        let mixed_qkv = mixed_qkvz.narrow(D::Minus1, 0, self.key_dim * 2 + self.value_dim)?;
         let mixed_qkv = self.causal_depthwise_conv(&mixed_qkv)?;
 
-        let z = self
-            .in_proj_z
-            .forward(hidden_states)?
+        let z = mixed_qkvz
+            .narrow(D::Minus1, self.key_dim * 2 + self.value_dim, self.value_dim)?
             .reshape((b, seq_len, self.num_v_heads, self.head_v_dim))?;
-        let b_proj = self.in_proj_b.forward(hidden_states)?;
-        let a_proj = self.in_proj_a.forward(hidden_states)?;
+
+        let ba = self.in_proj_ba.forward(hidden_states)?;
+        let b_proj = ba.narrow(D::Minus1, 0, self.num_v_heads)?;
+        let a_proj = ba.narrow(D::Minus1, self.num_v_heads, self.num_v_heads)?;
 
         let query = mixed_qkv.narrow(D::Minus1, 0, self.key_dim)?;
         let key = mixed_qkv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
@@ -689,8 +787,8 @@ impl LinearAttention {
 }
 
 struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
+    gate_up_proj: Linear,
+    intermediate_size: usize,
     down_proj: Linear,
 }
 
@@ -698,17 +796,35 @@ impl Mlp {
     fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
         let gate_proj = linear_no_bias(config.hidden_size, config.intermediate_size, vb.pp("gate_proj"))?;
         let up_proj = linear_no_bias(config.hidden_size, config.intermediate_size, vb.pp("up_proj"))?;
+        let gate_up_proj = Linear::new(
+            Tensor::cat(&[gate_proj.weight(), up_proj.weight()], 0)?,
+            None,
+        );
         let down_proj = linear_no_bias(config.intermediate_size, config.hidden_size, vb.pp("down_proj"))?;
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up_proj,
+            intermediate_size: config.intermediate_size,
             down_proj,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = silu(&self.gate_proj.forward(x)?)?;
-        let up = self.up_proj.forward(x)?;
+        let gate_up = self.gate_up_proj.forward(x)?;
+
+        #[cfg(feature = "cuda")]
+        {
+            if gate_up.device().is_cuda() {
+                let activated = crate::fused_ops::fused_silu_mul(
+                    &gate_up.contiguous()?,
+                    self.intermediate_size,
+                )?;
+                return self.down_proj.forward(&activated);
+            }
+        }
+
+        let gate = gate_up.narrow(D::Minus1, 0, self.intermediate_size)?;
+        let up = gate_up.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
+        let gate = silu(&gate)?;
         self.down_proj.forward(&(gate * up)?)
     }
 }
@@ -789,8 +905,16 @@ pub struct Qwen35Model {
 
 impl Qwen35Model {
     pub fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_model_prefix(config, vb, "model")
+    }
+
+    pub fn new_with_model_prefix(
+        config: &Config,
+        vb: VarBuilder,
+        model_prefix: &str,
+    ) -> Result<Self> {
         let dtype = vb.dtype();
-        let model_vb = vb.pp("model");
+        let model_vb = vb.pp(model_prefix);
 
         let embed_tokens = candle_nn::embedding(
             config.vocab_size,
@@ -876,4 +1000,453 @@ impl Qwen35Model {
     pub fn model_dtype(&self) -> DType {
         self.dtype
     }
+
+    /// Returns per-layer boolean: true = full_attention, false = linear_attention.
+    pub fn layer_is_full_attn(&self) -> Vec<bool> {
+        self.layers
+            .iter()
+            .map(|l| matches!(&l.token_mixer, TokenMixer::Full(_)))
+            .collect()
+    }
+
+    // ── KV Cache Management ─────────────────────────────────────────────
+
+    /// Total bytes held by the model state caches (full-attn KV + linear-attn states).
+    pub fn active_kv_cache_bytes(&self) -> u64 {
+        self.layers
+            .iter()
+            .map(|l| match &l.token_mixer {
+                TokenMixer::Full(attn) => attn
+                    .kv_cache
+                    .as_ref()
+                    .map(|(k, v)| {
+                        let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
+                        let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
+                        k_bytes + v_bytes
+                    })
+                    .unwrap_or(0),
+                TokenMixer::Linear(attn) => {
+                    let state_bytes = attn
+                        .recurrent_state
+                        .as_ref()
+                        .map(|s| s.elem_count() as u64 * s.dtype().size_in_bytes() as u64)
+                        .unwrap_or(0);
+                    let conv_bytes = attn
+                        .conv_history
+                        .as_ref()
+                        .map(|s| s.elem_count() as u64 * s.dtype().size_in_bytes() as u64)
+                        .unwrap_or(0);
+                    state_bytes + conv_bytes
+                }
+            })
+            .sum()
+    }
+
+    /// Number of full-attention layers (for KV cache vector sizing).
+    pub fn num_full_attn_layers(&self) -> usize {
+        self.layers
+            .iter()
+            .filter(|l| matches!(&l.token_mixer, TokenMixer::Full(_)))
+            .count()
+    }
+
+    /// Extract per-layer KV caches from full-attention layers (valid portion only).
+    /// Linear-attention layers contribute `None`.
+    pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.layers
+            .iter()
+            .map(|l| match &l.token_mixer {
+                TokenMixer::Full(attn) => attn.kv_cache.as_ref().map(|(k, v)| {
+                    let len = attn.cache_seq_len;
+                    if len > 0 && len < k.dim(2).unwrap_or(0) {
+                        (
+                            k.narrow(2, 0, len).unwrap_or_else(|_| k.clone()),
+                            v.narrow(2, 0, len).unwrap_or_else(|_| v.clone()),
+                        )
+                    } else {
+                        (k.clone(), v.clone())
+                    }
+                }),
+                TokenMixer::Linear(_) => None,
+            })
+            .collect()
+    }
+
+    /// Restore per-layer KV caches for full-attention layers.
+    /// Linear-attention layers are skipped.
+    pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+        for (layer, cache) in self.layers.iter_mut().zip(caches.into_iter()) {
+            if let TokenMixer::Full(ref mut attn) = layer.token_mixer {
+                let seq_len = cache
+                    .as_ref()
+                    .map(|(k, _)| k.dim(2).unwrap_or(0))
+                    .unwrap_or(0);
+                attn.kv_cache = cache;
+                attn.cache_seq_len = seq_len;
+            }
+        }
+    }
+
+    /// Save the full state of all layers (KV caches + linear-attention recurrent state).
+    pub fn save_full_state(&self) -> Vec<LayerState> {
+        self.layers
+            .iter()
+            .map(|l| match &l.token_mixer {
+                TokenMixer::Full(attn) => {
+                    let kv = attn.kv_cache.as_ref().map(|(k, v)| {
+                        let len = attn.cache_seq_len;
+                        if len > 0 && len < k.dim(2).unwrap_or(0) {
+                            (
+                                k.narrow(2, 0, len).unwrap_or_else(|_| k.clone()),
+                                v.narrow(2, 0, len).unwrap_or_else(|_| v.clone()),
+                            )
+                        } else {
+                            (k.clone(), v.clone())
+                        }
+                    });
+                    LayerState::FullAttn { kv_cache: kv }
+                }
+                TokenMixer::Linear(attn) => LayerState::LinearAttn {
+                    recurrent_state: attn.recurrent_state.clone(),
+                    conv_history: attn.conv_history.clone(),
+                },
+            })
+            .collect()
+    }
+
+    /// Restore the full state of all layers.
+    pub fn restore_full_state(&mut self, states: Vec<LayerState>) {
+        for (layer, state) in self.layers.iter_mut().zip(states.into_iter()) {
+            match (&mut layer.token_mixer, state) {
+                (TokenMixer::Full(attn), LayerState::FullAttn { kv_cache }) => {
+                    let seq_len = kv_cache
+                        .as_ref()
+                        .map(|(k, _)| k.dim(2).unwrap_or(0))
+                        .unwrap_or(0);
+                    attn.kv_cache = kv_cache;
+                    attn.cache_seq_len = seq_len;
+                }
+                (TokenMixer::Linear(attn), LayerState::LinearAttn { recurrent_state, conv_history }) => {
+                    attn.recurrent_state = recurrent_state;
+                    attn.conv_history = conv_history;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ── Batched Decode ──────────────────────────────────────────────────
+
+    /// Pad per-sequence KV caches to the same length and load into full-attention layers.
+    /// Linear-attention layers get their recurrent states stacked along the batch dim.
+    /// Returns `(kv_lens, max_kv_len)`.
+    pub fn setup_batch_decode(
+        &mut self,
+        seq_states: &[Vec<LayerState>],
+        extra_room: usize,
+    ) -> Result<(Vec<usize>, usize)> {
+        let device = self.embed_tokens.embeddings().device();
+
+        // Determine per-sequence KV lengths from the first full-attention layer.
+        let kv_lens: Vec<usize> = seq_states
+            .iter()
+            .map(|states| {
+                states.iter().find_map(|s| match s {
+                    LayerState::FullAttn { kv_cache: Some((k, _)) } => Some(k.dim(2).unwrap_or(0)),
+                    _ => None,
+                }).unwrap_or(0)
+            })
+            .collect();
+        let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0);
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let layer_states: Vec<&LayerState> =
+                seq_states.iter().map(|seq| &seq[layer_idx]).collect();
+
+            match &mut layer.token_mixer {
+                TokenMixer::Full(attn) => {
+                    let mut cache_owned: Vec<Option<(Tensor, Tensor)>> =
+                        Vec::with_capacity(layer_states.len());
+                    for s in &layer_states {
+                        match s {
+                            LayerState::FullAttn { kv_cache } => cache_owned.push(kv_cache.clone()),
+                            _ => cache_owned.push(None),
+                        }
+                    }
+                    let caches: Vec<&Option<(Tensor, Tensor)>> = cache_owned.iter().collect();
+
+                    let batched = pad_and_stack_kv_caches(
+                        &caches,
+                        max_kv_len,
+                        attn.num_kv_heads,
+                        attn.head_dim,
+                        device,
+                        self.dtype,
+                    )?;
+
+                    if let Some((k, v)) = batched {
+                        let k = k.contiguous()?;
+                        let v = v.contiguous()?;
+                        if extra_room > 0 {
+                            let (b, h, s, d) = k.dims4()?;
+                            let buf_k = Tensor::zeros(
+                                (b, h, s + extra_room, d),
+                                k.dtype(),
+                                k.device(),
+                            )?;
+                            let buf_v = Tensor::zeros(
+                                (b, h, s + extra_room, d),
+                                v.dtype(),
+                                v.device(),
+                            )?;
+                            buf_k.slice_set(&k, 2, 0)?;
+                            buf_v.slice_set(&v, 2, 0)?;
+                            attn.kv_cache = Some((buf_k, buf_v));
+                        } else {
+                            attn.kv_cache = Some((k, v));
+                        }
+                        attn.cache_seq_len = max_kv_len;
+                    } else {
+                        attn.kv_cache = None;
+                        attn.cache_seq_len = 0;
+                    }
+                }
+                TokenMixer::Linear(lin_attn) => {
+                    // Stack recurrent states along batch dimension.
+                    let states: Vec<&Tensor> = layer_states
+                        .iter()
+                        .filter_map(|s| match s {
+                            LayerState::LinearAttn { recurrent_state: Some(r), .. } => Some(r),
+                            _ => None,
+                        })
+                        .collect();
+                    if states.len() == seq_states.len() {
+                        lin_attn.recurrent_state = Some(Tensor::cat(&states, 0)?);
+                    } else {
+                        lin_attn.recurrent_state = None;
+                    }
+                    // Conv history: for decode (seq_len=1) we don't need it, clear it.
+                    lin_attn.conv_history = None;
+                }
+            }
+        }
+
+        Ok((kv_lens, max_kv_len))
+    }
+
+    /// Run one batched decode step.
+    pub fn step_batch_decode(
+        &mut self,
+        input_ids: &Tensor,
+        positions: &[usize],
+        attention_mask: Option<&Tensor>,
+        _batch_kv_info: Option<(&[usize], usize)>,
+    ) -> Result<Tensor> {
+        let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
+
+        let max_pos = positions.iter().copied().max().unwrap_or(0) + 1;
+        let device = input_ids.device();
+        let (cos, sin) = self.rotary_emb.forward(max_pos, 0, max_pos)?;
+        let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+        let pos_tensor = Tensor::new(pos_ids.as_slice(), device)?;
+        let cos = cos
+            .index_select(&pos_tensor, 0)?
+            .to_dtype(self.dtype)?
+            .unsqueeze(1)?;
+        let sin = sin
+            .index_select(&pos_tensor, 0)?
+            .to_dtype(self.dtype)?
+            .unsqueeze(1)?;
+
+        let mut hidden_states = hidden_states;
+        for layer in self.layers.iter_mut() {
+            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
+        }
+
+        let hidden_states = self.norm.forward(&hidden_states)?;
+        self.lm_head.forward(&hidden_states)
+    }
+
+    /// Extract per-sequence states from batched model state.
+    pub fn extract_batch_state(
+        &mut self,
+        kv_lens: &[usize],
+        original_max_kv: usize,
+        rounds_done: usize,
+    ) -> Result<Vec<Vec<LayerState>>> {
+        let n_seqs = kv_lens.len();
+        let num_layers = self.layers.len();
+        let mut result: Vec<Vec<LayerState>> = (0..n_seqs)
+            .map(|_| Vec::with_capacity(num_layers))
+            .collect();
+
+        for layer in self.layers.iter_mut() {
+            match &mut layer.token_mixer {
+                TokenMixer::Full(attn) => {
+                    if let Some((ref full_k, ref full_v)) = attn.kv_cache {
+                        for i in 0..n_seqs {
+                            let row_k = full_k.narrow(0, i, 1)?;
+                            let row_v = full_v.narrow(0, i, 1)?;
+                            let total = kv_lens[i] + rounds_done;
+                            let offset = original_max_kv - kv_lens[i];
+                            let clean = Some((
+                                row_k.narrow(2, offset, total)?.contiguous()?,
+                                row_v.narrow(2, offset, total)?.contiguous()?,
+                            ));
+                            result[i].push(LayerState::FullAttn { kv_cache: clean });
+                        }
+                    } else {
+                        for i in 0..n_seqs {
+                            result[i].push(LayerState::FullAttn { kv_cache: None });
+                        }
+                    }
+                    attn.kv_cache = None;
+                    attn.cache_seq_len = 0;
+                }
+                TokenMixer::Linear(lin_attn) => {
+                    if let Some(ref state) = lin_attn.recurrent_state {
+                        for i in 0..n_seqs {
+                            let row = state.narrow(0, i, 1)?.contiguous()?;
+                            result[i].push(LayerState::LinearAttn {
+                                recurrent_state: Some(row),
+                                conv_history: None,
+                            });
+                        }
+                    } else {
+                        for i in 0..n_seqs {
+                            result[i].push(LayerState::LinearAttn {
+                                recurrent_state: None,
+                                conv_history: None,
+                            });
+                        }
+                    }
+                    lin_attn.recurrent_state = None;
+                    lin_attn.conv_history = None;
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Access config values needed by backend.
+    pub fn num_kv_heads(&self) -> usize {
+        self.layers
+            .iter()
+            .find_map(|l| match &l.token_mixer {
+                TokenMixer::Full(attn) => Some(attn.num_kv_heads),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.layers
+            .iter()
+            .find_map(|l| match &l.token_mixer {
+                TokenMixer::Full(attn) => Some(attn.head_dim),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+}
+
+// ── Per-layer State ──────────────────────────────────────────────────────
+
+/// Saved state for a single decoder layer.
+pub enum LayerState {
+    FullAttn {
+        kv_cache: Option<(Tensor, Tensor)>,
+    },
+    LinearAttn {
+        recurrent_state: Option<Tensor>,
+        conv_history: Option<Tensor>,
+    },
+}
+
+// ── Utilities ────────────────────────────────────────────────────────────
+
+/// Build attention mask for batched decode with padding-aware masking.
+pub fn build_batch_decode_mask(
+    kv_lens: &[usize],
+    original_max_kv: usize,
+    total_width: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Option<Tensor>> {
+    if kv_lens.iter().all(|&l| l == original_max_kv) {
+        return Ok(None);
+    }
+    let n = kv_lens.len();
+    let mut mask_data = vec![0f32; n * total_width];
+    for i in 0..n {
+        let pad_end = (original_max_kv - kv_lens[i]).min(total_width);
+        for j in 0..pad_end {
+            mask_data[i * total_width + j] = -1e9;
+        }
+    }
+    let mask = Tensor::from_vec(mask_data, (n, total_width), device)?.to_dtype(dtype)?;
+    Ok(Some(mask.unsqueeze(1)?.unsqueeze(1)?))
+}
+
+/// Pad per-sequence KV caches to `max_len` and stack (right-aligned).
+fn pad_and_stack_kv_caches(
+    caches: &[&Option<(Tensor, Tensor)>],
+    max_len: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Option<(Tensor, Tensor)>> {
+    if max_len == 0 {
+        return Ok(None);
+    }
+
+    let n = caches.len();
+    let mut padded_ks = Vec::with_capacity(n);
+    let mut padded_vs = Vec::with_capacity(n);
+
+    let max_pad_needed = caches
+        .iter()
+        .map(|c| match c {
+            Some((k, _)) => max_len.saturating_sub(k.dim(2).unwrap_or(0)),
+            None => max_len,
+        })
+        .max()
+        .unwrap_or(0);
+    let zero_pad = if max_pad_needed > 0 {
+        Some(Tensor::zeros(
+            (1, kv_heads, max_pad_needed, head_dim),
+            dtype,
+            device,
+        )?)
+    } else {
+        None
+    };
+
+    for cache in caches {
+        match cache {
+            Some((k, v)) => {
+                let cur_len = k.dim(2)?;
+                let pad_len = max_len - cur_len;
+                if pad_len > 0 {
+                    let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
+                    padded_ks.push(Tensor::cat(&[&pad, k.as_ref()], 2)?);
+                    padded_vs.push(Tensor::cat(&[&pad, v.as_ref()], 2)?);
+                } else {
+                    padded_ks.push(k.clone());
+                    padded_vs.push(v.clone());
+                }
+            }
+            None => {
+                let zeros = Tensor::zeros((1, kv_heads, max_len, head_dim), dtype, device)?;
+                padded_ks.push(zeros.clone());
+                padded_vs.push(zeros);
+            }
+        }
+    }
+
+    let stacked_k = Tensor::cat(&padded_ks, 0)?.contiguous()?;
+    let stacked_v = Tensor::cat(&padded_vs, 0)?.contiguous()?;
+    Ok(Some((stacked_k, stacked_v)))
 }

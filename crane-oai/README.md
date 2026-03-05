@@ -6,8 +6,8 @@ An OpenAI & SGLang compatible inference API server built on the [Crane](../READM
 
 - **OpenAI-compatible API** — Chat Completions, Text Completions, Text-to-Speech, Models, Tokenize/Detokenize
 - **SGLang native API** — `/generate`, `/model_info`, `/server_info` and related endpoints
-- **Continuous batching** — Dedicated inference thread with prefill-priority scheduling, dynamic KV memory budget, and automatic sequence eviction/recovery
-- **Multi-model support** — Auto-detects and loads Hunyuan Dense, Qwen 2.5, Qwen 3, Qwen3-TTS architectures
+- **Continuous batching** — Dedicated inference thread with prefill-priority scheduling, dynamic KV memory budget, automatic sequence eviction/recovery, and optional KV-cache compression for swapped states
+- **Multi-model support** — Auto-detects and loads Hunyuan Dense, Qwen 2.5, Qwen 3, Qwen 3.5, Qwen3-TTS architectures
 - **Qwen3-TTS** — Full two-level TTS inference (Talker + Code Predictor) with native Candle speech-tokenizer decoder (ONNX optional fallback); exposes OpenAI-compatible `/v1/audio/speech`
 - **Streaming** — SSE (Server-Sent Events) token streaming
 - **Cross-platform acceleration** — CPU / CUDA / Apple Metal, selected automatically
@@ -339,7 +339,7 @@ Currently crane-oai runs on a single CUDA device (device 0). Multi-GPU tensor pa
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--model-path` | *(required)* | Path to model directory or GGUF file |
-| `--model-type` | `auto` | Architecture: `auto`, `hunyuan`, `qwen25`, `qwen3`, `qwen3_tts` |
+| `--model-type` | `auto` | Architecture: `auto`, `hunyuan`, `qwen25`, `qwen3`, `qwen35`, `qwen3_tts` |
 | `--model-name` | directory name | Model name shown in API responses |
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `8080` | Bind port |
@@ -349,6 +349,8 @@ Currently crane-oai runs on a single CUDA device (device 0). Multi-GPU tensor pa
 | `--format` | `auto` | Weight format: `auto`, `safetensors`, `gguf` |
 | `--max-seq-len` | `0` | Max sequence length (prompt + generation); `0` = unlimited |
 | `--gpu-memory-limit` | *(none)* | VRAM cap: absolute (`5G`, `8G`, `5120M`) or fractional (`0.7` = 70% of total) |
+| `--kv-cache-compression` | `auto` | Swapped-KV compression policy: `off`, `auto`, `always` |
+| `--kv-cache-compression-ratio` | `0.85` | Trigger ratio for `auto` mode (`tracked_kv / kv_budget >= ratio`) |
 
 ### Parameter tuning guide
 
@@ -358,6 +360,7 @@ Currently crane-oai runs on a single CUDA device (device 0). Multi-GPU tensor pa
 | Maximum throughput | Increase `--decode-tokens-per-seq` to `32` to reduce scheduling round-trips |
 | Lowest time-to-first-token | Decrease `--decode-tokens-per-seq` to `4–8` so prefill slots in sooner |
 | Long context generation | Set `--max-seq-len` to avoid unbounded KV growth |
+| Frequent memory pressure / swap churn | Keep `--kv-cache-compression auto` and tune `--kv-cache-compression-ratio` to `0.75–0.9` |
 
 ## API Reference
 
@@ -598,6 +601,8 @@ Returns server config and live engine stats.
   "model_path": "/models/Qwen2.5-7B-Instruct",
   "max_concurrent": 16,
   "decode_tokens_per_seq": 16,
+  "kv_cache_compression": "auto",
+  "kv_cache_compression_ratio": 0.85,
   "stats": {
     "total_requests": 42,
     "completed_requests": 40,
