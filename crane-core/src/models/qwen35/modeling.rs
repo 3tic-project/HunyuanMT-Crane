@@ -853,21 +853,39 @@ impl LinearAttention {
 
         let mut outputs: Vec<Tensor> = Vec::with_capacity(seq_len);
 
-        if hidden_states.device().is_cuda() {
+        let disable_fused_linear_scan = std::env::var("CRANE_DISABLE_QWEN35_LINEAR_SCAN_FUSED")
+            .ok()
+            .as_deref()
+            == Some("1");
+
+        if hidden_states.device().is_cuda() && !disable_fused_linear_scan {
             let bh = b * self.num_v_heads;
             let q_norm = (l2norm_last_dim(&query, 1e-6)? * scale)?;
             let k_norm = l2norm_last_dim(&key, 1e-6)?;
+            // Inputs have shape [b, seq_len, num_v_heads, dim].
+            // The kernel expects [b*num_v_heads, seq_len, dim], so we must
+            // transpose seq_len and num_v_heads before merging batch & heads.
             let q_seq = q_norm
-                .reshape((bh, seq_len, self.head_k_dim))?
-                .contiguous()?;
+                .transpose(1, 2)?  // [b, h, seq_len, k_dim]
+                .contiguous()?
+                .reshape((bh, seq_len, self.head_k_dim))?;
             let k_seq = k_norm
-                .reshape((bh, seq_len, self.head_k_dim))?
-                .contiguous()?;
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((bh, seq_len, self.head_k_dim))?;
             let v_seq = value
-                .reshape((bh, seq_len, self.head_v_dim))?
-                .contiguous()?;
-            let beta_seq = beta.reshape((bh, seq_len))?.contiguous()?;
-            let g_seq = g.reshape((bh, seq_len))?.contiguous()?;
+                .transpose(1, 2)?  // [b, h, seq_len, v_dim]
+                .contiguous()?
+                .reshape((bh, seq_len, self.head_v_dim))?;
+            // beta & g have shape [b, seq_len, num_v_heads]
+            let beta_seq = beta
+                .transpose(1, 2)?  // [b, h, seq_len]
+                .contiguous()?
+                .reshape((bh, seq_len))?;
+            let g_seq = g
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((bh, seq_len))?;
             let state_in = state
                 .reshape((bh, self.head_k_dim, self.head_v_dim))?
                 .contiguous()?;
@@ -883,7 +901,12 @@ impl LinearAttention {
 
             state = state_out
                 .reshape((b, self.num_v_heads, self.head_k_dim, self.head_v_dim))?;
-            let core = out_seq.reshape((b, seq_len, self.num_v_heads, self.head_v_dim))?;
+            // Kernel output is [bh, seq_len, v_dim] = [b, h, seq_len, v_dim]
+            // Transpose back to [b, seq_len, h, v_dim]
+            let core = out_seq
+                .reshape((b, self.num_v_heads, seq_len, self.head_v_dim))?
+                .transpose(1, 2)?
+                .contiguous()?;
             let core_2d = core.reshape(((), self.head_v_dim))?;
             let z_2d = z.to_dtype(DType::F32)?.reshape(((), self.head_v_dim))?;
             let core_2d = rms_norm_gated(&core_2d, &z_2d, &self.norm_weight, self.rms_norm_eps)?;
