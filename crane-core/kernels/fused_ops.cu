@@ -531,3 +531,89 @@ extern "C" __global__ void topk_stage2_f32(
     }
 }
 
+// =====================================================================
+// 7. Qwen3.5 linear-attention recurrent scan (f32)
+//
+//    Per (batch, head) block, scans all timesteps and updates recurrent
+//    state in-place while emitting outputs for each timestep.
+//
+//    Shapes:
+//      state_in/out : [BH, K, V]
+//      q            : [BH, S, K]
+//      k            : [BH, S, K]
+//      v            : [BH, S, V]
+//      beta         : [BH, S]
+//      g            : [BH, S]
+//      out          : [BH, S, V]
+// =====================================================================
+
+extern "C" __global__ void qwen35_linear_scan_f32(
+    const float *__restrict__ state_in,
+    float *__restrict__ state_out,
+    const float *__restrict__ q,
+    const float *__restrict__ k,
+    const float *__restrict__ v,
+    const float *__restrict__ beta,
+    const float *__restrict__ g,
+    float *__restrict__ out,
+    const int seq_len,
+    const int k_dim,
+    const int v_dim
+) {
+    const int bh = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    extern __shared__ float shmem[];
+    float *sh_k = shmem;
+    float *sh_q = shmem + k_dim;
+    __shared__ float sh_beta;
+    __shared__ float sh_exp_g;
+
+    const int state_base = bh * k_dim * v_dim;
+    const int qk_base = bh * seq_len * k_dim;
+    const int v_base = bh * seq_len * v_dim;
+    const int bg_base = bh * seq_len;
+
+    // Initialize working state from input state.
+    if (tid < v_dim) {
+        for (int kk = 0; kk < k_dim; ++kk) {
+            const int idx = state_base + kk * v_dim + tid;
+            state_out[idx] = state_in[idx];
+        }
+    }
+    __syncthreads();
+
+    for (int t = 0; t < seq_len; ++t) {
+        if (tid < k_dim) {
+            sh_k[tid] = k[qk_base + t * k_dim + tid];
+            sh_q[tid] = q[qk_base + t * k_dim + tid];
+        }
+        if (tid == 0) {
+            sh_beta = beta[bg_base + t];
+            sh_exp_g = expf(g[bg_base + t]);
+        }
+        __syncthreads();
+
+        if (tid < v_dim) {
+            float kv_mem = 0.0f;
+            for (int kk = 0; kk < k_dim; ++kk) {
+                const int sidx = state_base + kk * v_dim + tid;
+                kv_mem += (state_out[sidx] * sh_exp_g) * sh_k[kk];
+            }
+
+            const float delta = (v[v_base + t * v_dim + tid] - kv_mem) * sh_beta;
+
+            float out_v = 0.0f;
+            for (int kk = 0; kk < k_dim; ++kk) {
+                const int sidx = state_base + kk * v_dim + tid;
+                const float new_state = state_out[sidx] * sh_exp_g + sh_k[kk] * delta;
+                state_out[sidx] = new_state;
+                out_v += new_state * sh_q[kk];
+            }
+
+            out[v_base + t * v_dim + tid] = out_v;
+        }
+        __syncthreads();
+    }
+}
+

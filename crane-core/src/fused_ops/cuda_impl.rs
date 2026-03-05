@@ -6,7 +6,7 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice, WrapErr};
-use candle_core::{CudaDevice, DType, Device, Layout, Result, Shape, Tensor, WithDType};
+use candle_core::{BackpropOp, CudaDevice, DType, Device, Layout, Result, Shape, Storage, Tensor, WithDType};
 
 // PTX compiled from kernels/fused_ops.cu — embedded at build time.
 mod ptx {
@@ -567,4 +567,167 @@ pub fn copy_from_tensor_f32(src_tensor: &Tensor) -> Result<Tensor> {
         );
     }
     src_tensor.contiguous()
+}
+
+/// Fused recurrent scan for Qwen3.5 linear-attention blocks on CUDA.
+///
+/// Input shapes:
+/// - `state_in`: `[bh, k_dim, v_dim]` (f32)
+/// - `q`: `[bh, seq_len, k_dim]` (f32)
+/// - `k`: `[bh, seq_len, k_dim]` (f32)
+/// - `v`: `[bh, seq_len, v_dim]` (f32)
+/// - `beta`: `[bh, seq_len]` (f32)
+/// - `g`: `[bh, seq_len]` (f32)
+///
+/// Returns `(state_out, out_seq)` where:
+/// - `state_out`: `[bh, k_dim, v_dim]`
+/// - `out_seq`: `[bh, seq_len, v_dim]`
+#[cfg(feature = "cuda")]
+pub fn qwen35_linear_scan_f32(
+    state_in: &Tensor,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    beta: &Tensor,
+    g: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let state_in = state_in.contiguous()?;
+    let q = q.contiguous()?;
+    let k = k.contiguous()?;
+    let v = v.contiguous()?;
+    let beta = beta.contiguous()?;
+    let g = g.contiguous()?;
+
+    if state_in.dtype() != DType::F32
+        || q.dtype() != DType::F32
+        || k.dtype() != DType::F32
+        || v.dtype() != DType::F32
+        || beta.dtype() != DType::F32
+        || g.dtype() != DType::F32
+    {
+        candle_core::bail!("qwen35_linear_scan_f32 expects f32 tensors");
+    }
+
+    if !state_in.device().same_device(q.device())
+        || !state_in.device().same_device(k.device())
+        || !state_in.device().same_device(v.device())
+        || !state_in.device().same_device(beta.device())
+        || !state_in.device().same_device(g.device())
+    {
+        candle_core::bail!("qwen35_linear_scan_f32 expects all tensors on the same device");
+    }
+
+    let dev = match state_in.device() {
+        Device::Cuda(dev) => dev,
+        _ => candle_core::bail!("qwen35_linear_scan_f32 requires CUDA device"),
+    };
+
+    let (bh, k_dim, v_dim) = state_in.dims3()?;
+    let (q_bh, seq_len, qk_dim) = q.dims3()?;
+    let (k_bh, k_seq_len, kk_dim) = k.dims3()?;
+    let (v_bh, v_seq_len, vv_dim) = v.dims3()?;
+    let (b_bh, b_seq_len) = beta.dims2()?;
+    let (g_bh, g_seq_len) = g.dims2()?;
+
+    if q_bh != bh
+        || k_bh != bh
+        || v_bh != bh
+        || b_bh != bh
+        || g_bh != bh
+        || qk_dim != k_dim
+        || kk_dim != k_dim
+        || vv_dim != v_dim
+        || k_seq_len != seq_len
+        || v_seq_len != seq_len
+        || b_seq_len != seq_len
+        || g_seq_len != seq_len
+    {
+        candle_core::bail!(
+            "qwen35_linear_scan_f32 shape mismatch: \
+             state=[{bh},{k_dim},{v_dim}] q=[{q_bh},{seq_len},{qk_dim}] \
+             k=[{k_bh},{k_seq_len},{kk_dim}] v=[{v_bh},{v_seq_len},{vv_dim}] \
+             beta=[{b_bh},{b_seq_len}] g=[{g_bh},{g_seq_len}]"
+        );
+    }
+
+    fn extract_cuda_f32_slice(t: &Tensor) -> Result<candle_core::cuda_backend::cudarc::driver::CudaSlice<f32>> {
+        let (storage, layout) = t.storage_and_layout();
+        let cuda_storage = match &*storage {
+            Storage::Cuda(s) => s,
+            _ => candle_core::bail!("expected CUDA storage"),
+        };
+        let (o1, o2) = layout
+            .contiguous_offsets()
+            .ok_or_else(|| candle_core::Error::Msg("expected contiguous tensor".into()))?;
+        match &cuda_storage.slice {
+            CudaStorageSlice::F32(s) => Ok(s.slice(o1..o2)),
+            _ => candle_core::bail!("expected f32 CUDA slice"),
+        }
+    }
+
+    let state_in_slice = extract_cuda_f32_slice(&state_in)?;
+    let q_slice = extract_cuda_f32_slice(&q)?;
+    let k_slice = extract_cuda_f32_slice(&k)?;
+    let v_slice = extract_cuda_f32_slice(&v)?;
+    let beta_slice = extract_cuda_f32_slice(&beta)?;
+    let g_slice = extract_cuda_f32_slice(&g)?;
+
+    let state_out = unsafe { dev.alloc::<f32>(bh * k_dim * v_dim)? };
+    let out = unsafe { dev.alloc::<f32>(bh * seq_len * v_dim)? };
+
+    let func = load_func!(dev, "qwen35_linear_scan_f32")?;
+
+    let block_dim = if v_dim <= 32 {
+        32
+    } else if v_dim <= 64 {
+        64
+    } else if v_dim <= 128 {
+        128
+    } else {
+        256
+    } as u32;
+
+    let shared_mem_bytes = (2 * k_dim * std::mem::size_of::<f32>()) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (bh as u32, 1, 1),
+        block_dim: (block_dim, 1, 1),
+        shared_mem_bytes,
+    };
+
+    {
+        let mut builder = func.builder();
+        builder.arg(&state_in_slice);
+        builder.arg(&state_out);
+        builder.arg(&q_slice);
+        builder.arg(&k_slice);
+        builder.arg(&v_slice);
+        builder.arg(&beta_slice);
+        builder.arg(&g_slice);
+        builder.arg(&out);
+        let seq_len_i32 = seq_len as i32;
+        let k_dim_i32 = k_dim as i32;
+        let v_dim_i32 = v_dim as i32;
+        builder.arg(&seq_len_i32);
+        builder.arg(&k_dim_i32);
+        builder.arg(&v_dim_i32);
+        unsafe { builder.launch(cfg) }.w()?;
+    }
+
+    let state_out_storage = Storage::Cuda(CudaStorage::wrap_cuda_slice(state_out, dev.clone()));
+    let out_storage = Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev.clone()));
+
+    let state_out = Tensor::from_storage(
+        state_out_storage,
+        Shape::from_dims(&[bh, k_dim, v_dim]),
+        BackpropOp::none(),
+        false,
+    );
+    let out = Tensor::from_storage(
+        out_storage,
+        Shape::from_dims(&[bh, seq_len, v_dim]),
+        BackpropOp::none(),
+        false,
+    );
+
+    Ok((state_out, out))
 }

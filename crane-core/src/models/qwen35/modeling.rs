@@ -855,41 +855,43 @@ impl LinearAttention {
 
         if hidden_states.device().is_cuda() {
             let bh = b * self.num_v_heads;
-            let mut state_batched = state.reshape((bh, self.head_k_dim, self.head_v_dim))?;
+            let q_seq = query
+                .reshape((bh, seq_len, self.head_k_dim))?
+                .contiguous()?;
+            let k_seq = key
+                .reshape((bh, seq_len, self.head_k_dim))?
+                .contiguous()?;
+            let v_seq = value
+                .reshape((bh, seq_len, self.head_v_dim))?
+                .contiguous()?;
+            let beta_seq = beta.reshape((bh, seq_len))?.contiguous()?;
+            let g_seq = g.reshape((bh, seq_len))?.contiguous()?;
+            let state_in = state
+                .reshape((bh, self.head_k_dim, self.head_v_dim))?
+                .contiguous()?;
 
-            for t in 0..seq_len {
-                let q_t = query.narrow(1, t, 1)?.squeeze(1)?;
-                let k_t = key.narrow(1, t, 1)?.squeeze(1)?;
-                let v_t = value.narrow(1, t, 1)?.squeeze(1)?;
-                let beta_t = beta.narrow(1, t, 1)?.squeeze(1)?;
-                let g_t = g.narrow(1, t, 1)?.squeeze(1)?;
+            let (state_out, out_seq) = crate::fused_ops::qwen35_linear_scan_f32(
+                &state_in,
+                &q_seq,
+                &k_seq,
+                &v_seq,
+                &beta_seq,
+                &g_seq,
+            )?;
 
-                let q_t = (l2norm_last_dim(&q_t, 1e-6)? * scale)?;
-                let k_t = l2norm_last_dim(&k_t, 1e-6)?;
+            state = state_out
+                .reshape((b, self.num_v_heads, self.head_k_dim, self.head_v_dim))?;
+            let core = out_seq.reshape((b, seq_len, self.num_v_heads, self.head_v_dim))?;
+            let core_2d = core.reshape(((), self.head_v_dim))?;
+            let z_2d = z.to_dtype(DType::F32)?.reshape(((), self.head_v_dim))?;
+            let core_2d = rms_norm_gated(&core_2d, &z_2d, &self.norm_weight, self.rms_norm_eps)?;
+            let core = core_2d
+                .reshape((b, seq_len, self.num_v_heads, self.head_v_dim))?
+                .reshape((b, seq_len, self.value_dim))?
+                .to_dtype(hidden_states.dtype())?;
 
-                let q_b = q_t.reshape((bh, self.head_k_dim))?;
-                let k_b = k_t.reshape((bh, self.head_k_dim))?;
-                let v_b = v_t.reshape((bh, self.head_v_dim))?;
-                let beta_b = beta_t.reshape((bh, 1))?;
-                let g_decay = g_t.exp()?.reshape((bh, 1, 1))?;
-
-                state_batched = state_batched.broadcast_mul(&g_decay)?;
-
-                let kv_mem = k_b.unsqueeze(1)?.matmul(&state_batched)?.squeeze(1)?;
-                let delta = v_b.broadcast_sub(&kv_mem)?.broadcast_mul(&beta_b)?;
-
-                let k_delta = k_b.unsqueeze(2)?.matmul(&delta.unsqueeze(1)?)?;
-                state_batched = state_batched.broadcast_add(&k_delta)?;
-
-                let out_b = q_b.unsqueeze(1)?.matmul(&state_batched)?.squeeze(1)?;
-                outputs.push(
-                    out_b
-                        .reshape((b, self.num_v_heads, self.head_v_dim))?
-                        .unsqueeze(1)?,
-                );
-            }
-
-            state = state_batched.reshape((b, self.num_v_heads, self.head_k_dim, self.head_v_dim))?;
+            self.recurrent_state = Some(state);
+            return self.out_proj.forward(&core);
         } else {
             for t in 0..seq_len {
                 let q_t = query.narrow(1, t, 1)?.squeeze(1)?;

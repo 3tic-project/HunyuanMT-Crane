@@ -63,6 +63,17 @@ mod fallback {
     pub fn copy_from_tensor_f32(src: &Tensor) -> Result<Tensor> {
         src.contiguous()
     }
+
+    pub fn qwen35_linear_scan_f32(
+        _state_in: &Tensor,
+        _q: &Tensor,
+        _k: &Tensor,
+        _v: &Tensor,
+        _beta: &Tensor,
+        _g: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        candle_core::bail!("qwen35_linear_scan_f32 requires cuda feature")
+    }
 }
 
 #[cfg(not(feature = "cuda"))]
