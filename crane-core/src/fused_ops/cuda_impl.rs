@@ -612,9 +612,11 @@ pub fn topk_gumbel_sample(logits: &Tensor, k: usize, temperature: f32, seed: u64
 
     let func = load_func!(dev, "topk_gumbel_sample_f32")?;
 
-    let block_dim = 256u32;
-    let shared_mem =
-        block_dim as usize * k * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>());
+    // Cap block_dim so shared memory stays under 48KB.
+    let per_thread_bytes = k * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>());
+    let max_threads = ((48 * 1024) / per_thread_bytes).min(256).max(32);
+    let block_dim = (1u32 << (31 - (max_threads as u32).leading_zeros())).max(32);
+    let shared_mem = block_dim as usize * per_thread_bytes;
 
     let vocab_u32 = vocab_size as u32;
     let k_u32 = k as u32;
@@ -687,9 +689,11 @@ pub fn topk_topp_gumbel_sample(
 
     let func = load_func!(dev, "topk_topp_gumbel_sample_f32")?;
 
-    let block_dim = 256u32;
-    let shared_mem =
-        block_dim as usize * k * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>());
+    // Cap block_dim so shared memory stays under 48KB.
+    let per_thread_bytes = k * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>());
+    let max_threads = ((48 * 1024) / per_thread_bytes).min(256).max(32);
+    let block_dim = (1u32 << (31 - (max_threads as u32).leading_zeros())).max(32);
+    let shared_mem = block_dim as usize * per_thread_bytes;
 
     let vocab_u32 = vocab_size as u32;
     let k_u32 = k as u32;
