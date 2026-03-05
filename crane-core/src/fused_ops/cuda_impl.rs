@@ -6,7 +6,8 @@
 use candle_core::backend::BackendStorage;
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
 use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice, WrapErr};
-use candle_core::{BackpropOp, CudaDevice, DType, Device, Layout, Result, Shape, Storage, Tensor, WithDType};
+use candle_core::op::BackpropOp;
+use candle_core::{DType, Device, Layout, Result, Shape, Storage, Tensor, WithDType};
 
 // PTX compiled from kernels/fused_ops.cu — embedded at build time.
 mod ptx {
@@ -650,7 +651,9 @@ pub fn qwen35_linear_scan_f32(
         );
     }
 
-    fn extract_cuda_f32_slice(t: &Tensor) -> Result<candle_core::cuda_backend::cudarc::driver::CudaSlice<f32>> {
+    fn extract_cuda_f32_slice(
+        t: &Tensor,
+    ) -> Result<candle_core::cuda_backend::cudarc::driver::CudaView<'_, f32>> {
         let (storage, layout) = t.storage_and_layout();
         let cuda_storage = match &*storage {
             Storage::Cuda(s) => s,
