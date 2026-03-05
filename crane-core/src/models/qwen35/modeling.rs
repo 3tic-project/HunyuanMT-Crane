@@ -233,18 +233,21 @@ fn l2norm_last_dim(x: &Tensor, eps: f64) -> Result<Tensor> {
 
 fn rms_norm_gated(core: &Tensor, gate: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
     let (n, d) = core.dims2()?;
+    let work_dtype = core.dtype();
     let var = core.sqr()?.mean(1)?;
     let denom = (var + eps)?.sqrt()?.unsqueeze(1)?;
     let normed = core.broadcast_div(&denom)?;
 
     let w = if weight.dims().len() == 1 {
-        weight.reshape((1, d))?
+        weight.to_dtype(work_dtype)?.reshape((1, d))?
     } else {
-        weight.clone()
+        weight.to_dtype(work_dtype)?
     };
 
+    let gate = gate.to_dtype(work_dtype)?;
+
     let normed = normed.broadcast_mul(&w)?;
-    let gated = normed.broadcast_mul(&silu(gate)?)?;
+    let gated = normed.broadcast_mul(&silu(&gate)?)?;
     gated.reshape((n, d))
 }
 
