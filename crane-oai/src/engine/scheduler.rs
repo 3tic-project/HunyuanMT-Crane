@@ -8,6 +8,17 @@ pub struct SchedulerOutput {
     pub is_prefill: bool,
 }
 
+/// Once a live decode batch exists, defer refilling newly opened slots for a
+/// short decode burst so the engine can reuse the active batch-decode session.
+///
+/// This is tuned for Crane's current tensor-KV path where batch setup/extract
+/// still has non-trivial fixed cost. For short prompts (for example <= 2k),
+/// a small admission delay is usually worth the steadier decode throughput.
+const DECODE_BURST_STEPS_AFTER_PREFILL: usize = 2;
+const DECODE_BURST_STEPS_ON_QUEUE_PRESSURE: usize = 2;
+const DECODE_BURST_STEPS_AFTER_BATCH_SHRINK: usize = 3;
+const DECODE_BURST_MIN_RUNNING: usize = 4;
+
 /// Simple FIFO scheduler with prefill-priority batching.
 ///
 /// Invariants:
@@ -39,6 +50,9 @@ pub struct Scheduler {
     chunked_prefill_mode: bool,
     /// Toggles the next preference when chunked prefill mode is active.
     prefer_decode_next: bool,
+    /// Remaining decode-first scheduling rounds before the next waiting
+    /// request is admitted into prefill.
+    decode_burst_remaining: usize,
 }
 
 impl Scheduler {
@@ -50,6 +64,7 @@ impl Scheduler {
             effective_max_running: None,
             chunked_prefill_mode: false,
             prefer_decode_next: false,
+            decode_burst_remaining: 0,
         }
     }
 
@@ -57,12 +72,25 @@ impl Scheduler {
         self.chunked_prefill_mode = enabled;
         if !enabled {
             self.prefer_decode_next = false;
+        } else {
+            self.decode_burst_remaining = 0;
         }
+    }
+
+    fn arm_decode_burst(&mut self, steps: usize) {
+        if self.chunked_prefill_mode
+            || self.waiting.is_empty()
+            || self.running.len() < DECODE_BURST_MIN_RUNNING
+        {
+            return;
+        }
+        self.decode_burst_remaining = self.decode_burst_remaining.max(steps);
     }
 
     /// Add a new sequence to the waiting queue.
     pub fn add(&mut self, seq_id: String) {
         self.waiting.push_back(seq_id);
+        self.arm_decode_burst(DECODE_BURST_STEPS_ON_QUEUE_PRESSURE);
     }
 
     /// Requeue a partially-prefilled sequence at the front of the waiting queue.
@@ -72,8 +100,12 @@ impl Scheduler {
 
     /// Remove a sequence from all queues (on completion or error).
     pub fn remove(&mut self, seq_id: &str) {
+        let running_before = self.running.len();
         self.waiting.retain(|id| id != seq_id);
         self.running.retain(|id| id != seq_id);
+        if self.running.len() < running_before {
+            self.arm_decode_burst(DECODE_BURST_STEPS_AFTER_BATCH_SHRINK);
+        }
     }
 
     /// Decide what to do next.
@@ -86,6 +118,24 @@ impl Scheduler {
         let max = self.effective_max_running.unwrap_or(self.max_running);
         let has_prefill_capacity = !self.waiting.is_empty() && self.running.len() < max;
         let can_decode = !self.running.is_empty();
+
+        if !has_prefill_capacity {
+            self.decode_burst_remaining = 0;
+        }
+
+        if !self.chunked_prefill_mode
+            && has_prefill_capacity
+            && can_decode
+            && self.running.len() >= DECODE_BURST_MIN_RUNNING
+            && self.decode_burst_remaining > 0
+        {
+            self.decode_burst_remaining -= 1;
+            let batch: Vec<String> = self.running.iter().cloned().collect();
+            return Some(SchedulerOutput {
+                batch,
+                is_prefill: false,
+            });
+        }
 
         if self.chunked_prefill_mode && has_prefill_capacity && can_decode {
             if self.prefer_decode_next {
@@ -129,6 +179,7 @@ impl Scheduler {
         if !self.waiting.is_empty() {
             let seq_id = self.waiting.pop_front().unwrap();
             self.prefer_decode_next = false;
+            self.decode_burst_remaining = 0;
             return Some(SchedulerOutput {
                 batch: vec![seq_id],
                 is_prefill: true,
@@ -141,6 +192,7 @@ impl Scheduler {
     /// Move a sequence from waiting state to running state (called after prefill).
     pub fn promote_to_running(&mut self, seq_id: String) {
         self.running.push_back(seq_id);
+        self.arm_decode_burst(DECODE_BURST_STEPS_AFTER_PREFILL);
     }
 
     /// Total active sequences (waiting + running).
@@ -313,6 +365,113 @@ mod tests {
         s.requeue_waiting_front("a".into());
         let out = s.schedule().unwrap();
         assert_eq!(out.batch, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn non_chunked_scheduler_runs_decode_burst_after_prefill() {
+        let mut s = Scheduler::new(8);
+        s.promote_to_running("run-1".into());
+        s.promote_to_running("run-2".into());
+        s.promote_to_running("run-3".into());
+        s.add("wait-1".into());
+        s.add("wait-2".into());
+
+        let first = s.schedule().unwrap();
+        assert!(first.is_prefill);
+        assert_eq!(first.batch, vec!["wait-1".to_string()]);
+        s.promote_to_running("wait-1".into());
+
+        let second = s.schedule().unwrap();
+        assert!(!second.is_prefill);
+        assert_eq!(
+            second.batch,
+            vec![
+                "run-1".to_string(),
+                "run-2".to_string(),
+                "run-3".to_string(),
+                "wait-1".to_string(),
+            ]
+        );
+
+        let third = s.schedule().unwrap();
+        assert!(!third.is_prefill);
+        assert_eq!(
+            third.batch,
+            vec![
+                "run-1".to_string(),
+                "run-2".to_string(),
+                "run-3".to_string(),
+                "wait-1".to_string(),
+            ]
+        );
+
+        let fourth = s.schedule().unwrap();
+        assert!(fourth.is_prefill);
+        assert_eq!(fourth.batch, vec!["wait-2".to_string()]);
+    }
+
+    #[test]
+    fn new_waiting_request_triggers_decode_burst_for_stable_batch() {
+        let mut s = Scheduler::new(8);
+        s.promote_to_running("run-1".into());
+        s.promote_to_running("run-2".into());
+        s.promote_to_running("run-3".into());
+        s.promote_to_running("run-4".into());
+        s.add("wait-1".into());
+
+        let first = s.schedule().unwrap();
+        assert!(!first.is_prefill);
+        assert_eq!(
+            first.batch,
+            vec![
+                "run-1".to_string(),
+                "run-2".to_string(),
+                "run-3".to_string(),
+                "run-4".to_string(),
+            ]
+        );
+
+        let second = s.schedule().unwrap();
+        assert!(!second.is_prefill);
+
+        let third = s.schedule().unwrap();
+        assert!(third.is_prefill);
+        assert_eq!(third.batch, vec!["wait-1".to_string()]);
+    }
+
+    #[test]
+    fn batch_shrink_triggers_decode_burst_before_refill() {
+        let mut s = Scheduler::new(8);
+        s.promote_to_running("run-1".into());
+        s.promote_to_running("run-2".into());
+        s.promote_to_running("run-3".into());
+        s.promote_to_running("run-4".into());
+        s.promote_to_running("run-5".into());
+        s.add("wait-1".into());
+
+        s.remove("run-5");
+
+        let first = s.schedule().unwrap();
+        assert!(!first.is_prefill);
+        assert_eq!(
+            first.batch,
+            vec![
+                "run-1".to_string(),
+                "run-2".to_string(),
+                "run-3".to_string(),
+                "run-4".to_string(),
+            ]
+        );
+
+        let second = s.schedule().unwrap();
+        assert!(!second.is_prefill);
+
+        let third = s.schedule().unwrap();
+        assert!(!third.is_prefill);
+
+        let fourth = s.schedule().unwrap();
+        assert!(fourth.is_prefill);
+        assert_eq!(fourth.batch, vec!["wait-1".to_string()]);
     }
 
     #[test]

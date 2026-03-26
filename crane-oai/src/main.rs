@@ -68,7 +68,8 @@ struct Args {
     decode_tokens_per_seq: usize,
 
     /// Prompt tokens to prefill per engine step. 0 = full prompt in one step.
-    #[arg(long, default_value_t = 256)]
+    /// On the current tensor-KV path, full-prompt prefill is the throughput-first default.
+    #[arg(long, default_value_t = 0)]
     prefill_chunk_size: usize,
 
     /// Model weight format: auto, safetensors, or gguf

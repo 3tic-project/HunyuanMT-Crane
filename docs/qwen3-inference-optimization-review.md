@@ -726,9 +726,16 @@ Crane 已经有：
 - `去掉每轮 extract→pad→stack→extract`：
   - 已通过 active batch session 复用大幅减少主循环中的 setup/extract 频率
   - 当前仍是过渡实现，batch 变化或 session flush 时仍会回到旧式 batched KV 提取
+- `短 prompt admission`：
+  - 针对 `prompt <= 2k` 的实际服务场景，scheduler 已加入 decode-burst admission
+  - waiting queue 增长、prefill 完成、以及 running batch shrink 时，都会先保住几轮 decode，再补新 prefill，目标是提高 `reuse_session=true` 的连续命中率
 - `decode bucket + graph 基础设施`：
   - bucket key、plan cache hit 统计和 metadata 统计已具备
   - CUDA Graph 仍未正式接入，需要远端服务器继续 capture 验证
+- 当前默认仍以吞吐优先：
+  - `prefill_chunk_size` 默认回到 `0`
+  - 在真正 paged KV / decode backend 落地前，chunked prefill 需要显式开启，否则会频繁打断 tensor batch decode session
+  - 远端验证时应重点观察 batched decode 日志里 `reuse_session=true` 是否开始连续出现，以及 decode/prefill 是否不再每轮交替
 
 ---
 
