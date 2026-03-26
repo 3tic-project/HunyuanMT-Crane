@@ -25,6 +25,7 @@ const DECODE_BURST_STEPS_AFTER_PREFILL: usize = 2;
 const DECODE_BURST_STEPS_ON_QUEUE_PRESSURE: usize = 2;
 const DECODE_BURST_MIN_RUNNING_AFTER_PREFILL: usize = 4;
 const DECODE_BURST_MIN_RUNNING_ON_QUEUE_PRESSURE: usize = 4;
+const ADMISSION_PRESSURE_WAITING_THRESHOLD: usize = 8;
 
 /// Simple FIFO scheduler with prefill-priority batching.
 ///
@@ -94,6 +95,12 @@ impl Scheduler {
         self.decode_burst_remaining = self.decode_burst_remaining.max(steps);
     }
 
+    fn under_admission_pressure(&self, max_running: usize) -> bool {
+        !self.chunked_prefill_mode
+            && self.running.len() < max_running
+            && self.waiting.len() >= ADMISSION_PRESSURE_WAITING_THRESHOLD.min(max_running.max(1))
+    }
+
     /// Add a new sequence to the waiting queue.
     pub fn add(&mut self, seq_id: String) {
         self.waiting.push_back(seq_id);
@@ -129,14 +136,16 @@ impl Scheduler {
         let max = self.effective_max_running.unwrap_or(self.max_running);
         let has_prefill_capacity = !self.waiting.is_empty() && self.running.len() < max;
         let can_decode = !self.running.is_empty();
+        let admission_pressure = self.under_admission_pressure(max);
 
-        if !has_prefill_capacity {
+        if !has_prefill_capacity || admission_pressure {
             self.decode_burst_remaining = 0;
         }
 
         if !self.chunked_prefill_mode
             && has_prefill_capacity
             && can_decode
+            && !admission_pressure
             && self.decode_burst_remaining > 0
         {
             self.decode_burst_remaining -= 1;
@@ -450,6 +459,23 @@ mod tests {
         let third = s.schedule().unwrap();
         assert!(third.is_prefill);
         assert_eq!(third.batch, vec!["wait-1".to_string()]);
+    }
+
+    #[test]
+    fn backlog_pressure_disables_decode_burst_and_prefills_immediately() {
+        let mut s = Scheduler::new(16);
+        s.promote_to_running("run-1".into());
+        s.promote_to_running("run-2".into());
+        s.promote_to_running("run-3".into());
+        s.promote_to_running("run-4".into());
+        s.promote_to_running("run-5".into());
+        for i in 0..8 {
+            s.add(format!("wait-{i}"));
+        }
+
+        let out = s.schedule().unwrap();
+        assert!(out.is_prefill);
+        assert_eq!(out.batch, vec!["wait-0".to_string()]);
     }
 
     #[test]
