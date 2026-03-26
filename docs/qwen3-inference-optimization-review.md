@@ -146,6 +146,12 @@ Crane 的主要瓶颈并不在“模型完全没优化”，而在以下几个�
 - setup / extract 固定开销
 - 与 batch size、轮数强耦合的服务端额外负担
 
+截至 `2026-03-26`，Qwen3 tensor-KV 过渡路径已经先做了一轮止血：
+
+- `setup_batch_decode` 不再为每层构造 `pad + cat + contiguous + reallocate` 临时张量链
+- 改为复用 batched KV workspace，并用右对齐 scatter 写回各 sequence cache
+- 这能明显降低长时间压测下的 `setup_ms` 漂移与 allocator 增长，但架构上仍然属于“重组型 batched decode”，并没有替代 paged KV
+
 #### 3.2.2 attention backend 仍以 Candle matmul 为主
 
 虽然 decode 路径已有 grouped GQA 形状优化，但 attention 主体仍是：
@@ -726,6 +732,7 @@ Crane 已经有：
 - `去掉每轮 extract→pad→stack→extract`：
   - 已通过 active batch session 复用大幅减少主循环中的 setup/extract 频率
   - 当前仍是过渡实现，batch 变化或 session flush 时仍会回到旧式 batched KV 提取
+  - 同时，Qwen3 tensor-KV `setup_batch_decode` 已改成可复用 batched KV workspace，避免每次 batch rebuild 都生成大块临时 pad/stack tensor；这一步主要解决长压测时的 `setup_ms` 上升和显存池持续抬高问题
 - `短 prompt admission`：
   - 针对 `prompt <= 2k` 的实际服务场景，scheduler 已加入 decode-burst admission
   - waiting queue 增长、prefill 完成时，会优先保住几轮 decode，再补新 prefill；但 `running batch shrink` 不再延迟 admission，因为当前 tensor-KV 引擎在完成/取消后已经 flush active session，继续停留在 3-lane decode 没有 reuse 收益

@@ -309,6 +309,10 @@ python3 scripts/benchmark_qwen3_serving.py \
 
 - Qwen3 prefill / decode 已在 engine 层显式分家，并支持 `prefill_chunk_size` 驱动的 chunked prefill。
 - batch decode 热路径已引入 active session 复用，避免每个 scheduling round 都做 `extract -> pad/stack -> decode -> extract`。
+- `crane-core/src/models/qwen3/modeling.rs` 的 tensor-KV `setup_batch_decode` 已从“每层 `pad + cat + contiguous + extra_room copy`”改成“可复用 batched KV workspace + 右对齐 scatter 写入”：
+  - workspace 按 batch=`8`、width=`256 token` 阶梯扩容
+  - batch 变化时优先复用已有大 buffer，避免长时间压测下 `setup_ms` 与 CUDA allocator 占用持续爬升
+  - 这仍然是 paged KV 前的过渡方案，但已经能明显减少短 prompt serving 场景里的结构性浪费
 - scheduler 已进一步加入短 prompt 吞吐优先的 decode-burst admission 策略，当前主要覆盖 `新请求入队 / prefill 完成` 两类事件；当前 tensor-KV 路径下，这比“slot 一空就立刻 prefill”更符合 Qwen3 1.7B serving 的真实瓶颈。对 `batch shrink`，当前实现会直接补位，因为 active batch session 已被引擎 flush，延迟 prefill 只会制造低吞吐的 3-lane decode。
 - 当 waiting backlog 很高时，burst 会被自动关闭，优先扩 batch，而不是为了局部 `reuse_session=true` 牺牲整体吞吐与排队长度。
 - sampling 时间已进入 engine 细粒度统计；现有 GPU fast path 继续保留 `gpu_argmax / topk / gumbel-max / repetition penalty`。
