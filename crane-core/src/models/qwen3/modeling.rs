@@ -32,6 +32,8 @@ use candle_nn::{linear_no_bias, Linear, RmsNorm, VarBuilder};
 use serde::Deserialize;
 use std::io::{Read, Seek};
 
+use super::paged_kv::{KvCacheLayout, PagedAttentionMetadata, PagedKvConfig};
+
 // Reuse the polymorphic linear layer and GGUF loader from the shared Hunyuan module.
 pub use crate::models::hunyuan_dense::modeling::{Gguf, LinearLayer};
 
@@ -1099,6 +1101,63 @@ impl Qwen3Model {
         }
 
         Ok(result)
+    }
+
+    /// Extract per-sequence KV caches from the current batched state using
+    /// the already-updated per-sequence lengths.
+    pub fn extract_batch_kv_by_lengths(
+        &mut self,
+        seq_lens: &[usize],
+        batch_width: usize,
+    ) -> Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        let n_seqs = seq_lens.len();
+        let num_layers = self.layers.len();
+        let mut result: Vec<Vec<Option<(Tensor, Tensor)>>> = (0..n_seqs)
+            .map(|_| Vec::with_capacity(num_layers))
+            .collect();
+
+        for layer in self.layers.iter_mut() {
+            if let Some((ref full_k, ref full_v)) = layer.self_attn.kv_cache {
+                for i in 0..n_seqs {
+                    let row_k = full_k.narrow(0, i, 1)?;
+                    let row_v = full_v.narrow(0, i, 1)?;
+                    let seq_len = seq_lens[i];
+                    let offset = batch_width.saturating_sub(seq_len);
+                    let clean = Some((
+                        row_k.narrow(2, offset, seq_len)?.contiguous()?,
+                        row_v.narrow(2, offset, seq_len)?.contiguous()?,
+                    ));
+                    result[i].push(clean);
+                }
+            } else {
+                for result_row in &mut result {
+                    result_row.push(None);
+                }
+            }
+            layer.self_attn.kv_cache = None;
+            layer.self_attn.cache_seq_len = 0;
+        }
+
+        Ok(result)
+    }
+
+    pub fn paged_kv_config(&self, page_size: usize) -> PagedKvConfig {
+        PagedKvConfig {
+            page_size,
+            num_layers: self.layers.len(),
+            num_kv_heads: self.config.num_key_value_heads,
+            head_dim: self.config.head_dim(),
+            dtype: self.dtype,
+            layout: KvCacheLayout::Nhd,
+        }
+    }
+
+    pub fn build_paged_attention_metadata(
+        &self,
+        seq_lens: &[usize],
+        page_size: usize,
+    ) -> PagedAttentionMetadata {
+        PagedAttentionMetadata::from_seq_lens(seq_lens, page_size)
     }
 
     /// Access the model config.

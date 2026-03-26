@@ -67,6 +67,10 @@ struct Args {
     #[arg(long, default_value_t = 16)]
     decode_tokens_per_seq: usize,
 
+    /// Prompt tokens to prefill per engine step. 0 = full prompt in one step.
+    #[arg(long, default_value_t = 256)]
+    prefill_chunk_size: usize,
+
     /// Model weight format: auto, safetensors, or gguf
     #[arg(long, default_value = "auto")]
     format: String,
@@ -113,6 +117,7 @@ pub struct AppState {
     pub port: u16,
     pub max_concurrent: usize,
     pub decode_tokens_per_seq: usize,
+    pub prefill_chunk_size: usize,
     pub max_seq_len: usize,
     pub gpu_memory_limit: String,
 }
@@ -489,7 +494,11 @@ async fn main() -> Result<()> {
 
         // ── Start engine on dedicated thread ──
         let (engine, handle) = InferenceEngine::new(
-            backend, args.max_concurrent, args.decode_tokens_per_seq, memory_config,
+            backend,
+            args.max_concurrent,
+            args.decode_tokens_per_seq,
+            args.prefill_chunk_size,
+            memory_config,
         );
 
         std::thread::Builder::new()
@@ -497,8 +506,10 @@ async fn main() -> Result<()> {
             .spawn(move || engine.run())
             .expect("Failed to spawn engine thread");
         info!(
-            "Inference engine started (max_concurrent={}, decode_tokens_per_seq={})",
-            args.max_concurrent, args.decode_tokens_per_seq,
+            "Inference engine started (max_concurrent={}, decode_tokens_per_seq={}, prefill_chunk_size={})",
+            args.max_concurrent,
+            args.decode_tokens_per_seq,
+            args.prefill_chunk_size,
         );
 
         (Some(handle), tokenizer, eos_token_id, chat_template, None, None)
@@ -534,6 +545,7 @@ async fn main() -> Result<()> {
         port: args.port,
         max_concurrent: args.max_concurrent,
         decode_tokens_per_seq: args.decode_tokens_per_seq,
+        prefill_chunk_size: args.prefill_chunk_size,
         max_seq_len: args.max_seq_len,
         gpu_memory_limit: gpu_memory_limit_display,
     });
@@ -565,7 +577,12 @@ async fn main() -> Result<()> {
             let mem_str = state.gpu_memory_limit.clone();
             println!("  Memory  : seq_len={seq_str}  gpu_limit={mem_str}");
         }
-        println!("  Batch   : max_concurrent={}  decode_tokens_per_seq={}", args.max_concurrent, args.decode_tokens_per_seq);
+        println!(
+            "  Batch   : max_concurrent={}  decode_tokens_per_seq={}  prefill_chunk_size={}",
+            args.max_concurrent,
+            args.decode_tokens_per_seq,
+            args.prefill_chunk_size,
+        );
     }
     println!("  {sep2}");
     println!("  OpenAI-compatible API");

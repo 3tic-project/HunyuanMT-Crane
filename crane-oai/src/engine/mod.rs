@@ -45,6 +45,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use candle_core::{Device, Tensor};
+use crane_core::models::qwen3::decode_backend::DecodeBackendPlan;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -177,6 +178,14 @@ fn format_bytes_engine(bytes: u64) -> String {
     }
 }
 
+#[derive(Clone)]
+struct ActiveBatchDecodeSession {
+    batch: Vec<String>,
+    batch_width: usize,
+    plan: Option<DecodeBackendPlan>,
+    backend_name: &'static str,
+}
+
 // ─────────────────────────────────────────────────────────────
 //  InferenceEngine
 // ─────────────────────────────────────────────────────────────
@@ -209,6 +218,8 @@ pub struct InferenceEngine {
     stats: Arc<EngineStats>,
     /// How many tokens to decode for one sequence before switching.
     decode_tokens_per_seq: usize,
+    /// Maximum prompt tokens to prefill in a single engine step.
+    prefill_chunk_size: usize,
     /// Engine start time for uptime calculation.
     start_time: Instant,
     /// Step counter for periodic stats logging.
@@ -226,6 +237,9 @@ pub struct InferenceEngine {
     /// grant a short cooldown after preemption to avoid a deadlock where
     /// cuMemGetInfo always reports over-limit.
     eviction_cooldown: u32,
+    /// Reusable batched-decode state kept resident in the model while the
+    /// running batch remains unchanged.
+    active_batch_decode: Option<ActiveBatchDecodeSession>,
 }
 
 impl InferenceEngine {
@@ -234,6 +248,7 @@ impl InferenceEngine {
         model: Box<dyn ModelBackend>,
         max_concurrent: usize,
         decode_tokens_per_seq: usize,
+        prefill_chunk_size: usize,
         memory_config: MemoryConfig,
     ) -> (Self, EngineHandle) {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
@@ -253,16 +268,25 @@ impl InferenceEngine {
         }
 
         let stats = Arc::new(EngineStats::new());
+        let mut scheduler = Scheduler::new(effective_max);
+        let prefill_chunk_size = if prefill_chunk_size == 0 {
+            usize::MAX
+        } else {
+            prefill_chunk_size
+        };
+        scheduler.set_chunked_prefill_mode(prefill_chunk_size != usize::MAX);
+
         let engine = Self {
             model,
             sequences: HashMap::new(),
             token_streams: HashMap::new(),
-            scheduler: Scheduler::new(effective_max),
+            scheduler,
             request_rx,
             active_seq_id: None,
             num_layers,
             stats: stats.clone(),
             decode_tokens_per_seq: decode_tokens_per_seq.max(1),
+            prefill_chunk_size,
             start_time: Instant::now(),
             step_counter: 0,
             sampling_buffers: SamplingBuffers::new(),
@@ -270,6 +294,7 @@ impl InferenceEngine {
             last_mem_warn: Instant::now() - std::time::Duration::from_secs(60),
             tracked_kv_bytes: 0,
             eviction_cooldown: 0,
+            active_batch_decode: None,
         };
         let handle = EngineHandle {
             request_tx,
@@ -306,10 +331,16 @@ impl InferenceEngine {
                 );
             }
         }
+        let prefill_chunk_display = if self.prefill_chunk_size == usize::MAX {
+            "full-prompt".to_string()
+        } else {
+            self.prefill_chunk_size.to_string()
+        };
         info!(
-            "Engine started (max_concurrent={}, decode_tokens_per_seq={}, max_seq_len={})",
+            "Engine started (max_concurrent={}, decode_tokens_per_seq={}, prefill_chunk_size={}, max_seq_len={})",
             self.scheduler.max_running,
             self.decode_tokens_per_seq,
+            prefill_chunk_display,
             if self.memory_config.max_seq_len == 0 { "unlimited".to_string() } else { self.memory_config.max_seq_len.to_string() },
         );
 
@@ -336,6 +367,15 @@ impl InferenceEngine {
                     // largest running sequence to make room. If still over,
                     // defer the prefill and drain existing sequences.
                     if output.is_prefill && self.is_over_kv_budget() {
+                        if let (Some(used_pages), Some(page_budget)) =
+                            (self.current_estimated_kv_pages(), self.kv_page_budget())
+                        {
+                            if used_pages > page_budget {
+                                self.stats
+                                    .total_page_budget_denials
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                         // Attempt eviction before deferring.
                         self.evict_if_needed();
 
@@ -400,12 +440,19 @@ impl InferenceEngine {
         } else {
             format!(" | kv_cache: {}{}", format_bytes_engine(self.tracked_kv_bytes), budget_info)
         };
+        let plan_total = snap.total_decode_plan_cache_hits + snap.total_decode_plan_cache_misses;
+        let plan_hit_rate = if plan_total > 0 {
+            snap.total_decode_plan_cache_hits as f64 / plan_total as f64 * 100.0
+        } else {
+            0.0
+        };
         info!(
             "Engine stats | uptime={}s | requests: total={} completed={} cancelled={} failed={} | \
              sequences: active={} waiting={} | \
              tokens: prompt={} completion={} | \
-             kv_swaps={} | \
-             speed: prefill={:.1} tok/s decode={:.1} tok/s{}",
+             kv_swaps={} prefill_chunks={} | \
+             speed: prefill={:.1} tok/s decode={:.1} tok/s | \
+             decode_plan_hit={:.0}% sampling_ms={}{}",
             uptime,
             snap.total_requests,
             snap.completed_requests,
@@ -416,8 +463,11 @@ impl InferenceEngine {
             snap.total_prompt_tokens,
             snap.total_completion_tokens,
             snap.total_kv_swaps,
+            snap.total_prefill_chunks,
             snap.avg_prefill_tokens_per_sec,
             snap.avg_decode_tokens_per_sec,
+            plan_hit_rate,
+            snap.total_sampling_time_us / 1000,
             gpu_info,
         );
     }
@@ -438,7 +488,17 @@ impl InferenceEngine {
                 total += sequence::kv_cache_bytes(&seq.kv_caches);
             }
         }
+        if self.active_batch_decode.is_some() {
+            total += self.model.active_kv_cache_bytes();
+        }
         self.tracked_kv_bytes = total;
+        self.stats
+            .current_tracked_kv_bytes
+            .store(total, Ordering::Relaxed);
+        self.stats.current_estimated_kv_pages.store(
+            self.current_estimated_kv_pages().unwrap_or(0) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     /// KV cache budget **in KV-cache bytes** (not raw GPU bytes).
@@ -499,6 +559,23 @@ impl InferenceEngine {
                 );
             }
             return true;
+        }
+
+        if let (Some(used_pages), Some(page_budget)) =
+            (self.current_estimated_kv_pages(), self.kv_page_budget())
+        {
+            if used_pages > page_budget {
+                let now = Instant::now();
+                if now.duration_since(self.last_mem_warn).as_secs() >= 5 {
+                    self.last_mem_warn = now;
+                    warn!(
+                        used_pages,
+                        page_budget,
+                        "Estimated KV page budget exceeded"
+                    );
+                }
+                return true;
+            }
         }
 
         // Check 2: cuMemGetInfo hard safety (skip during cooldown).
@@ -606,6 +683,80 @@ impl InferenceEngine {
         self.eviction_cooldown = 5;
     }
 
+    fn batch_seq_lens(&self, batch: &[String]) -> Vec<usize> {
+        batch.iter()
+            .map(|id| self.sequences.get(id).map(|seq| seq.start_pos()).unwrap_or(0))
+            .collect()
+    }
+
+    fn can_reuse_active_batch_decode(&self, batch: &[String]) -> bool {
+        self.active_batch_decode
+            .as_ref()
+            .map(|session| session.batch == batch)
+            .unwrap_or(false)
+    }
+
+    fn flush_active_batch_decode_session(&mut self) {
+        let session = match self.active_batch_decode.take() {
+            Some(session) => session,
+            None => return,
+        };
+
+        let seq_lens = self.batch_seq_lens(&session.batch);
+        let t_extract = Instant::now();
+        match self
+            .model
+            .extract_batch_kv_current(&seq_lens, session.batch_width)
+        {
+            Ok(extracted) => {
+                for (i, seq_id) in session.batch.iter().enumerate() {
+                    if let Some(seq) = self.sequences.get_mut(seq_id) {
+                        if let Some(caches) = extracted.get(i) {
+                            seq.kv_caches = caches.clone();
+                        }
+                    }
+                }
+                let extract_us = t_extract.elapsed().as_micros() as u64;
+                self.stats
+                    .total_batch_decode_extract_time_us
+                    .fetch_add(extract_us, Ordering::Relaxed);
+            }
+            Err(e) => {
+                error!(
+                    backend = session.backend_name,
+                    "Failed to flush active batch-decode session: {e}"
+                );
+            }
+        }
+
+        self.model.clear_kv_cache();
+        self.recount_kv_bytes();
+    }
+
+    fn kv_page_budget(&self) -> Option<usize> {
+        let budget = self.kv_budget_bytes();
+        if budget == u64::MAX {
+            return None;
+        }
+        let cfg = self.model.paged_kv_config()?;
+        let page_bytes = cfg.total_page_size_bytes();
+        if page_bytes == 0 {
+            None
+        } else {
+            Some((budget / page_bytes) as usize)
+        }
+    }
+
+    fn current_estimated_kv_pages(&self) -> Option<usize> {
+        let cfg = self.model.paged_kv_config()?;
+        Some(
+            self.sequences
+                .values()
+                .map(|seq| cfg.pages_for_tokens(seq.start_pos()))
+                .sum(),
+        )
+    }
+
     /// Effective max_tokens for a request, taking server-level max_seq_len into account.
     fn effective_max_tokens(&self, prompt_len: usize, requested_max_tokens: usize) -> usize {
         if self.memory_config.max_seq_len == 0 {
@@ -673,6 +824,7 @@ impl InferenceEngine {
             status: SequenceStatus::Waiting,
             tokens: req.tokens,
             prompt_len,
+            prefill_cursor: 0,
             kv_caches: vec![None; self.num_layers],
             logits_processor: candle_transformers::generation::LogitsProcessor::new(
                 sampling::rand_seed(),
@@ -742,14 +894,25 @@ impl InferenceEngine {
     fn step_prefill(&mut self, seq_id: String) {
         let t0 = Instant::now();
 
+        self.flush_active_batch_decode_session();
         self.swap_in(&seq_id);
 
-        let (input_ids, start_pos) = {
+        let (input_ids, start_pos, chunk_len, remaining_prompt_tokens) = {
             let seq = self.sequences.get(&seq_id).unwrap();
-            (seq.next_input_ids().to_vec(), seq.start_pos())
+            let chunk = if self.prefill_chunk_size == usize::MAX {
+                seq.next_input_ids().to_vec()
+            } else {
+                seq.next_prefill_chunk(self.prefill_chunk_size).to_vec()
+            };
+            let chunk_len = chunk.len();
+            let remaining = seq.remaining_prompt_tokens().saturating_sub(chunk_len);
+            (chunk, seq.start_pos(), chunk_len, remaining)
         };
 
-        let prompt_len = input_ids.len();
+        if input_ids.is_empty() {
+            self.send_error(&seq_id, "Prefill chunk is empty");
+            return;
+        }
 
         let logits = match self.model.forward_step(&input_ids, start_pos) {
             Ok(l) => l,
@@ -759,6 +922,41 @@ impl InferenceEngine {
             }
         };
 
+        let prefill_us = t0.elapsed().as_micros() as u64;
+        self.stats
+            .total_prefill_time_us
+            .fetch_add(prefill_us, Ordering::Relaxed);
+        self.stats
+            .total_prefill_chunks
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .total_prefill_chunk_time_us
+            .fetch_add(prefill_us, Ordering::Relaxed);
+
+        {
+            let seq = self.sequences.get_mut(&seq_id).unwrap();
+            seq.advance_prefill_cursor(chunk_len);
+        }
+
+        if self
+            .sequences
+            .get(&seq_id)
+            .map(|seq| !seq.is_prefill_complete())
+            .unwrap_or(false)
+        {
+            debug!(
+                id = %seq_id,
+                chunk_len,
+                remaining_prompt_tokens,
+                prefill_ms = prefill_us / 1000,
+                "Prefill chunk complete",
+            );
+            self.recount_kv_bytes();
+            self.scheduler.requeue_waiting_front(seq_id);
+            return;
+        }
+
+        let t_sampling = Instant::now();
         let next_token = {
             let seq = self.sequences.get_mut(&seq_id).unwrap();
             match sampling::sample(&seq_id, seq, &logits, &mut self.sampling_buffers) {
@@ -769,16 +967,20 @@ impl InferenceEngine {
                 }
             }
         };
+        let sampling_us = t_sampling.elapsed().as_micros() as u64;
+        self.stats
+            .total_sampling_time_us
+            .fetch_add(sampling_us, Ordering::Relaxed);
 
         self.swap_out(&seq_id);
 
-        let prefill_us = t0.elapsed().as_micros() as u64;
-        self.stats
-            .total_prefill_time_us
-            .fetch_add(prefill_us, Ordering::Relaxed);
-
+        let prompt_len = self
+            .sequences
+            .get(&seq_id)
+            .map(|seq| seq.prompt_len)
+            .unwrap_or(chunk_len);
         let prefill_tok_s = if prefill_us > 0 {
-            (prompt_len as f64) / (prefill_us as f64 / 1_000_000.0)
+            (chunk_len as f64) / (prefill_us as f64 / 1_000_000.0)
         } else {
             0.0
         };
@@ -792,6 +994,7 @@ impl InferenceEngine {
         info!(
             id = %seq_id,
             prompt_len,
+            final_chunk_len = chunk_len,
             prefill_ms = prefill_us / 1000,
             prefill_tok_s = format!("{:.1}", prefill_tok_s),
             "Prefill complete, first token generated",
@@ -818,6 +1021,10 @@ impl InferenceEngine {
     fn step_decode_batch(&mut self, batch: Vec<String>) {
         let t0 = Instant::now();
 
+        if self.active_batch_decode.is_some() && !self.can_reuse_active_batch_decode(&batch) {
+            self.flush_active_batch_decode_session();
+        }
+
         // Filter cancelled sequences.
         let cancelled: Vec<String> = batch
             .iter()
@@ -842,31 +1049,38 @@ impl InferenceEngine {
         }
 
         let batch_size = batch.len();
+        let reuse_session = self.can_reuse_active_batch_decode(&batch);
+        let mut kv_lens = self.batch_seq_lens(&batch);
+        let mut original_max_kv = kv_lens.iter().copied().max().unwrap_or(0);
 
-        // Flush model's internal KV cache state.
-        if let Some(ref prev_id) = self.active_seq_id.take() {
-            if self.sequences.contains_key(prev_id) {
-                let caches = self.model.get_kv_caches();
-                if let Some(seq) = self.sequences.get_mut(prev_id) {
-                    seq.kv_caches = caches;
+        let setup_start = Instant::now();
+        if !reuse_session {
+            // Flush model's single-sequence KV cache state before switching to
+            // a batched decode session.
+            if let Some(ref prev_id) = self.active_seq_id.take() {
+                if self.sequences.contains_key(prev_id) {
+                    let caches = self.model.get_kv_caches();
+                    if let Some(seq) = self.sequences.get_mut(prev_id) {
+                        seq.kv_caches = caches;
+                    }
                 }
+                self.model.clear_kv_cache();
             }
-            self.model.clear_kv_cache();
-        }
-        self.recount_kv_bytes();
+            self.recount_kv_bytes();
 
-        // Collect KV caches and setup batched decode.
-        let kv_caches: Vec<Vec<Option<(Tensor, Tensor)>>> = batch
-            .iter()
-            .map(|id| self.sequences.get(id).unwrap().kv_caches.clone())
-            .collect();
+            let kv_caches: Vec<Vec<Option<(Tensor, Tensor)>>> = batch
+                .iter()
+                .map(|id| self.sequences.get(id).unwrap().kv_caches.clone())
+                .collect();
 
-        let (kv_lens, original_max_kv) =
             match self
                 .model
                 .setup_batch_decode(&kv_caches, self.decode_tokens_per_seq)
             {
-                Ok(r) => r,
+                Ok((setup_lens, setup_max_kv)) => {
+                    kv_lens = setup_lens;
+                    original_max_kv = setup_max_kv;
+                }
                 Err(e) => {
                     error!("Batch decode setup failed: {e}");
                     for seq_id in &batch {
@@ -875,23 +1089,64 @@ impl InferenceEngine {
                     return;
                 }
             };
-        drop(kv_caches);
+            drop(kv_caches);
 
-        // Now that setup_batch_decode has consumed the KV views (building its
-        // own padded buffer), drop the per-sequence cache references.  With
-        // zero-copy narrow views from get_kv_caches(), these still pin the
-        // old pre-allocated buffers — clearing them here lets CUDA free that
-        // VRAM before the decode loop allocates intermediates.
-        for seq_id in &batch {
-            if let Some(seq) = self.sequences.get_mut(seq_id) {
-                seq.kv_caches = vec![None; self.num_layers];
+            // setup_batch_decode has consumed the existing per-sequence caches.
+            // Drop the stale references so the model-owned batched cache is the
+            // only live copy until we explicitly flush the session.
+            for seq_id in &batch {
+                if let Some(seq) = self.sequences.get_mut(seq_id) {
+                    seq.kv_caches = vec![None; self.num_layers];
+                }
             }
         }
+        let setup_us = setup_start.elapsed().as_micros() as u64;
+        if !reuse_session {
+            self.stats
+                .total_batch_decode_setup_time_us
+                .fetch_add(setup_us, Ordering::Relaxed);
+        }
 
-        let t_setup = t0.elapsed();
+        let plan_start = Instant::now();
+        let mut plan = match self
+            .model
+            .plan_batch_decode(&kv_lens, self.decode_tokens_per_seq)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                error!("Batch decode plan failed: {e}");
+                self.active_batch_decode = Some(ActiveBatchDecodeSession {
+                    batch: batch.clone(),
+                    batch_width: original_max_kv,
+                    plan: None,
+                    backend_name: self.model.decode_backend_name(),
+                });
+                self.flush_active_batch_decode_session();
+                for seq_id in &batch {
+                    self.send_error(seq_id, &format!("Batch decode plan failed: {e}"));
+                }
+                return;
+            }
+        };
+        let plan_us = plan_start.elapsed().as_micros() as u64;
+        self.stats
+            .total_decode_plan_time_us
+            .fetch_add(plan_us, Ordering::Relaxed);
+        if let Some(ref decode_plan) = plan {
+            self.stats
+                .total_h2d_metadata_bytes
+                .fetch_add(decode_plan.metadata.h2d_metadata_bytes(), Ordering::Relaxed);
+            let counter = if decode_plan.plan_cache_hit {
+                &self.stats.total_decode_plan_cache_hits
+            } else {
+                &self.stats.total_decode_plan_cache_misses
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
 
         // Pre-build attention mask.
         let max_total_width = original_max_kv + self.decode_tokens_per_seq;
+        let mask_start = Instant::now();
         let full_mask = match self.model.build_batch_decode_mask(
             &kv_lens,
             original_max_kv,
@@ -900,10 +1155,20 @@ impl InferenceEngine {
             Ok(m) => m,
             Err(e) => {
                 error!("Mask build failed: {e}");
-                self.model.clear_kv_cache();
+                self.active_batch_decode = Some(ActiveBatchDecodeSession {
+                    batch: batch.clone(),
+                    batch_width: original_max_kv,
+                    plan: plan.clone(),
+                    backend_name: self.model.decode_backend_name(),
+                });
+                self.flush_active_batch_decode_session();
                 return;
             }
         };
+        let mask_us = mask_start.elapsed().as_micros() as u64;
+        self.stats
+            .total_batch_decode_mask_time_us
+            .fetch_add(mask_us, Ordering::Relaxed);
 
         // Multi-round decode loop with lazy eviction.
         let mut total_tokens_this_step = 0u64;
@@ -957,22 +1222,59 @@ impl InferenceEngine {
                 None => None,
             };
 
-            let logits = match self.model.step_batch_decode(
-                &input_ids,
-                &positions,
-                mask_for_round.as_ref(),
-                Some((&kv_lens, original_max_kv)),
-            ) {
-                Ok(l) => l,
-                Err(e) => {
-                    error!("Batched decode forward failed (round {round}): {e}");
-                    for (i, seq_id) in batch.iter().enumerate() {
-                        if alive[i] {
-                            self.send_error(seq_id, &format!("Batched decode failed: {e}"));
+            let logits = if let Some(ref decode_plan) = plan {
+                match self.model.run_planned_batch_decode(
+                    decode_plan,
+                    &input_ids,
+                    &positions,
+                    mask_for_round.as_ref(),
+                    Some((&kv_lens, original_max_kv)),
+                ) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        error!("Planned batch decode forward failed (round {round}): {e}");
+                        self.active_batch_decode = Some(ActiveBatchDecodeSession {
+                            batch: batch.clone(),
+                            batch_width: original_max_kv,
+                            plan: plan.clone(),
+                            backend_name: self.model.decode_backend_name(),
+                        });
+                        self.flush_active_batch_decode_session();
+                        for (i, seq_id) in batch.iter().enumerate() {
+                            if alive[i] {
+                                self.send_error(
+                                    seq_id,
+                                    &format!("Planned batch decode failed: {e}"),
+                                );
+                            }
                         }
+                        return;
                     }
-                    self.model.clear_kv_cache();
-                    return;
+                }
+            } else {
+                match self.model.step_batch_decode(
+                    &input_ids,
+                    &positions,
+                    mask_for_round.as_ref(),
+                    Some((&kv_lens, original_max_kv)),
+                ) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        error!("Batched decode forward failed (round {round}): {e}");
+                        self.active_batch_decode = Some(ActiveBatchDecodeSession {
+                            batch: batch.clone(),
+                            batch_width: original_max_kv,
+                            plan: plan.clone(),
+                            backend_name: self.model.decode_backend_name(),
+                        });
+                        self.flush_active_batch_decode_session();
+                        for (i, seq_id) in batch.iter().enumerate() {
+                            if alive[i] {
+                                self.send_error(seq_id, &format!("Batched decode failed: {e}"));
+                            }
+                        }
+                        return;
+                    }
                 }
             };
 
@@ -992,6 +1294,7 @@ impl InferenceEngine {
                     }
                 };
 
+                let t_sampling = Instant::now();
                 let next_token = {
                     let seq = self.sequences.get_mut(seq_id).unwrap();
                     match sampling::sample(seq_id, seq, &seq_logits, &mut self.sampling_buffers) {
@@ -1003,6 +1306,9 @@ impl InferenceEngine {
                         }
                     }
                 };
+                self.stats
+                    .total_sampling_time_us
+                    .fetch_add(t_sampling.elapsed().as_micros() as u64, Ordering::Relaxed);
 
                 if let Some(seq) = self.sequences.get_mut(seq_id) {
                     seq.tokens.push(next_token);
@@ -1033,31 +1339,28 @@ impl InferenceEngine {
             }
         }
 
-        // Extract per-sequence KV caches.
-        if rounds_done > 0 {
-            match self
-                .model
-                .extract_batch_kv(&kv_lens, original_max_kv, rounds_done)
-            {
-                Ok(extracted) => {
-                    for (i, seq_id) in batch.iter().enumerate() {
-                        if alive[i] {
-                            if let Some(seq) = self.sequences.get_mut(seq_id) {
-                                if i < extracted.len() {
-                                    seq.kv_caches = extracted[i].clone();
-                                }
-                            }
-                        }
-                    }
-                    // KV caches changed for multiple sequences — recount.
-                    self.recount_kv_bytes();
-                }
-                Err(e) => {
-                    error!("Final KV extraction failed: {e}");
-                    self.model.clear_kv_cache();
-                    self.recount_kv_bytes();
-                }
-            }
+        let current_seq_lens = self.batch_seq_lens(&batch);
+        let current_batch_width = current_seq_lens.iter().copied().max().unwrap_or(0);
+        let keep_session =
+            rounds_done > 0 && pending_finish.is_empty() && pending_cancel.is_empty();
+
+        if keep_session {
+            self.active_batch_decode = Some(ActiveBatchDecodeSession {
+                batch: batch.clone(),
+                batch_width: current_batch_width,
+                plan,
+                backend_name: self.model.decode_backend_name(),
+            });
+            self.active_seq_id = None;
+            self.recount_kv_bytes();
+        } else if rounds_done > 0 {
+            self.active_batch_decode = Some(ActiveBatchDecodeSession {
+                batch: batch.clone(),
+                batch_width: current_batch_width,
+                plan,
+                backend_name: self.model.decode_backend_name(),
+            });
+            self.flush_active_batch_decode_session();
         }
 
         for id in &pending_finish {
@@ -1081,10 +1384,14 @@ impl InferenceEngine {
             };
             debug!(
                 batch_size,
+                backend = self.model.decode_backend_name(),
+                reuse_session,
                 tokens = total_tokens_this_step,
                 rounds = rounds_done,
                 finished = pending_finish.len(),
-                setup_ms = t_setup.as_millis() as u64,
+                setup_ms = setup_us / 1000,
+                plan_ms = plan_us / 1000,
+                mask_ms = mask_us / 1000,
                 decode_ms = decode_us / 1000,
                 tok_s = format!("{:.1}", tok_s),
                 "Batched decode step complete",
@@ -1103,6 +1410,7 @@ impl InferenceEngine {
     fn step_decode_sequential(&mut self, batch: Vec<String>) {
         let t0 = Instant::now();
         let mut total_tokens: u64 = 0;
+        self.flush_active_batch_decode_session();
 
         for seq_id in &batch {
             if self
@@ -1136,6 +1444,7 @@ impl InferenceEngine {
                     }
                 };
 
+                let t_sampling = Instant::now();
                 let next_token = {
                     let seq = self.sequences.get_mut(seq_id).unwrap();
                     match sampling::sample(seq_id, seq, &logits, &mut self.sampling_buffers) {
@@ -1146,6 +1455,9 @@ impl InferenceEngine {
                         }
                     }
                 };
+                self.stats
+                    .total_sampling_time_us
+                    .fetch_add(t_sampling.elapsed().as_micros() as u64, Ordering::Relaxed);
 
                 if let Some(seq) = self.sequences.get_mut(seq_id) {
                     seq.tokens.push(next_token);
@@ -1362,6 +1674,15 @@ impl InferenceEngine {
     }
 
     fn cleanup_sequence(&mut self, seq_id: &str) {
+        if self
+            .active_batch_decode
+            .as_ref()
+            .map(|session| session.batch.iter().any(|id| id == seq_id))
+            .unwrap_or(false)
+        {
+            self.flush_active_batch_decode_session();
+        }
+
         // Subtract this sequence's KV bytes from the tracked total.
         // If active, bytes are in the model (not in seq.kv_caches).
         let freed = if self.active_seq_id.as_deref() == Some(seq_id) {
@@ -1380,7 +1701,9 @@ impl InferenceEngine {
         if self.active_seq_id.as_deref() == Some(seq_id) {
             self.active_seq_id = None;
         }
-        self.model.clear_kv_cache();
+        if self.active_batch_decode.is_none() {
+            self.model.clear_kv_cache();
+        }
 
         // Only lift the eviction cap when the system has drained all
         // waiting sequences. Under sustained load, keeping the cap prevents
@@ -1397,6 +1720,7 @@ impl InferenceEngine {
             self.scheduler.effective_max_running = None;
         }
 
+        self.recount_kv_bytes();
         debug!(id = %seq_id, "Sequence cleaned up");
     }
 }

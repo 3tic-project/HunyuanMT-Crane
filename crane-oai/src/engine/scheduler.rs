@@ -34,6 +34,11 @@ pub struct Scheduler {
     /// exceed the KV budget again. Reset to `None` when a sequence finishes
     /// naturally, allowing the system to try admitting more.
     pub effective_max_running: Option<usize>,
+    /// When enabled, alternate prefill and decode whenever both waiting and
+    /// running queues are non-empty, so long prompts do not starve decode.
+    chunked_prefill_mode: bool,
+    /// Toggles the next preference when chunked prefill mode is active.
+    prefer_decode_next: bool,
 }
 
 impl Scheduler {
@@ -43,12 +48,26 @@ impl Scheduler {
             running: VecDeque::new(),
             max_running,
             effective_max_running: None,
+            chunked_prefill_mode: false,
+            prefer_decode_next: false,
+        }
+    }
+
+    pub fn set_chunked_prefill_mode(&mut self, enabled: bool) {
+        self.chunked_prefill_mode = enabled;
+        if !enabled {
+            self.prefer_decode_next = false;
         }
     }
 
     /// Add a new sequence to the waiting queue.
     pub fn add(&mut self, seq_id: String) {
         self.waiting.push_back(seq_id);
+    }
+
+    /// Requeue a partially-prefilled sequence at the front of the waiting queue.
+    pub fn requeue_waiting_front(&mut self, seq_id: String) {
+        self.waiting.push_front(seq_id);
     }
 
     /// Remove a sequence from all queues (on completion or error).
@@ -64,10 +83,31 @@ impl Scheduler {
     /// Prioritizes prefilling waiting sequences up to `max_running` (or `effective_max_running`)
     /// to build up the batch size for efficient decoding.
     pub fn schedule(&mut self) -> Option<SchedulerOutput> {
-        // Priority 1: Prefill a waiting sequence if there's capacity.
         let max = self.effective_max_running.unwrap_or(self.max_running);
+        let has_prefill_capacity = !self.waiting.is_empty() && self.running.len() < max;
+        let can_decode = !self.running.is_empty();
+
+        if self.chunked_prefill_mode && has_prefill_capacity && can_decode {
+            if self.prefer_decode_next {
+                self.prefer_decode_next = false;
+                let batch: Vec<String> = self.running.iter().cloned().collect();
+                return Some(SchedulerOutput {
+                    batch,
+                    is_prefill: false,
+                });
+            }
+            self.prefer_decode_next = true;
+            let seq_id = self.waiting.pop_front().unwrap();
+            return Some(SchedulerOutput {
+                batch: vec![seq_id],
+                is_prefill: true,
+            });
+        }
+
+        // Priority 1: Prefill a waiting sequence if there's capacity.
         if !self.waiting.is_empty() && self.running.len() < max {
             let seq_id = self.waiting.pop_front().unwrap();
+            self.prefer_decode_next = self.chunked_prefill_mode && !self.running.is_empty();
             return Some(SchedulerOutput {
                 batch: vec![seq_id],
                 is_prefill: true,
@@ -76,6 +116,7 @@ impl Scheduler {
 
         // Priority 2: Decode all running sequences.
         if !self.running.is_empty() {
+            self.prefer_decode_next = false;
             let batch: Vec<String> = self.running.iter().cloned().collect();
             return Some(SchedulerOutput {
                 batch,
@@ -87,6 +128,7 @@ impl Scheduler {
         // (This happens if max is 0, which shouldn't normally happen, but just in case).
         if !self.waiting.is_empty() {
             let seq_id = self.waiting.pop_front().unwrap();
+            self.prefer_decode_next = false;
             return Some(SchedulerOutput {
                 batch: vec![seq_id],
                 is_prefill: true,
@@ -244,6 +286,33 @@ mod tests {
     fn schedule_none_when_empty() {
         let mut s = Scheduler::new(4);
         assert!(s.schedule().is_none());
+    }
+
+    #[test]
+    fn chunked_prefill_mode_alternates_with_decode() {
+        let mut s = Scheduler::new(4);
+        s.set_chunked_prefill_mode(true);
+        s.promote_to_running("run-1".into());
+        s.add("wait-1".into());
+
+        let first = s.schedule().unwrap();
+        assert!(first.is_prefill);
+        assert_eq!(first.batch, vec!["wait-1".to_string()]);
+
+        // Requeue the partially-prefilled request to simulate another chunk.
+        s.requeue_waiting_front("wait-1".into());
+        let second = s.schedule().unwrap();
+        assert!(!second.is_prefill);
+        assert_eq!(second.batch, vec!["run-1".to_string()]);
+    }
+
+    #[test]
+    fn requeue_waiting_front_preserves_priority() {
+        let mut s = Scheduler::new(4);
+        s.add("b".into());
+        s.requeue_waiting_front("a".into());
+        let out = s.schedule().unwrap();
+        assert_eq!(out.batch, vec!["a".to_string()]);
     }
 
     #[test]

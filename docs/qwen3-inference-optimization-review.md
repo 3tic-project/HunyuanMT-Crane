@@ -713,6 +713,23 @@ Crane 已经有：
 - batch serving 固定成本明显下降
 - 后续 prefix cache / KV quant / backend 扩展有统一基础
 
+### 2026-03-26 当前实现对照
+
+- `paged KV / block table`：
+  - 已落地第一版抽象与 allocator/metadata 测试骨架，代码位于 `crane-core/src/models/qwen3/paged_kv.rs`
+  - 目前先锁 ABI 与 page/bucket 语义，真实 page-store 与 page-write kernel 仍待远端 CUDA 验证
+- `backend-native metadata ABI`：
+  - 已固定 `paged_kv_indptr / paged_kv_indices / paged_kv_last_page_len / block_tables`
+- `plan / run / workspace` 风格 decode backend：
+  - 已在 Rust 层建好 `Qwen3DecodeBackend` 与 `DecodeBackendPlan`
+  - engine 已切换到 `plan_batch_decode + run_planned_batch_decode` 生命周期
+- `去掉每轮 extract→pad→stack→extract`：
+  - 已通过 active batch session 复用大幅减少主循环中的 setup/extract 频率
+  - 当前仍是过渡实现，batch 变化或 session flush 时仍会回到旧式 batched KV 提取
+- `decode bucket + graph 基础设施`：
+  - bucket key、plan cache hit 统计和 metadata 统计已具备
+  - CUDA Graph 仍未正式接入，需要远端服务器继续 capture 验证
+
 ---
 
 ## 8.2 第二阶段：补齐高价值功能

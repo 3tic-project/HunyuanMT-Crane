@@ -248,6 +248,23 @@ Qwen3 serving 下，KV cache 不能再被看成“每个请求一对 K/V tensor�
 
 这是后续所有 phase 的前置条件。
 
+### 2026-03-26 当前实现状态
+
+- 已新增 `scripts/benchmark_qwen3_serving.py`，可直接对 `crane-oai` 的 `/v1/chat/completions` 与 `/v1/stats` 跑固定 workload。
+- `EngineStats` 已补充 `prefill/decode/setup/extract/mask/plan/sampling/H2D metadata/page-budget` 相关计数。
+- `EngineStats` 现可暴露 `current_tracked_kv_bytes` 与 `current_estimated_kv_pages`，便于 Phase 0 持续采样。
+- 远端 CUDA 环境下建议配合 `nvidia-smi` 轮询使用；benchmark 脚本已经内置可选显存采样。
+
+示例：
+
+```bash
+python3 scripts/benchmark_qwen3_serving.py \
+  --base-url http://127.0.0.1:8080 \
+  --model Qwen3-1.7B-Instruct \
+  --workload w1 --workload w3 --workload w4 --workload w7 \
+  --json-out /tmp/qwen3-bench.json
+```
+
 ---
 
 ## 6.2 Phase 1：先去掉现有路径中的明显结构性浪费
@@ -284,6 +301,13 @@ Qwen3 serving 下，KV cache 不能再被看成“每个请求一对 K/V tensor�
 ### 是否必须完成
 
 不是最终决定性 phase，但非常建议先做，否则后续难定位收益归因。
+
+### 2026-03-26 当前实现状态
+
+- Qwen3 prefill / decode 已在 engine 层显式分家，并支持 `prefill_chunk_size` 驱动的 chunked prefill。
+- batch decode 热路径已引入 active session 复用，避免每个 scheduling round 都做 `extract -> pad/stack -> decode -> extract`。
+- sampling 时间已进入 engine 细粒度统计；现有 GPU fast path 继续保留 `gpu_argmax / topk / gumbel-max / repetition penalty`。
+- `FusedAddRmsNorm` 仍未真正进入 Qwen3 热路径，现阶段保留为 Candle 能力限制下的待验证点，需要远端 CUDA profiling 后再继续推进。
 
 ---
 
@@ -396,6 +420,17 @@ paged KV 一旦基本跑通，就建议尽快做一个小范围 spike：
 - 这是最具破坏性的重构
 - 很可能需要先在 Qwen3 上独立走一条 backend trait 分支
 
+### 2026-03-26 当前实现状态
+
+- 已新增 `crane-core/src/models/qwen3/paged_kv.rs`，定义 `PagedKvConfig / PagedAttentionMetadata / DecodeBucketKey / KvPageAllocator / SeqBlockTable / PagedKvPool`。
+- backend-native metadata ABI 第一版已锁定为：
+  - `paged_kv_indptr`
+  - `paged_kv_indices`
+  - `paged_kv_last_page_len`
+  - `block_tables`
+- engine 已接入 page-budget admission 的估算与统计，但底层 KV 存储仍是过渡态，还没有完全切到真实 paged page-store。
+- 当前实现的目标是先把 metadata、allocator 语义和服务生命周期钉住，为后续远端 CUDA page-write kernel 留稳定接口。
+
 ---
 
 ## 6.4 Phase 3：Qwen3 专用 decode attention backend
@@ -474,6 +509,13 @@ paged KV 一旦基本跑通，就建议尽快做一个小范围 spike：
 
 - Qwen3 模型层和 backend 之间的职责边界需要重划
 - 一开始可能会导致代码非常不“优雅”，这是可接受的
+
+### 2026-03-26 当前实现状态
+
+- 已新增 `crane-core/src/models/qwen3/decode_backend.rs`，定义 `Qwen3DecodeBackend` 与 `DecodeBackendPlan`。
+- `crane-oai` 的 batch decode 已切到 `plan -> run` 风格接口，decode plan cache hit、H2D metadata bytes 均可统计。
+- 当前默认 backend 仍是 `TensorDecodeBackend`，它的职责是先把高性能 decode backend 的 ABI、bucket 语义、engine 生命周期跑通。
+- FlashInfer / 自定义 CUDA backend / CUDA Graph 仍需在远端服务器继续接线与 profiling；现阶段代码已为后续 backend 替换留出接口。
 
 ---
 

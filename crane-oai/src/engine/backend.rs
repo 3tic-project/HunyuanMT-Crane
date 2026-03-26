@@ -13,6 +13,8 @@
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
+use crane_core::models::qwen3::decode_backend::DecodeBackendPlan;
+use crane_core::models::qwen3::paged_kv::{PagedAttentionMetadata, PagedKvConfig};
 
 // ─────────────────────────────────────────────────────────────
 //  Trait
@@ -120,6 +122,56 @@ pub trait ModelBackend: Send + 'static {
         _max_total_width: usize,
     ) -> candle_core::Result<Option<Tensor>> {
         candle_core::bail!("Batch decode not supported by this backend")
+    }
+
+    /// Human-readable name of the decode backend used by the model.
+    fn decode_backend_name(&self) -> &'static str {
+        "legacy"
+    }
+
+    /// Paged-KV configuration exposed by the backend, if available.
+    fn paged_kv_config(&self) -> Option<PagedKvConfig> {
+        None
+    }
+
+    /// Build backend-native decode metadata from per-sequence KV lengths.
+    fn build_paged_attention_metadata(
+        &self,
+        _seq_lens: &[usize],
+    ) -> Option<PagedAttentionMetadata> {
+        None
+    }
+
+    /// Plan a batch-decode run for backends with explicit plan/run semantics.
+    fn plan_batch_decode(
+        &mut self,
+        _seq_lens: &[usize],
+        _decode_tokens_per_seq: usize,
+    ) -> candle_core::Result<Option<DecodeBackendPlan>> {
+        Ok(None)
+    }
+
+    /// Execute a batch-decode step using a previously built plan.
+    fn run_planned_batch_decode(
+        &mut self,
+        plan: &DecodeBackendPlan,
+        input_ids: &Tensor,
+        positions: &[usize],
+        attention_mask: Option<&Tensor>,
+        batch_kv_info: Option<(&[usize], usize)>,
+    ) -> candle_core::Result<Tensor> {
+        let _ = plan;
+        self.step_batch_decode(input_ids, positions, attention_mask, batch_kv_info)
+    }
+
+    /// Extract per-sequence KV caches from the current batched cache state
+    /// using the already-updated sequence lengths.
+    fn extract_batch_kv_current(
+        &mut self,
+        _seq_lens: &[usize],
+        _batch_width: usize,
+    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        candle_core::bail!("Current batch extraction not supported by this backend")
     }
 }
 
@@ -246,6 +298,7 @@ impl ModelBackend for HunyuanBackend {
             self.dtype(),
         )
     }
+
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -436,5 +489,55 @@ impl ModelBackend for Qwen3Backend {
             self.device(),
             self.dtype(),
         )
+    }
+
+    fn decode_backend_name(&self) -> &'static str {
+        self.model.decode_backend_name()
+    }
+
+    fn paged_kv_config(&self) -> Option<PagedKvConfig> {
+        Some(self.model.paged_kv_config())
+    }
+
+    fn build_paged_attention_metadata(
+        &self,
+        seq_lens: &[usize],
+    ) -> Option<PagedAttentionMetadata> {
+        Some(self.model.build_paged_attention_metadata(seq_lens))
+    }
+
+    fn plan_batch_decode(
+        &mut self,
+        seq_lens: &[usize],
+        decode_tokens_per_seq: usize,
+    ) -> candle_core::Result<Option<DecodeBackendPlan>> {
+        self.model
+            .plan_batch_decode(seq_lens, decode_tokens_per_seq)
+            .map(Some)
+    }
+
+    fn run_planned_batch_decode(
+        &mut self,
+        plan: &DecodeBackendPlan,
+        input_ids: &Tensor,
+        positions: &[usize],
+        attention_mask: Option<&Tensor>,
+        batch_kv_info: Option<(&[usize], usize)>,
+    ) -> candle_core::Result<Tensor> {
+        self.model.run_planned_batch_decode(
+            plan,
+            input_ids,
+            positions,
+            attention_mask,
+            batch_kv_info,
+        )
+    }
+
+    fn extract_batch_kv_current(
+        &mut self,
+        seq_lens: &[usize],
+        batch_width: usize,
+    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        self.model.extract_batch_kv_current(seq_lens, batch_width)
     }
 }

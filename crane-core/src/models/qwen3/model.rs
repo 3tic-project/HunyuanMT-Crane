@@ -13,7 +13,11 @@ use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
 
+use super::decode_backend::{
+    DecodeBackendPlan, Qwen3DecodeBackend, TensorDecodeBackend, DEFAULT_KV_PAGE_SIZE,
+};
 use super::modeling::{Config, Qwen3Model};
+use super::paged_kv::{PagedAttentionMetadata, PagedKvConfig};
 use crate::generation::based::ModelForCausalLM;
 use crate::generation::GenerationConfig;
 use crate::utils::token_output_stream::TokenOutputStream;
@@ -35,6 +39,8 @@ pub struct Model {
     pub device: Device,
     pub dtype: DType,
     inner: Qwen3Model,
+    decode_backend: Box<dyn Qwen3DecodeBackend>,
+    kv_page_size: usize,
 }
 
 impl Model {
@@ -99,6 +105,8 @@ impl Model {
             device: device.clone(),
             dtype: *dtype,
             inner,
+            decode_backend: Box::<TensorDecodeBackend>::default(),
+            kv_page_size: DEFAULT_KV_PAGE_SIZE,
         })
     }
 
@@ -149,6 +157,8 @@ impl Model {
             device: device.clone(),
             dtype,
             inner,
+            decode_backend: Box::<TensorDecodeBackend>::default(),
+            kv_page_size: DEFAULT_KV_PAGE_SIZE,
         })
     }
 
@@ -227,6 +237,49 @@ impl Model {
             .step_batch_decode(input_ids, positions, attention_mask, batch_kv_info)
     }
 
+    pub fn decode_backend_name(&self) -> &'static str {
+        self.decode_backend.name()
+    }
+
+    pub fn paged_kv_config(&self) -> PagedKvConfig {
+        self.inner.paged_kv_config(self.kv_page_size)
+    }
+
+    pub fn build_paged_attention_metadata(
+        &self,
+        seq_lens: &[usize],
+    ) -> PagedAttentionMetadata {
+        self.inner
+            .build_paged_attention_metadata(seq_lens, self.kv_page_size)
+    }
+
+    pub fn plan_batch_decode(
+        &mut self,
+        seq_lens: &[usize],
+        decode_tokens_per_seq: usize,
+    ) -> candle_core::Result<DecodeBackendPlan> {
+        let metadata = self.build_paged_attention_metadata(seq_lens);
+        self.decode_backend.plan(&metadata, decode_tokens_per_seq)
+    }
+
+    pub fn run_planned_batch_decode(
+        &mut self,
+        plan: &DecodeBackendPlan,
+        input_ids: &Tensor,
+        positions: &[usize],
+        attention_mask: Option<&Tensor>,
+        batch_kv_info: Option<(&[usize], usize)>,
+    ) -> candle_core::Result<Tensor> {
+        self.decode_backend.run(
+            &mut self.inner,
+            input_ids,
+            positions,
+            attention_mask,
+            batch_kv_info,
+            plan,
+        )
+    }
+
     pub fn extract_batch_kv(
         &mut self,
         kv_lens: &[usize],
@@ -235,6 +288,14 @@ impl Model {
     ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
         self.inner
             .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
+    }
+
+    pub fn extract_batch_kv_current(
+        &mut self,
+        seq_lens: &[usize],
+        batch_width: usize,
+    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+        self.inner.extract_batch_kv_by_lengths(seq_lens, batch_width)
     }
 
     pub fn warmup(&mut self) {

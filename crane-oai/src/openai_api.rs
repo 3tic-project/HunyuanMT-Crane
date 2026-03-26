@@ -90,7 +90,7 @@ impl ChatMessage {
 }
 
 /// Chat message content — either a plain string or structured multimodal parts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ChatMessageContent {
     /// Plain text content (backward compatible).
@@ -99,8 +99,26 @@ pub enum ChatMessageContent {
     Parts(Vec<ContentPart>),
 }
 
+impl From<String> for ChatMessageContent {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<&str> for ChatMessageContent {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+impl PartialEq<&str> for ChatMessageContent {
+    fn eq(&self, other: &&str) -> bool {
+        matches!(self, Self::Text(text) if text == other)
+    }
+}
+
 /// A single content part in a multimodal message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ContentPart {
     /// Text content.
@@ -115,7 +133,7 @@ pub enum ContentPart {
 }
 
 /// An image URL reference.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImageUrl {
     pub url: String,
 }

@@ -163,6 +163,7 @@ pub async fn server_info(State(state): State<Arc<AppState>>) -> impl IntoRespons
         port: state.port,
         max_concurrent: state.max_concurrent,
         decode_tokens_per_seq: state.decode_tokens_per_seq,
+        prefill_chunk_size: state.prefill_chunk_size,
         max_seq_len: state.max_seq_len,
         gpu_memory_limit: state.gpu_memory_limit.clone(),
         stats,

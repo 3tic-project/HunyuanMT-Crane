@@ -39,6 +39,8 @@ pub struct Sequence {
     pub tokens: Vec<u32>,
     /// Length of the original prompt (tokens before generation started).
     pub prompt_len: usize,
+    /// Number of prompt tokens already prefetched into the KV cache.
+    pub prefill_cursor: usize,
 
     // ── KV cache (one entry per transformer layer) ──
     /// Saved KV caches when this sequence is not the one loaded in the model.
@@ -81,14 +83,11 @@ impl Sequence {
 
     /// The KV cache covers tokens `0..start_pos` when we do the next forward.
     /// For a fresh sequence, `start_pos = 0`.
-    /// After prefill of N prompt tokens, `start_pos = N`.
+    /// During chunked prefill, `start_pos = prefill_cursor`.
     /// During decode, `start_pos = tokens.len() - 1` (everything except the latest token).
     pub fn start_pos(&self) -> usize {
-        // After prefill the kv_caches cover prompt_len tokens.
-        // During decode each step adds one token, so the cache covers
-        // tokens.len() - 1 positions (the new token hasn't been cached yet).
         if self.status == SequenceStatus::Waiting {
-            0
+            self.prefill_cursor
         } else {
             self.tokens.len().saturating_sub(1)
         }
@@ -97,12 +96,30 @@ impl Sequence {
     /// Tokens to feed into the next forward step.
     pub fn next_input_ids(&self) -> &[u32] {
         if self.status == SequenceStatus::Waiting {
-            // Prefill: feed all prompt tokens.
-            &self.tokens[..self.prompt_len]
+            // Prefill: feed the remaining prompt tokens.
+            &self.tokens[self.prefill_cursor..self.prompt_len]
         } else {
             // Decode: feed only the last generated token.
             &self.tokens[self.tokens.len() - 1..]
         }
+    }
+
+    pub fn remaining_prompt_tokens(&self) -> usize {
+        self.prompt_len.saturating_sub(self.prefill_cursor)
+    }
+
+    pub fn is_prefill_complete(&self) -> bool {
+        self.prefill_cursor >= self.prompt_len
+    }
+
+    pub fn next_prefill_chunk(&self, chunk_size: usize) -> &[u32] {
+        let start = self.prefill_cursor.min(self.prompt_len);
+        let end = (start + chunk_size.max(1)).min(self.prompt_len);
+        &self.tokens[start..end]
+    }
+
+    pub fn advance_prefill_cursor(&mut self, chunk_len: usize) {
+        self.prefill_cursor = (self.prefill_cursor + chunk_len).min(self.prompt_len);
     }
 
     /// Finish reason string for the OpenAI response.
@@ -137,6 +154,7 @@ mod tests {
             status,
             tokens,
             prompt_len: prompt.len(),
+            prefill_cursor: 0,
             kv_caches: vec![],
             logits_processor: LogitsProcessor::new(42, Some(0.8), Some(0.95)),
             temperature: Some(0.8),
@@ -210,6 +228,27 @@ mod tests {
     fn next_input_ids_waiting_returns_prompt() {
         let seq = make_seq(&[1, 2, 3], &[], 10, 0, SequenceStatus::Waiting);
         assert_eq!(seq.next_input_ids(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn next_input_ids_waiting_uses_prefill_cursor() {
+        let mut seq = make_seq(&[1, 2, 3, 4], &[], 10, 0, SequenceStatus::Waiting);
+        seq.prefill_cursor = 2;
+        assert_eq!(seq.start_pos(), 2);
+        assert_eq!(seq.next_input_ids(), &[3, 4]);
+    }
+
+    #[test]
+    fn next_prefill_chunk_respects_chunk_size() {
+        let mut seq = make_seq(&[1, 2, 3, 4, 5], &[], 10, 0, SequenceStatus::Waiting);
+        assert_eq!(seq.next_prefill_chunk(2), &[1, 2]);
+        seq.advance_prefill_cursor(2);
+        assert_eq!(seq.next_prefill_chunk(2), &[3, 4]);
+        seq.advance_prefill_cursor(2);
+        assert_eq!(seq.next_prefill_chunk(2), &[5]);
+        seq.advance_prefill_cursor(10);
+        assert!(seq.is_prefill_complete());
+        assert_eq!(seq.remaining_prompt_tokens(), 0);
     }
 
     #[test]
