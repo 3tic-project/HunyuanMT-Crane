@@ -14,13 +14,17 @@ pub struct SchedulerOutput {
 /// This is tuned for Crane's current tensor-KV path where batch setup/extract
 /// still has non-trivial fixed cost. For short prompts (for example <= 2k),
 /// a small admission delay is usually worth the steadier decode throughput.
-/// We intentionally keep this threshold low so a 4-lane batch can keep
-/// decoding even after shrinking to 3 lanes, which matches the current
-/// Qwen3 1.7B serving target better than "refill immediately on first gap".
+/// The policy is asymmetric on purpose:
+/// - when a stable 4+ lane batch already exists, new waiting requests should
+///   not immediately break it;
+/// - but when the engine is only at 3 lanes, refilling back to 4 is usually
+///   cheap enough that we should not keep deferring prefill for long.
 const DECODE_BURST_STEPS_AFTER_PREFILL: usize = 2;
 const DECODE_BURST_STEPS_ON_QUEUE_PRESSURE: usize = 2;
-const DECODE_BURST_STEPS_AFTER_BATCH_SHRINK: usize = 3;
-const DECODE_BURST_MIN_RUNNING: usize = 3;
+const DECODE_BURST_STEPS_AFTER_BATCH_SHRINK: usize = 1;
+const DECODE_BURST_MIN_RUNNING_AFTER_PREFILL: usize = 4;
+const DECODE_BURST_MIN_RUNNING_ON_QUEUE_PRESSURE: usize = 4;
+const DECODE_BURST_MIN_RUNNING_AFTER_BATCH_SHRINK: usize = 3;
 
 /// Simple FIFO scheduler with prefill-priority batching.
 ///
@@ -80,20 +84,34 @@ impl Scheduler {
         }
     }
 
-    fn arm_decode_burst(&mut self, steps: usize) {
+    fn arm_decode_burst(&mut self, steps: usize, min_running: usize) {
         if self.chunked_prefill_mode
             || self.waiting.is_empty()
-            || self.running.len() < DECODE_BURST_MIN_RUNNING
+            || self.running.len() < min_running
         {
             return;
         }
         self.decode_burst_remaining = self.decode_burst_remaining.max(steps);
     }
 
+    fn reset_decode_burst(&mut self, steps: usize, min_running: usize) {
+        if self.chunked_prefill_mode
+            || self.waiting.is_empty()
+            || self.running.len() < min_running
+        {
+            self.decode_burst_remaining = 0;
+            return;
+        }
+        self.decode_burst_remaining = steps;
+    }
+
     /// Add a new sequence to the waiting queue.
     pub fn add(&mut self, seq_id: String) {
         self.waiting.push_back(seq_id);
-        self.arm_decode_burst(DECODE_BURST_STEPS_ON_QUEUE_PRESSURE);
+        self.arm_decode_burst(
+            DECODE_BURST_STEPS_ON_QUEUE_PRESSURE,
+            DECODE_BURST_MIN_RUNNING_ON_QUEUE_PRESSURE,
+        );
     }
 
     /// Requeue a partially-prefilled sequence at the front of the waiting queue.
@@ -107,7 +125,10 @@ impl Scheduler {
         self.waiting.retain(|id| id != seq_id);
         self.running.retain(|id| id != seq_id);
         if self.running.len() < running_before {
-            self.arm_decode_burst(DECODE_BURST_STEPS_AFTER_BATCH_SHRINK);
+            self.reset_decode_burst(
+                DECODE_BURST_STEPS_AFTER_BATCH_SHRINK,
+                DECODE_BURST_MIN_RUNNING_AFTER_BATCH_SHRINK,
+            );
         }
     }
 
@@ -129,7 +150,6 @@ impl Scheduler {
         if !self.chunked_prefill_mode
             && has_prefill_capacity
             && can_decode
-            && self.running.len() >= DECODE_BURST_MIN_RUNNING
             && self.decode_burst_remaining > 0
         {
             self.decode_burst_remaining -= 1;
@@ -195,7 +215,10 @@ impl Scheduler {
     /// Move a sequence from waiting state to running state (called after prefill).
     pub fn promote_to_running(&mut self, seq_id: String) {
         self.running.push_back(seq_id);
-        self.arm_decode_burst(DECODE_BURST_STEPS_AFTER_PREFILL);
+        self.arm_decode_burst(
+            DECODE_BURST_STEPS_AFTER_PREFILL,
+            DECODE_BURST_MIN_RUNNING_AFTER_PREFILL,
+        );
     }
 
     /// Total active sequences (waiting + running).
@@ -375,6 +398,7 @@ mod tests {
         let mut s = Scheduler::new(8);
         s.promote_to_running("run-1".into());
         s.promote_to_running("run-2".into());
+        s.promote_to_running("run-3".into());
         s.add("wait-1".into());
         s.add("wait-2".into());
 
@@ -390,6 +414,7 @@ mod tests {
             vec![
                 "run-1".to_string(),
                 "run-2".to_string(),
+                "run-3".to_string(),
                 "wait-1".to_string(),
             ]
         );
@@ -401,6 +426,7 @@ mod tests {
             vec![
                 "run-1".to_string(),
                 "run-2".to_string(),
+                "run-3".to_string(),
                 "wait-1".to_string(),
             ]
         );
@@ -464,14 +490,8 @@ mod tests {
         );
 
         let second = s.schedule().unwrap();
-        assert!(!second.is_prefill);
-
-        let third = s.schedule().unwrap();
-        assert!(!third.is_prefill);
-
-        let fourth = s.schedule().unwrap();
-        assert!(fourth.is_prefill);
-        assert_eq!(fourth.batch, vec!["wait-1".to_string()]);
+        assert!(second.is_prefill);
+        assert_eq!(second.batch, vec!["wait-1".to_string()]);
     }
 
     #[test]
@@ -497,14 +517,8 @@ mod tests {
         );
 
         let second = s.schedule().unwrap();
-        assert!(!second.is_prefill);
-
-        let third = s.schedule().unwrap();
-        assert!(!third.is_prefill);
-
-        let fourth = s.schedule().unwrap();
-        assert!(fourth.is_prefill);
-        assert_eq!(fourth.batch, vec!["wait-1".to_string()]);
+        assert!(second.is_prefill);
+        assert_eq!(second.batch, vec!["wait-1".to_string()]);
     }
 
     #[test]
@@ -573,23 +587,13 @@ mod tests {
         assert_eq!(out.batch[0], "c");
         s.promote_to_running("c".into());
 
-        // Step 4: once the running batch reaches 3 lanes, preserve it briefly.
-        let out = s.schedule().unwrap();
-        assert!(!out.is_prefill);
-        assert_eq!(out.batch.len(), 3);
-
-        // Step 5: second decode-burst round.
-        let out = s.schedule().unwrap();
-        assert!(!out.is_prefill);
-        assert_eq!(out.batch.len(), 3);
-
-        // Step 6: now admit "d".
+        // Step 4: at 3 lanes we should refill immediately back toward 4.
         let out = s.schedule().unwrap();
         assert!(out.is_prefill);
         assert_eq!(out.batch[0], "d");
         s.promote_to_running("d".into());
 
-        // Step 7: nothing waiting, running has items → decode.
+        // Step 5: nothing waiting, running has items → decode.
         let out = s.schedule().unwrap();
         assert!(!out.is_prefill);
         assert_eq!(out.batch.len(), 4);
