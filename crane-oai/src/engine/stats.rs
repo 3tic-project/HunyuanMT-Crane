@@ -22,6 +22,8 @@ pub struct EngineStats {
     pub total_sampling_time_us: AtomicU64,
     pub total_decode_plan_cache_hits: AtomicU64,
     pub total_decode_plan_cache_misses: AtomicU64,
+    pub total_decode_plan_reuses: AtomicU64,
+    pub total_decode_workspace_resets: AtomicU64,
     pub total_h2d_metadata_bytes: AtomicU64,
     pub total_page_budget_denials: AtomicU64,
     pub current_tracked_kv_bytes: AtomicU64,
@@ -52,6 +54,8 @@ impl EngineStats {
             total_sampling_time_us: AtomicU64::new(0),
             total_decode_plan_cache_hits: AtomicU64::new(0),
             total_decode_plan_cache_misses: AtomicU64::new(0),
+            total_decode_plan_reuses: AtomicU64::new(0),
+            total_decode_workspace_resets: AtomicU64::new(0),
             total_h2d_metadata_bytes: AtomicU64::new(0),
             total_page_budget_denials: AtomicU64::new(0),
             current_tracked_kv_bytes: AtomicU64::new(0),
@@ -100,11 +104,13 @@ impl EngineStats {
                 .load(Ordering::Relaxed),
             total_decode_plan_time_us: self.total_decode_plan_time_us.load(Ordering::Relaxed),
             total_sampling_time_us: self.total_sampling_time_us.load(Ordering::Relaxed),
-            total_decode_plan_cache_hits: self
-                .total_decode_plan_cache_hits
-                .load(Ordering::Relaxed),
+            total_decode_plan_cache_hits: self.total_decode_plan_cache_hits.load(Ordering::Relaxed),
             total_decode_plan_cache_misses: self
                 .total_decode_plan_cache_misses
+                .load(Ordering::Relaxed),
+            total_decode_plan_reuses: self.total_decode_plan_reuses.load(Ordering::Relaxed),
+            total_decode_workspace_resets: self
+                .total_decode_workspace_resets
                 .load(Ordering::Relaxed),
             total_h2d_metadata_bytes: self.total_h2d_metadata_bytes.load(Ordering::Relaxed),
             total_page_budget_denials: self.total_page_budget_denials.load(Ordering::Relaxed),
@@ -135,6 +141,8 @@ pub struct StatsSnapshot {
     pub total_sampling_time_us: u64,
     pub total_decode_plan_cache_hits: u64,
     pub total_decode_plan_cache_misses: u64,
+    pub total_decode_plan_reuses: u64,
+    pub total_decode_workspace_resets: u64,
     pub total_h2d_metadata_bytes: u64,
     pub total_page_budget_denials: u64,
     pub current_tracked_kv_bytes: u64,
@@ -162,13 +170,21 @@ mod tests {
         assert_eq!(s.total_prefill_chunk_time_us.load(Ordering::Relaxed), 0);
         assert_eq!(s.total_decode_steps.load(Ordering::Relaxed), 0);
         assert_eq!(s.total_decode_time_us.load(Ordering::Relaxed), 0);
-        assert_eq!(s.total_batch_decode_setup_time_us.load(Ordering::Relaxed), 0);
-        assert_eq!(s.total_batch_decode_extract_time_us.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            s.total_batch_decode_setup_time_us.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            s.total_batch_decode_extract_time_us.load(Ordering::Relaxed),
+            0
+        );
         assert_eq!(s.total_batch_decode_mask_time_us.load(Ordering::Relaxed), 0);
         assert_eq!(s.total_decode_plan_time_us.load(Ordering::Relaxed), 0);
         assert_eq!(s.total_sampling_time_us.load(Ordering::Relaxed), 0);
         assert_eq!(s.total_decode_plan_cache_hits.load(Ordering::Relaxed), 0);
         assert_eq!(s.total_decode_plan_cache_misses.load(Ordering::Relaxed), 0);
+        assert_eq!(s.total_decode_plan_reuses.load(Ordering::Relaxed), 0);
+        assert_eq!(s.total_decode_workspace_resets.load(Ordering::Relaxed), 0);
         assert_eq!(s.total_h2d_metadata_bytes.load(Ordering::Relaxed), 0);
         assert_eq!(s.total_page_budget_denials.load(Ordering::Relaxed), 0);
         assert_eq!(s.current_tracked_kv_bytes.load(Ordering::Relaxed), 0);
@@ -189,15 +205,20 @@ mod tests {
         s.total_completion_tokens.store(1000, Ordering::Relaxed);
         s.total_kv_swap_count.store(3, Ordering::Relaxed);
         s.total_prefill_chunks.store(4, Ordering::Relaxed);
-        s.total_batch_decode_setup_time_us.store(111, Ordering::Relaxed);
-        s.total_batch_decode_extract_time_us.store(222, Ordering::Relaxed);
-        s.total_batch_decode_mask_time_us.store(333, Ordering::Relaxed);
+        s.total_batch_decode_setup_time_us
+            .store(111, Ordering::Relaxed);
+        s.total_batch_decode_extract_time_us
+            .store(222, Ordering::Relaxed);
+        s.total_batch_decode_mask_time_us
+            .store(333, Ordering::Relaxed);
         s.total_decode_plan_time_us.store(444, Ordering::Relaxed);
         s.total_sampling_time_us.store(555, Ordering::Relaxed);
         s.total_decode_plan_cache_hits.store(6, Ordering::Relaxed);
         s.total_decode_plan_cache_misses.store(7, Ordering::Relaxed);
+        s.total_decode_plan_reuses.store(8, Ordering::Relaxed);
+        s.total_decode_workspace_resets.store(9, Ordering::Relaxed);
         s.total_h2d_metadata_bytes.store(888, Ordering::Relaxed);
-        s.total_page_budget_denials.store(9, Ordering::Relaxed);
+        s.total_page_budget_denials.store(10, Ordering::Relaxed);
         s.current_tracked_kv_bytes.store(10_000, Ordering::Relaxed);
         s.current_estimated_kv_pages.store(11, Ordering::Relaxed);
         s.active_sequences.store(4, Ordering::Relaxed);
@@ -219,8 +240,10 @@ mod tests {
         assert_eq!(snap.total_sampling_time_us, 555);
         assert_eq!(snap.total_decode_plan_cache_hits, 6);
         assert_eq!(snap.total_decode_plan_cache_misses, 7);
+        assert_eq!(snap.total_decode_plan_reuses, 8);
+        assert_eq!(snap.total_decode_workspace_resets, 9);
         assert_eq!(snap.total_h2d_metadata_bytes, 888);
-        assert_eq!(snap.total_page_budget_denials, 9);
+        assert_eq!(snap.total_page_budget_denials, 10);
         assert_eq!(snap.current_tracked_kv_bytes, 10_000);
         assert_eq!(snap.current_estimated_kv_pages, 11);
         assert_eq!(snap.active_sequences, 4);

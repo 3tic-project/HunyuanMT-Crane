@@ -463,7 +463,7 @@ impl InferenceEngine {
              tokens: prompt={} completion={} | \
              kv_swaps={} prefill_chunks={} | \
              speed: prefill={:.1} tok/s decode={:.1} tok/s | \
-             decode_plan_hit={:.0}% sampling_ms={}{}",
+             decode_plan_hit={:.0}% plan_reuse={} workspace_reset={} sampling_ms={}{}",
             uptime,
             snap.total_requests,
             snap.completed_requests,
@@ -478,6 +478,8 @@ impl InferenceEngine {
             snap.avg_prefill_tokens_per_sec,
             snap.avg_decode_tokens_per_sec,
             plan_hit_rate,
+            snap.total_decode_plan_reuses,
+            snap.total_decode_workspace_resets,
             snap.total_sampling_time_us / 1000,
             gpu_info,
         );
@@ -801,6 +803,16 @@ impl InferenceEngine {
         }
 
         self.model.clear_kv_cache();
+        if let Err(e) = self.model.reset_decode_backend_workspace() {
+            error!(
+                backend = session.backend_name,
+                "Failed to reset decode backend workspace: {e}"
+            );
+        } else {
+            self.stats
+                .total_decode_workspace_resets
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.recount_kv_bytes();
     }
 
@@ -970,6 +982,59 @@ impl InferenceEngine {
         Some(PagedAttentionMetadata::from_block_tables(
             &tables, page_size,
         ))
+    }
+
+    fn try_refresh_session_decode_plan(
+        &mut self,
+        metadata: &PagedAttentionMetadata,
+    ) -> Option<DecodeBackendPlan> {
+        let mut plan = self
+            .active_batch_decode
+            .as_ref()
+            .and_then(|session| session.plan.clone())?;
+        let expected_bucket = metadata.bucket_key(self.decode_tokens_per_seq, plan.split_kv);
+        if plan.backend_name != self.model.decode_backend_name()
+            || plan.bucket_key != expected_bucket
+        {
+            return None;
+        }
+        match self.model.refresh_batch_decode_plan(&mut plan, metadata) {
+            Ok(()) => {
+                plan.plan_cache_hit = true;
+                Some(plan)
+            }
+            Err(e) => {
+                warn!(
+                    backend = self.model.decode_backend_name(),
+                    error = %e,
+                    "Decode plan refresh failed, falling back to full plan",
+                );
+                None
+            }
+        }
+    }
+
+    fn prepare_batch_decode_plan(
+        &mut self,
+        batch: &[String],
+        kv_lens: &[usize],
+        reuse_session: bool,
+    ) -> candle_core::Result<(Option<DecodeBackendPlan>, bool)> {
+        let paged_metadata = self.batch_paged_attention_metadata(batch);
+        if let Some(metadata) = paged_metadata.as_ref() {
+            if reuse_session {
+                if let Some(plan) = self.try_refresh_session_decode_plan(metadata) {
+                    return Ok((Some(plan), true));
+                }
+            }
+            return self
+                .model
+                .plan_batch_decode_with_metadata(metadata, self.decode_tokens_per_seq)
+                .map(|plan| (plan, false));
+        }
+        self.model
+            .plan_batch_decode(kv_lens, self.decode_tokens_per_seq)
+            .map(|plan| (plan, false))
     }
 
     /// Effective max_tokens for a request, taking server-level max_seq_len into account.
@@ -1355,32 +1420,24 @@ impl InferenceEngine {
         }
 
         let plan_start = Instant::now();
-        let paged_metadata = self.batch_paged_attention_metadata(&batch);
-        let plan_result = match paged_metadata.as_ref() {
-            Some(metadata) => self
-                .model
-                .plan_batch_decode_with_metadata(metadata, self.decode_tokens_per_seq),
-            None => self
-                .model
-                .plan_batch_decode(&kv_lens, self.decode_tokens_per_seq),
-        };
-        let plan = match plan_result {
-            Ok(p) => p,
-            Err(e) => {
-                error!("Batch decode plan failed: {e}");
-                self.active_batch_decode = Some(ActiveBatchDecodeSession {
-                    batch: batch.clone(),
-                    batch_width: original_max_kv,
-                    plan: None,
-                    backend_name: self.model.decode_backend_name(),
-                });
-                self.flush_active_batch_decode_session();
-                for seq_id in &batch {
-                    self.send_error(seq_id, &format!("Batch decode plan failed: {e}"));
+        let (plan, reused_plan) =
+            match self.prepare_batch_decode_plan(&batch, &kv_lens, reuse_session) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("Batch decode plan failed: {e}");
+                    self.active_batch_decode = Some(ActiveBatchDecodeSession {
+                        batch: batch.clone(),
+                        batch_width: original_max_kv,
+                        plan: None,
+                        backend_name: self.model.decode_backend_name(),
+                    });
+                    self.flush_active_batch_decode_session();
+                    for seq_id in &batch {
+                        self.send_error(seq_id, &format!("Batch decode plan failed: {e}"));
+                    }
+                    return;
                 }
-                return;
-            }
-        };
+            };
         let plan_us = plan_start.elapsed().as_micros() as u64;
         self.stats
             .total_decode_plan_time_us
@@ -1389,7 +1446,12 @@ impl InferenceEngine {
             self.stats
                 .total_h2d_metadata_bytes
                 .fetch_add(decode_plan.metadata.h2d_metadata_bytes(), Ordering::Relaxed);
-            let counter = if decode_plan.plan_cache_hit {
+            if reused_plan {
+                self.stats
+                    .total_decode_plan_reuses
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            let counter = if reused_plan || decode_plan.plan_cache_hit {
                 &self.stats.total_decode_plan_cache_hits
             } else {
                 &self.stats.total_decode_plan_cache_misses
@@ -1659,6 +1721,7 @@ impl InferenceEngine {
                 batch_size,
                 backend = self.model.decode_backend_name(),
                 reuse_session,
+                reuse_plan = reused_plan,
                 tokens = total_tokens_this_step,
                 rounds = rounds_done,
                 finished = pending_finish.len(),
@@ -1993,12 +2056,22 @@ impl InferenceEngine {
     }
 }
 
+impl Drop for InferenceEngine {
+    fn drop(&mut self) {
+        if let Err(e) = self.model.destroy_decode_backend() {
+            warn!("Failed to destroy decode backend state during engine shutdown: {e}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::backend::ModelBackend;
     use candle_core::{DType, Device, Tensor};
     use crane_core::models::qwen3::paged_kv::{KvCacheLayout, PagedKvConfig};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
     use tokenizers::{models::bpe::BPE, Tokenizer};
     use tokio::sync::mpsc;
 
@@ -2064,6 +2137,120 @@ mod tests {
 
         fn paged_kv_config(&self) -> Option<PagedKvConfig> {
             Some(self.cfg.clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct PlanCounters {
+        plan_calls: AtomicUsize,
+        refresh_calls: AtomicUsize,
+        reset_calls: AtomicUsize,
+    }
+
+    struct MockPlanBackend {
+        inner: MockPagedBackend,
+        counters: Arc<PlanCounters>,
+    }
+
+    impl MockPlanBackend {
+        fn new(device: Device, counters: Arc<PlanCounters>) -> Self {
+            Self {
+                inner: MockPagedBackend::new(device),
+                counters,
+            }
+        }
+    }
+
+    impl ModelBackend for MockPlanBackend {
+        fn forward_step(
+            &mut self,
+            _input_ids: &[u32],
+            _start_pos: usize,
+        ) -> anyhow::Result<Tensor> {
+            anyhow::bail!("unused in tests")
+        }
+
+        fn clear_kv_cache(&mut self) {}
+
+        fn num_layers(&self) -> usize {
+            self.inner.num_layers()
+        }
+
+        fn device(&self) -> &Device {
+            self.inner.device()
+        }
+
+        fn dtype(&self) -> DType {
+            self.inner.dtype()
+        }
+
+        fn tokenizer(&self) -> &Tokenizer {
+            self.inner.tokenizer()
+        }
+
+        fn eos_token_id(&self) -> Vec<u32> {
+            self.inner.eos_token_id()
+        }
+
+        fn warmup(&mut self) {}
+
+        fn supports_kv_swap(&self) -> bool {
+            true
+        }
+
+        fn decode_backend_name(&self) -> &'static str {
+            "mock-plan"
+        }
+
+        fn paged_kv_config(&self) -> Option<PagedKvConfig> {
+            self.inner.paged_kv_config()
+        }
+
+        fn plan_batch_decode_with_metadata(
+            &mut self,
+            metadata: &PagedAttentionMetadata,
+            decode_tokens_per_seq: usize,
+        ) -> candle_core::Result<Option<DecodeBackendPlan>> {
+            self.counters
+                .plan_calls
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(Some(DecodeBackendPlan {
+                backend_name: "mock-plan",
+                bucket_key: metadata.bucket_key(decode_tokens_per_seq, false),
+                metadata: metadata.clone(),
+                plan_cache_hit: false,
+                graph_eligible: false,
+                split_kv: false,
+            }))
+        }
+
+        fn refresh_batch_decode_plan(
+            &mut self,
+            plan: &mut DecodeBackendPlan,
+            metadata: &PagedAttentionMetadata,
+        ) -> candle_core::Result<()> {
+            self.counters
+                .refresh_calls
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            let bucket_key =
+                metadata.bucket_key(plan.bucket_key.decode_tokens_per_seq, plan.split_kv);
+            if bucket_key != plan.bucket_key {
+                candle_core::bail!("bucket mismatch")
+            }
+            plan.metadata = metadata.clone();
+            plan.plan_cache_hit = true;
+            Ok(())
+        }
+
+        fn reset_decode_backend_workspace(&mut self) -> candle_core::Result<()> {
+            self.counters
+                .reset_calls
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(())
+        }
+
+        fn destroy_decode_backend(&mut self) -> candle_core::Result<()> {
+            Ok(())
         }
     }
 
@@ -2167,5 +2354,135 @@ mod tests {
         assert_eq!(metadata.abi.paged_kv_indices, vec![0, 1, 2]);
         assert_eq!(metadata.abi.paged_kv_last_page_len, vec![1, 5]);
         assert_eq!(metadata.abi.block_tables, vec![vec![0, 1], vec![2]]);
+    }
+
+    #[test]
+    fn prepare_batch_decode_plan_reuses_session_plan_when_bucket_matches() {
+        let counters = Arc::new(PlanCounters::default());
+        let backend = Box::new(MockPlanBackend::new(Device::Cpu, counters.clone()));
+        let memory = MemoryConfig {
+            max_seq_len: 128,
+            gpu_memory_limit_bytes: 0,
+            baseline_gpu_bytes: 0,
+        };
+        let (mut engine, _handle) = InferenceEngine::new(backend, 4, 16, 0, memory);
+
+        let mut seq_a = make_sequence("a", 17);
+        seq_a.status = SequenceStatus::Running;
+        let mut seq_b = make_sequence("b", 5);
+        seq_b.status = SequenceStatus::Running;
+        engine.sequences.insert(seq_a.id.clone(), seq_a);
+        engine.sequences.insert(seq_b.id.clone(), seq_b);
+
+        engine.sync_sequence_paged_kv("a", 17).unwrap();
+        engine.sync_sequence_paged_kv("b", 5).unwrap();
+
+        let batch = vec!["a".to_string(), "b".to_string()];
+        let first_kv_lens = engine.batch_seq_lens(&batch);
+        let (first_plan, reused) = engine
+            .prepare_batch_decode_plan(&batch, &first_kv_lens, false)
+            .unwrap();
+        assert!(!reused);
+        let first_plan = first_plan.expect("plan");
+        assert_eq!(counters.plan_calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(counters.refresh_calls.load(AtomicOrdering::Relaxed), 0);
+
+        engine.active_batch_decode = Some(ActiveBatchDecodeSession {
+            batch: batch.clone(),
+            batch_width: 17,
+            plan: Some(first_plan),
+            backend_name: "mock-plan",
+        });
+
+        engine.sequences.get_mut("a").unwrap().tokens.push(2);
+        engine.sequences.get_mut("b").unwrap().tokens.push(2);
+        engine.sync_sequence_paged_kv("a", 18).unwrap();
+        engine.sync_sequence_paged_kv("b", 6).unwrap();
+
+        let second_kv_lens = engine.batch_seq_lens(&batch);
+        let (second_plan, reused) = engine
+            .prepare_batch_decode_plan(&batch, &second_kv_lens, true)
+            .unwrap();
+        assert!(reused);
+        let second_plan = second_plan.expect("plan");
+        assert_eq!(counters.plan_calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(counters.refresh_calls.load(AtomicOrdering::Relaxed), 1);
+        assert!(second_plan.plan_cache_hit);
+        assert_eq!(second_plan.metadata.seq_lens, vec![18, 6]);
+    }
+
+    #[test]
+    fn prepare_batch_decode_plan_falls_back_to_full_plan_when_bucket_changes() {
+        let counters = Arc::new(PlanCounters::default());
+        let backend = Box::new(MockPlanBackend::new(Device::Cpu, counters.clone()));
+        let memory = MemoryConfig {
+            max_seq_len: 128,
+            gpu_memory_limit_bytes: 0,
+            baseline_gpu_bytes: 0,
+        };
+        let (mut engine, _handle) = InferenceEngine::new(backend, 4, 16, 0, memory);
+
+        let mut seq_a = make_sequence("a", 17);
+        seq_a.status = SequenceStatus::Running;
+        engine.sequences.insert(seq_a.id.clone(), seq_a);
+        engine.sync_sequence_paged_kv("a", 17).unwrap();
+
+        let batch = vec!["a".to_string()];
+        let first_kv_lens = engine.batch_seq_lens(&batch);
+        let (first_plan, _) = engine
+            .prepare_batch_decode_plan(&batch, &first_kv_lens, false)
+            .unwrap();
+
+        engine.active_batch_decode = Some(ActiveBatchDecodeSession {
+            batch: batch.clone(),
+            batch_width: 17,
+            plan: first_plan,
+            backend_name: "mock-plan",
+        });
+
+        for _ in 0..16 {
+            engine.sequences.get_mut("a").unwrap().tokens.push(2);
+        }
+        engine.sync_sequence_paged_kv("a", 33).unwrap();
+
+        let second_kv_lens = engine.batch_seq_lens(&batch);
+        let (_second_plan, reused) = engine
+            .prepare_batch_decode_plan(&batch, &second_kv_lens, true)
+            .unwrap();
+        assert!(!reused);
+        assert_eq!(counters.plan_calls.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(counters.refresh_calls.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn flush_active_batch_decode_session_resets_backend_workspace() {
+        let counters = Arc::new(PlanCounters::default());
+        let backend = Box::new(MockPlanBackend::new(Device::Cpu, counters.clone()));
+        let memory = MemoryConfig {
+            max_seq_len: 128,
+            gpu_memory_limit_bytes: 0,
+            baseline_gpu_bytes: 0,
+        };
+        let (mut engine, _handle) = InferenceEngine::new(backend, 4, 16, 0, memory);
+
+        let seq = make_sequence("a", 16);
+        engine.sequences.insert("a".to_string(), seq);
+        engine.active_batch_decode = Some(ActiveBatchDecodeSession {
+            batch: vec!["a".to_string()],
+            batch_width: 16,
+            plan: None,
+            backend_name: "mock-plan",
+        });
+
+        engine.flush_active_batch_decode_session();
+
+        assert_eq!(counters.reset_calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(
+            engine
+                .stats
+                .total_decode_workspace_resets
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 }

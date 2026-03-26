@@ -158,6 +158,30 @@ pub trait ModelBackend: Send + 'static {
         self.plan_batch_decode(&metadata.seq_lens, decode_tokens_per_seq)
     }
 
+    fn refresh_batch_decode_plan(
+        &mut self,
+        plan: &mut DecodeBackendPlan,
+        metadata: &PagedAttentionMetadata,
+    ) -> candle_core::Result<()> {
+        match self
+            .plan_batch_decode_with_metadata(metadata, plan.bucket_key.decode_tokens_per_seq)?
+        {
+            Some(refreshed) => {
+                *plan = refreshed;
+                Ok(())
+            }
+            None => candle_core::bail!("Batch decode plan refresh not supported by this backend"),
+        }
+    }
+
+    fn reset_decode_backend_workspace(&mut self) -> candle_core::Result<()> {
+        Ok(())
+    }
+
+    fn destroy_decode_backend(&mut self) -> candle_core::Result<()> {
+        self.reset_decode_backend_workspace()
+    }
+
     /// Execute a batch-decode step using a previously built plan.
     fn run_planned_batch_decode(
         &mut self,
@@ -543,6 +567,22 @@ impl ModelBackend for Qwen3Backend {
         self.model
             .plan_batch_decode_with_metadata(metadata, decode_tokens_per_seq)
             .map(Some)
+    }
+
+    fn refresh_batch_decode_plan(
+        &mut self,
+        plan: &mut DecodeBackendPlan,
+        metadata: &PagedAttentionMetadata,
+    ) -> candle_core::Result<()> {
+        self.model.refresh_batch_decode_plan(plan, metadata)
+    }
+
+    fn reset_decode_backend_workspace(&mut self) -> candle_core::Result<()> {
+        self.model.reset_decode_backend_workspace()
+    }
+
+    fn destroy_decode_backend(&mut self) -> candle_core::Result<()> {
+        self.model.destroy_decode_backend()
     }
 
     fn run_planned_batch_decode(

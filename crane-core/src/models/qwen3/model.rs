@@ -263,6 +263,22 @@ impl Model {
         self.decode_backend.plan(metadata, decode_tokens_per_seq)
     }
 
+    pub fn refresh_batch_decode_plan(
+        &mut self,
+        plan: &mut DecodeBackendPlan,
+        metadata: &PagedAttentionMetadata,
+    ) -> candle_core::Result<()> {
+        self.decode_backend.refresh_plan(plan, metadata)
+    }
+
+    pub fn reset_decode_backend_workspace(&mut self) -> candle_core::Result<()> {
+        self.decode_backend.reset_workspace()
+    }
+
+    pub fn destroy_decode_backend(&mut self) -> candle_core::Result<()> {
+        self.decode_backend.destroy()
+    }
+
     pub fn run_planned_batch_decode(
         &mut self,
         plan: &DecodeBackendPlan,

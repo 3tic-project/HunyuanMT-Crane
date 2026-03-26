@@ -131,9 +131,7 @@ impl RotaryEmbedding {
         // positions × inv_freq: [max_pos, dim/2]
         let positions: Vec<f32> = (0..max_pos).map(|i| i as f32).collect();
         let positions = Tensor::new(positions.as_slice(), device)?;
-        let freqs = positions
-            .unsqueeze(1)?
-            .matmul(&inv_freq.unsqueeze(0)?)?; // [max_pos, dim/2]
+        let freqs = positions.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?; // [max_pos, dim/2]
 
         // cos/sin tables: [max_pos, dim/2] — candle_nn::rotary_emb::rope() handles
         // the half-dim duplication internally, so we store the raw half-dim tables.
@@ -211,8 +209,11 @@ impl Attention {
         // replaces three.  `narrow` splits are zero-copy views.
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
-        let qkv_proj = if let (LinearLayer::Standard(ref q), LinearLayer::Standard(ref k), LinearLayer::Standard(ref v)) =
-            (&q_proj, &k_proj, &v_proj)
+        let qkv_proj = if let (
+            LinearLayer::Standard(ref q),
+            LinearLayer::Standard(ref k),
+            LinearLayer::Standard(ref v),
+        ) = (&q_proj, &k_proj, &v_proj)
         {
             let qkv_w = Tensor::cat(&[q.weight(), k.weight(), v.weight()], 0)?;
             let qkv_b = match (q.bias(), k.bias(), v.bias()) {
@@ -277,14 +278,8 @@ impl Attention {
 
         let (q_norm, k_norm) = if config.use_qk_norm {
             (
-                Some(gg.rms_norm(
-                    &format!("{prefix}.attn_q_norm.weight"),
-                    config.rms_norm_eps,
-                )?),
-                Some(gg.rms_norm(
-                    &format!("{prefix}.attn_k_norm.weight"),
-                    config.rms_norm_eps,
-                )?),
+                Some(gg.rms_norm(&format!("{prefix}.attn_q_norm.weight"), config.rms_norm_eps)?),
+                Some(gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), config.rms_norm_eps)?),
             )
         } else {
             (None, None)
@@ -345,10 +340,8 @@ impl Attention {
                     let total = full_k.dim(2)?;
                     let room = 256; // fixed small room — avoids 2x over-allocation
                     let (b, h, _, d) = full_k.dims4()?;
-                    let new_buf_k =
-                        Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
-                    let new_buf_v =
-                        Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
+                    let new_buf_k = Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
+                    let new_buf_v = Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
                     new_buf_k.slice_set(&full_k, 2, 0)?;
                     new_buf_v.slice_set(&full_v, 2, 0)?;
                     self.kv_cache = Some((new_buf_k, new_buf_v));
@@ -439,8 +432,7 @@ impl Attention {
             let scale = 1.0 / (self.head_dim as f64).sqrt();
 
             // Q: [B, H, 1, D] → [B, kv_heads, n_rep, D], pre-scaled
-            let q_g =
-                (q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))? * scale)?;
+            let q_g = (q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))? * scale)?;
 
             // K^T: [B, kv_heads, D, S] — just a view (0 copies here;
             //       matmul will flatten+contiguous in one pass).
@@ -496,10 +488,11 @@ impl Attention {
         let attn_output = attn_weights.matmul(&v)?;
 
         // [B, H, S, D] → [B, S, H*D]
-        let attn_output = attn_output
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b_sz, seq_len, ()))?;
+        let attn_output =
+            attn_output
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((b_sz, seq_len, ()))?;
 
         self.o_proj.forward(&attn_output)
     }
@@ -515,9 +508,16 @@ impl Attention {
 /// Gate+up projection: either a merged [2*I, H] weight (Standard) or separate quantized projections.
 enum MlpGateUp {
     /// Merged gate+up weight — one gemv instead of two. Standard (BF16/F16/F32) only.
-    Merged { gate_up_proj: Linear, intermediate_size: usize },
+    Merged {
+        gate_up_proj: Linear,
+        intermediate_size: usize,
+    },
     /// Separate quantized gate and up projections (GGUF).
-    Separate { gate_proj: LinearLayer, up_proj: LinearLayer, intermediate_size: usize },
+    Separate {
+        gate_proj: LinearLayer,
+        up_proj: LinearLayer,
+        intermediate_size: usize,
+    },
 }
 
 struct Mlp {
@@ -554,7 +554,11 @@ impl Mlp {
         Ok(Self { gate_up, down_proj })
     }
 
-    fn new_from_gguf<R: Read + Seek>(gg: &mut Gguf<R>, layer_idx: usize, intermediate_size: usize) -> Result<Self> {
+    fn new_from_gguf<R: Read + Seek>(
+        gg: &mut Gguf<R>,
+        layer_idx: usize,
+        intermediate_size: usize,
+    ) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
         let gate_proj = gg.linear(&format!("{prefix}.ffn_gate.weight"))?;
         let up_proj = gg.linear(&format!("{prefix}.ffn_up.weight"))?;
@@ -571,7 +575,10 @@ impl Mlp {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match &self.gate_up {
-            MlpGateUp::Merged { gate_up_proj, intermediate_size } => {
+            MlpGateUp::Merged {
+                gate_up_proj,
+                intermediate_size,
+            } => {
                 let gu = gate_up_proj.forward(x)?; // [B, S, 2*intermediate_size]
 
                 // Use fused CUDA kernel when available: eliminates narrow + silu + mul
@@ -593,7 +600,9 @@ impl Mlp {
                 let gate = candle_nn::Activation::Silu.forward(&gate)?;
                 self.down_proj.forward(&(gate * up)?)
             }
-            MlpGateUp::Separate { gate_proj, up_proj, .. } => {
+            MlpGateUp::Separate {
+                gate_proj, up_proj, ..
+            } => {
                 let gate = gate_proj.forward(x)?;
                 let gate = candle_nn::Activation::Silu.forward(&gate)?;
                 let up = up_proj.forward(x)?;
@@ -663,9 +672,9 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
-        let hidden_states =
-            self.self_attn
-                .forward(&hidden_states, cos, sin, attention_mask)?;
+        let hidden_states = self
+            .self_attn
+            .forward(&hidden_states, cos, sin, attention_mask)?;
         let hidden_states = (residual + hidden_states)?;
 
         let residual = &hidden_states;
@@ -760,8 +769,7 @@ impl Qwen3Model {
 
         let num_attention_heads =
             md_get(&format!("{arch}.attention.head_count"))?.to_u32()? as usize;
-        let num_kv_heads =
-            md_get(&format!("{arch}.attention.head_count_kv"))?.to_u32()? as usize;
+        let num_kv_heads = md_get(&format!("{arch}.attention.head_count_kv"))?.to_u32()? as usize;
         let head_dim = gg
             .metadata()
             .get(&format!("{arch}.attention.key_length"))
@@ -769,8 +777,7 @@ impl Qwen3Model {
             .unwrap_or(128) as usize;
         let num_hidden_layers = md_get(&format!("{arch}.block_count"))?.to_u32()? as usize;
         let hidden_size = md_get(&format!("{arch}.embedding_length"))?.to_u32()? as usize;
-        let intermediate_size =
-            md_get(&format!("{arch}.feed_forward_length"))?.to_u32()? as usize;
+        let intermediate_size = md_get(&format!("{arch}.feed_forward_length"))?.to_u32()? as usize;
         let max_position_embeddings = gg
             .metadata()
             .get(&format!("{arch}.context_length"))
@@ -887,8 +894,7 @@ impl Qwen3Model {
 
         let mut hidden_states = hidden_states;
         for layer in self.layers.iter_mut() {
-            hidden_states =
-                layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -919,10 +925,8 @@ impl Qwen3Model {
                     .kv_cache
                     .as_ref()
                     .map(|(k, v)| {
-                        let k_bytes =
-                            k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
-                        let v_bytes =
-                            v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
+                        let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
+                        let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
                         k_bytes + v_bytes
                     })
                     .unwrap_or(0)
@@ -1011,10 +1015,8 @@ impl Qwen3Model {
                 let v = v.contiguous()?;
                 if extra_room > 0 {
                     let (b, h, s, d) = k.dims4()?;
-                    let buf_k =
-                        Tensor::zeros((b, h, s + extra_room, d), k.dtype(), k.device())?;
-                    let buf_v =
-                        Tensor::zeros((b, h, s + extra_room, d), v.dtype(), v.device())?;
+                    let buf_k = Tensor::zeros((b, h, s + extra_room, d), k.dtype(), k.device())?;
+                    let buf_v = Tensor::zeros((b, h, s + extra_room, d), v.dtype(), v.device())?;
                     buf_k.slice_set(&k, 2, 0)?;
                     buf_v.slice_set(&v, 2, 0)?;
                     layer.self_attn.kv_cache = Some((buf_k, buf_v));
@@ -1043,7 +1045,8 @@ impl Qwen3Model {
 
         let max_pos = positions.iter().copied().max().unwrap_or(0) + 1;
         let device = input_ids.device();
-        let (full_cos, full_sin) = self.rotary_emb.forward(max_pos)?;        let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+        let (full_cos, full_sin) = self.rotary_emb.forward(max_pos)?;
+        let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         let pos_tensor = Tensor::new(pos_ids.as_slice(), device)?;
         let cos = full_cos
             .index_select(&pos_tensor, 0)?
@@ -1056,8 +1059,7 @@ impl Qwen3Model {
 
         let mut hidden_states = hidden_states;
         for layer in self.layers.iter_mut() {
-            hidden_states =
-                layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
+            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;

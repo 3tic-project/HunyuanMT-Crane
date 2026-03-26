@@ -529,6 +529,10 @@ paged KV 一旦基本跑通，就建议尽快做一个小范围 spike：
 - 已新增 `crane-core/src/models/qwen3/decode_backend.rs`，定义 `Qwen3DecodeBackend` 与 `DecodeBackendPlan`。
 - `crane-oai` 的 batch decode 已切到 `plan -> run` 风格接口，decode plan cache hit、H2D metadata bytes 均可统计。
 - Qwen3 backend 现已支持直接接收 block-table 驱动的 metadata plan，不必再退回“只按 `seq_lens` 重新推导 page 结构”。
+- decode backend ABI 已进一步补到 `plan / refresh_plan / reset_workspace`：
+  - running batch 不变且 bucket 未变时，engine 会优先复用上一轮 session plan，只刷新 metadata
+  - active batch session flush 时会显式 reset backend workspace，而不是把 lifecycle 全部留在隐式状态里
+  - `EngineStats` 已开始统计 `decode_plan_reuses / decode_workspace_resets`
 - 当前默认 backend 仍是 `TensorDecodeBackend`，它的职责是先把高性能 decode backend 的 ABI、bucket 语义、engine 生命周期跑通。
 - FlashInfer / 自定义 CUDA backend / CUDA Graph 仍需在远端服务器继续接线与 profiling；现阶段代码已为后续 backend 替换留出接口。
 

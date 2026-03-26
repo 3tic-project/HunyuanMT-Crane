@@ -731,6 +731,7 @@ Crane 已经有：
   - 已在 Rust 层建好 `Qwen3DecodeBackend` 与 `DecodeBackendPlan`
   - engine 已切换到 `plan_batch_decode + run_planned_batch_decode` 生命周期
   - Qwen3 backend 已支持 `plan_batch_decode_with_metadata(...)`，可直接消费 block-table 驱动的 metadata
+  - 同时已补上 `refresh_plan / reset_workspace` 生命周期：batch 未变且 bucket 未变时可直接复用 session plan，只刷新 metadata；flush session 时会显式 reset workspace
 - `去掉每轮 extract→pad→stack→extract`：
   - 已通过 active batch session 复用大幅减少主循环中的 setup/extract 频率
   - 当前仍是过渡实现，batch 变化或 session flush 时仍会回到旧式 batched KV 提取
@@ -742,6 +743,7 @@ Crane 已经有：
   - 同时已加入 page-budget-aware prefill admission，会为 running decode 预留页预算；预算不足时优先继续 drain decode，而不是盲目把 waiting 请求推进 prefill
 - `decode bucket + graph 基础设施`：
   - bucket key、plan cache hit 统计和 metadata 统计已具备
+  - `decode_plan_reuses / decode_workspace_resets` 也已开始统计，方便后续验证 stable workspace 和 graph-friendly lifecycle 是否真的命中
   - CUDA Graph 仍未正式接入，需要远端服务器继续 capture 验证
 - 当前默认仍以吞吐优先：
   - `prefill_chunk_size` 默认回到 `0`
