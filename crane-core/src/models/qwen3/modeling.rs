@@ -930,26 +930,17 @@ impl Qwen3Model {
             .sum()
     }
 
-    /// Extract per-layer KV caches (valid portion only, zero-copy narrow views).
-    ///
-    /// The returned views still reference the pre-allocated buffer.  Callers
-    /// that need to free the buffer (e.g. batch-decode extract) should use
-    /// `Tensor::contiguous()` on their side, or clear `seq.kv_caches` after
-    /// consuming the views.
+    /// Extract per-layer KV caches as contiguous tensors covering only the
+    /// valid prefix. This avoids restoring non-contiguous narrow views back
+    /// into `self_attn.kv_cache`, which would later make `slice_set` fail
+    /// after a KV swap.
     pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
         self.layers
             .iter()
             .map(|l| {
                 l.self_attn.kv_cache.as_ref().map(|(k, v)| {
                     let len = l.self_attn.cache_seq_len;
-                    if len > 0 && len < k.dim(2).unwrap_or(0) {
-                        (
-                            k.narrow(2, 0, len).unwrap_or_else(|_| k.clone()),
-                            v.narrow(2, 0, len).unwrap_or_else(|_| v.clone()),
-                        )
-                    } else {
-                        (k.clone(), v.clone())
-                    }
+                    materialize_kv_cache(k, v, len).unwrap_or_else(|_| (k.clone(), v.clone()))
                 })
             })
             .collect()
@@ -958,6 +949,10 @@ impl Qwen3Model {
     /// Restore per-layer KV caches.
     pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
         for (layer, cache) in self.layers.iter_mut().zip(caches.into_iter()) {
+            let cache = cache.map(|(k, v)| {
+                let valid_len = k.dim(2).unwrap_or(0).min(v.dim(2).unwrap_or(0));
+                materialize_kv_cache(&k, &v, valid_len).unwrap_or((k, v))
+            });
             let seq_len = cache
                 .as_ref()
                 .map(|(k, _)| k.dim(2).unwrap_or(0))
@@ -1196,6 +1191,30 @@ pub fn build_batch_decode_mask(
     Ok(Some(mask.unsqueeze(1)?.unsqueeze(1)?))
 }
 
+fn materialize_kv_cache(k: &Tensor, v: &Tensor, valid_len: usize) -> Result<(Tensor, Tensor)> {
+    let k_len = k.dim(2)?;
+    let v_len = v.dim(2)?;
+    let valid_len = valid_len.min(k_len).min(v_len);
+
+    let k = if valid_len < k_len {
+        k.narrow(2, 0, valid_len)?.contiguous()?
+    } else if k.is_contiguous() {
+        k.clone()
+    } else {
+        k.contiguous()?
+    };
+
+    let v = if valid_len < v_len {
+        v.narrow(2, 0, valid_len)?.contiguous()?
+    } else if v.is_contiguous() {
+        v.clone()
+    } else {
+        v.contiguous()?
+    };
+
+    Ok((k, v))
+}
+
 /// Pad per-sequence KV caches to `max_len` and stack (right-aligned).
 fn pad_and_stack_kv_caches(
     caches: &[&Option<(Tensor, Tensor)>],
@@ -1256,4 +1275,31 @@ fn pad_and_stack_kv_caches(
     let stacked_k = Tensor::cat(&padded_ks, 0)?.contiguous()?;
     let stacked_v = Tensor::cat(&padded_vs, 0)?.contiguous()?;
     Ok(Some((stacked_k, stacked_v)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::materialize_kv_cache;
+    use candle_core::{Device, Result, Tensor};
+
+    #[test]
+    fn materialize_kv_cache_makes_narrow_views_contiguous() -> Result<()> {
+        let device = Device::Cpu;
+        let total = 2 * 3 * 8 * 4;
+        let data = (0..total).map(|v| v as f32).collect::<Vec<_>>();
+        let k = Tensor::from_vec(data.clone(), (2, 3, 8, 4), &device)?;
+        let v = Tensor::from_vec(data, (2, 3, 8, 4), &device)?;
+
+        let k_view = k.narrow(2, 0, 6)?;
+        let v_view = v.narrow(2, 0, 6)?;
+        assert!(!k_view.is_contiguous());
+        assert!(!v_view.is_contiguous());
+
+        let (k_mat, v_mat) = materialize_kv_cache(&k_view, &v_view, 6)?;
+        assert!(k_mat.is_contiguous());
+        assert!(v_mat.is_contiguous());
+        assert_eq!(k_mat.dims4()?, (2, 3, 6, 4));
+        assert_eq!(v_mat.dims4()?, (2, 3, 6, 4));
+        Ok(())
+    }
 }
