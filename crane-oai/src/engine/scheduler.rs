@@ -14,10 +14,13 @@ pub struct SchedulerOutput {
 /// This is tuned for Crane's current tensor-KV path where batch setup/extract
 /// still has non-trivial fixed cost. For short prompts (for example <= 2k),
 /// a small admission delay is usually worth the steadier decode throughput.
+/// We intentionally keep this threshold low so a 4-lane batch can keep
+/// decoding even after shrinking to 3 lanes, which matches the current
+/// Qwen3 1.7B serving target better than "refill immediately on first gap".
 const DECODE_BURST_STEPS_AFTER_PREFILL: usize = 2;
 const DECODE_BURST_STEPS_ON_QUEUE_PRESSURE: usize = 2;
 const DECODE_BURST_STEPS_AFTER_BATCH_SHRINK: usize = 3;
-const DECODE_BURST_MIN_RUNNING: usize = 4;
+const DECODE_BURST_MIN_RUNNING: usize = 3;
 
 /// Simple FIFO scheduler with prefill-priority batching.
 ///
@@ -372,7 +375,6 @@ mod tests {
         let mut s = Scheduler::new(8);
         s.promote_to_running("run-1".into());
         s.promote_to_running("run-2".into());
-        s.promote_to_running("run-3".into());
         s.add("wait-1".into());
         s.add("wait-2".into());
 
@@ -388,7 +390,6 @@ mod tests {
             vec![
                 "run-1".to_string(),
                 "run-2".to_string(),
-                "run-3".to_string(),
                 "wait-1".to_string(),
             ]
         );
@@ -400,7 +401,6 @@ mod tests {
             vec![
                 "run-1".to_string(),
                 "run-2".to_string(),
-                "run-3".to_string(),
                 "wait-1".to_string(),
             ]
         );
@@ -460,6 +460,39 @@ mod tests {
                 "run-2".to_string(),
                 "run-3".to_string(),
                 "run-4".to_string(),
+            ]
+        );
+
+        let second = s.schedule().unwrap();
+        assert!(!second.is_prefill);
+
+        let third = s.schedule().unwrap();
+        assert!(!third.is_prefill);
+
+        let fourth = s.schedule().unwrap();
+        assert!(fourth.is_prefill);
+        assert_eq!(fourth.batch, vec!["wait-1".to_string()]);
+    }
+
+    #[test]
+    fn batch_shrink_from_four_to_three_still_prefers_decode() {
+        let mut s = Scheduler::new(4);
+        s.promote_to_running("run-1".into());
+        s.promote_to_running("run-2".into());
+        s.promote_to_running("run-3".into());
+        s.promote_to_running("run-4".into());
+        s.add("wait-1".into());
+
+        s.remove("run-4");
+
+        let first = s.schedule().unwrap();
+        assert!(!first.is_prefill);
+        assert_eq!(
+            first.batch,
+            vec![
+                "run-1".to_string(),
+                "run-2".to_string(),
+                "run-3".to_string(),
             ]
         );
 
@@ -540,13 +573,23 @@ mod tests {
         assert_eq!(out.batch[0], "c");
         s.promote_to_running("c".into());
 
-        // Step 4: prefill "d".
+        // Step 4: once the running batch reaches 3 lanes, preserve it briefly.
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill);
+        assert_eq!(out.batch.len(), 3);
+
+        // Step 5: second decode-burst round.
+        let out = s.schedule().unwrap();
+        assert!(!out.is_prefill);
+        assert_eq!(out.batch.len(), 3);
+
+        // Step 6: now admit "d".
         let out = s.schedule().unwrap();
         assert!(out.is_prefill);
         assert_eq!(out.batch[0], "d");
         s.promote_to_running("d".into());
 
-        // Step 5: nothing waiting, running has items → decode.
+        // Step 7: nothing waiting, running has items → decode.
         let out = s.schedule().unwrap();
         assert!(!out.is_prefill);
         assert_eq!(out.batch.len(), 4);
