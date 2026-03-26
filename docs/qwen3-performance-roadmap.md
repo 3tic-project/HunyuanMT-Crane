@@ -254,6 +254,8 @@ Qwen3 serving 下，KV cache 不能再被看成“每个请求一对 K/V tensor�
 - `EngineStats` 已补充 `prefill/decode/setup/extract/mask/plan/sampling/H2D metadata/page-budget` 相关计数。
 - `EngineStats` 现可暴露 `current_tracked_kv_bytes` 与 `current_estimated_kv_pages`，便于 Phase 0 持续采样。
 - 针对 `prompt <= 2k` 的主场景，scheduler 已加入 decode-first admission burst：当 waiting queue 增长、prefill 晋升为 running 时，会优先保住 `4+ lane` 稳定 decode 批；但 `batch shrink` 不再延迟 admission，因为当前 tensor-KV 引擎在完成/取消后会 flush active session，此时继续跑 3-lane decode 没有 session reuse 收益。
+- 在高 backlog 场景下，scheduler 现会关闭 decode-burst，直接优先把 batch 补满，避免 sustained load 下长期停留在过小 batch。
+- 如果此前发生过 eviction，`effective_max_running` 也不再要求 waiting 清空才恢复，而是会在持续 headroom 下逐步放松，避免把并发长期钉死在过低值。
 - 远端 CUDA 环境下建议配合 `nvidia-smi` 轮询使用；benchmark 脚本已经内置可选显存采样。
 
 示例：
@@ -308,6 +310,7 @@ python3 scripts/benchmark_qwen3_serving.py \
 - Qwen3 prefill / decode 已在 engine 层显式分家，并支持 `prefill_chunk_size` 驱动的 chunked prefill。
 - batch decode 热路径已引入 active session 复用，避免每个 scheduling round 都做 `extract -> pad/stack -> decode -> extract`。
 - scheduler 已进一步加入短 prompt 吞吐优先的 decode-burst admission 策略，当前主要覆盖 `新请求入队 / prefill 完成` 两类事件；当前 tensor-KV 路径下，这比“slot 一空就立刻 prefill”更符合 Qwen3 1.7B serving 的真实瓶颈。对 `batch shrink`，当前实现会直接补位，因为 active batch session 已被引擎 flush，延迟 prefill 只会制造低吞吐的 3-lane decode。
+- 当 waiting backlog 很高时，burst 会被自动关闭，优先扩 batch，而不是为了局部 `reuse_session=true` 牺牲整体吞吐与排队长度。
 - sampling 时间已进入 engine 细粒度统计；现有 GPU fast path 继续保留 `gpu_argmax / topk / gumbel-max / repetition penalty`。
 - `FusedAddRmsNorm` 仍未真正进入 Qwen3 热路径，现阶段保留为 Candle 能力限制下的待验证点，需要远端 CUDA profiling 后再继续推进。
 - 由于当前仍是 tensor-KV 过渡路径，chunked prefill 会打断 active batch decode session；因此 CLI 默认值已回到 `prefill_chunk_size=0`，chunked prefill 改为显式开启项。

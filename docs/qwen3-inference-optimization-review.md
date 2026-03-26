@@ -729,6 +729,7 @@ Crane 已经有：
 - `短 prompt admission`：
   - 针对 `prompt <= 2k` 的实际服务场景，scheduler 已加入 decode-burst admission
   - waiting queue 增长、prefill 完成时，会优先保住几轮 decode，再补新 prefill；但 `running batch shrink` 不再延迟 admission，因为当前 tensor-KV 引擎在完成/取消后已经 flush active session，继续停留在 3-lane decode 没有 reuse 收益
+  - 当 waiting backlog 很高且 `running < max_running` 时，burst 会自动关闭，优先扩 batch；如果此前被 eviction 降过 cap，`effective_max_running` 也会在持续 headroom 下逐步恢复
 - `decode bucket + graph 基础设施`：
   - bucket key、plan cache hit 统计和 metadata 统计已具备
   - CUDA Graph 仍未正式接入，需要远端服务器继续 capture 验证

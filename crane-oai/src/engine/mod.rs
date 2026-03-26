@@ -689,6 +689,58 @@ impl InferenceEngine {
             .collect()
     }
 
+    fn maybe_relax_eviction_cap(&mut self) {
+        let cap = match self.scheduler.effective_max_running {
+            Some(cap) => cap,
+            None => return,
+        };
+
+        if cap >= self.scheduler.max_running {
+            self.scheduler.effective_max_running = None;
+            return;
+        }
+
+        if self.eviction_cooldown > 0 || self.scheduler.running.len() < cap {
+            return;
+        }
+
+        let budget = self.kv_budget_bytes();
+        let has_headroom = if budget == u64::MAX {
+            true
+        } else {
+            // Only relax once KV usage has fallen well below the prior limit.
+            self.tracked_kv_bytes.saturating_mul(4) <= budget.saturating_mul(3)
+        };
+
+        let has_page_headroom = match (self.current_estimated_kv_pages(), self.kv_page_budget()) {
+            (Some(used), Some(budget)) if budget > 0 => used.saturating_mul(4) <= budget.saturating_mul(3),
+            _ => true,
+        };
+
+        if !has_headroom || !has_page_headroom {
+            return;
+        }
+
+        let new_cap = (cap + 1).min(self.scheduler.max_running);
+        if new_cap >= self.scheduler.max_running {
+            info!(
+                previous_cap = cap,
+                restored_cap = self.scheduler.max_running,
+                "Eviction cap fully relaxed under sustained headroom",
+            );
+            self.scheduler.effective_max_running = None;
+        } else {
+            info!(
+                previous_cap = cap,
+                relaxed_cap = new_cap,
+                waiting = self.scheduler.waiting.len(),
+                running = self.scheduler.running.len(),
+                "Relaxing eviction cap under sustained headroom",
+            );
+            self.scheduler.effective_max_running = Some(new_cap);
+        }
+    }
+
     fn can_reuse_active_batch_decode(&self, batch: &[String]) -> bool {
         self.active_batch_decode
             .as_ref()
@@ -1705,22 +1757,8 @@ impl InferenceEngine {
             self.model.clear_kv_cache();
         }
 
-        // Only lift the eviction cap when the system has drained all
-        // waiting sequences. Under sustained load, keeping the cap prevents
-        // repeated eviction-readmit cycles (e.g., cap=6 → finish → admit 7th →
-        // evict → cap=6 → repeat). Once the load subsides and all waiting
-        // sequences are served, we reset so the next burst can try full
-        // concurrency again.
-        if self.scheduler.effective_max_running.is_some()
-            && self.scheduler.waiting.is_empty()
-        {
-            debug!(
-                "Eviction cap lifted (no waiting sequences, load subsided)"
-            );
-            self.scheduler.effective_max_running = None;
-        }
-
         self.recount_kv_bytes();
+        self.maybe_relax_eviction_cap();
         debug!(id = %seq_id, "Sequence cleaned up");
     }
 }
