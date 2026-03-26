@@ -728,7 +728,7 @@ Crane 已经有：
   - 当前仍是过渡实现，batch 变化或 session flush 时仍会回到旧式 batched KV 提取
 - `短 prompt admission`：
   - 针对 `prompt <= 2k` 的实际服务场景，scheduler 已加入 decode-burst admission
-  - waiting queue 增长、prefill 完成、以及 running batch shrink 时，都会先保住几轮 decode，再补新 prefill；当前策略只对 `4+ lane` 稳定批次延迟 admission，而 `4 -> 3` shrink 仅保留 1 轮 decode，避免过久停留在 3-lane
+  - waiting queue 增长、prefill 完成时，会优先保住几轮 decode，再补新 prefill；但 `running batch shrink` 不再延迟 admission，因为当前 tensor-KV 引擎在完成/取消后已经 flush active session，继续停留在 3-lane decode 没有 reuse 收益
 - `decode bucket + graph 基础设施`：
   - bucket key、plan cache hit 统计和 metadata 统计已具备
   - CUDA Graph 仍未正式接入，需要远端服务器继续 capture 验证

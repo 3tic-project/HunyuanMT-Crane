@@ -17,14 +17,14 @@ pub struct SchedulerOutput {
 /// The policy is asymmetric on purpose:
 /// - when a stable 4+ lane batch already exists, new waiting requests should
 ///   not immediately break it;
-/// - but when the engine is only at 3 lanes, refilling back to 4 is usually
-///   cheap enough that we should not keep deferring prefill for long.
+/// - but when the engine shrinks after a completion/cancel on the current
+///   tensor-KV path, the active batch session is already being flushed by the
+///   engine, so deferring prefill only leaves us stuck in a slower 3-lane
+///   decode with no session reuse benefit.
 const DECODE_BURST_STEPS_AFTER_PREFILL: usize = 2;
 const DECODE_BURST_STEPS_ON_QUEUE_PRESSURE: usize = 2;
-const DECODE_BURST_STEPS_AFTER_BATCH_SHRINK: usize = 1;
 const DECODE_BURST_MIN_RUNNING_AFTER_PREFILL: usize = 4;
 const DECODE_BURST_MIN_RUNNING_ON_QUEUE_PRESSURE: usize = 4;
-const DECODE_BURST_MIN_RUNNING_AFTER_BATCH_SHRINK: usize = 3;
 
 /// Simple FIFO scheduler with prefill-priority batching.
 ///
@@ -94,17 +94,6 @@ impl Scheduler {
         self.decode_burst_remaining = self.decode_burst_remaining.max(steps);
     }
 
-    fn reset_decode_burst(&mut self, steps: usize, min_running: usize) {
-        if self.chunked_prefill_mode
-            || self.waiting.is_empty()
-            || self.running.len() < min_running
-        {
-            self.decode_burst_remaining = 0;
-            return;
-        }
-        self.decode_burst_remaining = steps;
-    }
-
     /// Add a new sequence to the waiting queue.
     pub fn add(&mut self, seq_id: String) {
         self.waiting.push_back(seq_id);
@@ -121,15 +110,13 @@ impl Scheduler {
 
     /// Remove a sequence from all queues (on completion or error).
     pub fn remove(&mut self, seq_id: &str) {
-        let running_before = self.running.len();
         self.waiting.retain(|id| id != seq_id);
         self.running.retain(|id| id != seq_id);
-        if self.running.len() < running_before {
-            self.reset_decode_burst(
-                DECODE_BURST_STEPS_AFTER_BATCH_SHRINK,
-                DECODE_BURST_MIN_RUNNING_AFTER_BATCH_SHRINK,
-            );
-        }
+        // A finished/cancelled sequence changes the live batch shape. On the
+        // current tensor-KV path the engine flushes the active batch-decode
+        // session in that case, so keeping any pending decode burst would only
+        // force a slower refill-delayed small batch with no reuse upside.
+        self.decode_burst_remaining = 0;
     }
 
     /// Decide what to do next.
@@ -466,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_shrink_triggers_decode_burst_before_refill() {
+    fn batch_shrink_clears_burst_and_refills_immediately() {
         let mut s = Scheduler::new(8);
         s.promote_to_running("run-1".into());
         s.promote_to_running("run-2".into());
@@ -478,24 +465,12 @@ mod tests {
         s.remove("run-5");
 
         let first = s.schedule().unwrap();
-        assert!(!first.is_prefill);
-        assert_eq!(
-            first.batch,
-            vec![
-                "run-1".to_string(),
-                "run-2".to_string(),
-                "run-3".to_string(),
-                "run-4".to_string(),
-            ]
-        );
-
-        let second = s.schedule().unwrap();
-        assert!(second.is_prefill);
-        assert_eq!(second.batch, vec!["wait-1".to_string()]);
+        assert!(first.is_prefill);
+        assert_eq!(first.batch, vec!["wait-1".to_string()]);
     }
 
     #[test]
-    fn batch_shrink_from_four_to_three_still_prefers_decode() {
+    fn batch_shrink_from_four_to_three_refills_immediately() {
         let mut s = Scheduler::new(4);
         s.promote_to_running("run-1".into());
         s.promote_to_running("run-2".into());
@@ -506,19 +481,8 @@ mod tests {
         s.remove("run-4");
 
         let first = s.schedule().unwrap();
-        assert!(!first.is_prefill);
-        assert_eq!(
-            first.batch,
-            vec![
-                "run-1".to_string(),
-                "run-2".to_string(),
-                "run-3".to_string(),
-            ]
-        );
-
-        let second = s.schedule().unwrap();
-        assert!(second.is_prefill);
-        assert_eq!(second.batch, vec!["wait-1".to_string()]);
+        assert!(first.is_prefill);
+        assert_eq!(first.batch, vec!["wait-1".to_string()]);
     }
 
     #[test]
