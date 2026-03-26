@@ -1298,7 +1298,8 @@ fn build_batch_scatter_indices(
             let offset = max_len - kv_len;
             let indices = Tensor::arange(offset as u32, (offset + kv_len) as u32, device)?
                 .reshape((1, 1, kv_len, 1))?
-                .expand((1, kv_heads, kv_len, head_dim))?;
+                .expand((1, kv_heads, kv_len, head_dim))?
+                .contiguous()?;
             Ok(Some(indices))
         })
         .collect()
@@ -1399,6 +1400,8 @@ mod tests {
         let cache1 = Some((k1, v1));
         let caches = vec![&cache0, &cache1];
         let indices = build_batch_scatter_indices(&[3, 2], 3, 1, 1, &device)?;
+        assert!(indices[0].as_ref().unwrap().is_contiguous());
+        assert!(indices[1].as_ref().unwrap().is_contiguous());
 
         load_batched_kv_into_workspace(&workspace_k, &workspace_v, &caches, &indices)?;
 
