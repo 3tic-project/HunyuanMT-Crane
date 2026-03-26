@@ -1021,13 +1021,15 @@ impl Qwen3Model {
                     self.dtype,
                     device,
                 )?;
+                let active_k = workspace_k.narrow(0, 0, layer_caches.len())?;
+                let active_v = workspace_v.narrow(0, 0, layer_caches.len())?;
                 load_batched_kv_into_workspace(
-                    &workspace_k,
-                    &workspace_v,
+                    &active_k,
+                    &active_v,
                     &layer_caches,
                     &batch_scatter_indices,
                 )?;
-                layer.self_attn.kv_cache = Some((workspace_k, workspace_v));
+                layer.self_attn.kv_cache = Some((active_k, active_v));
                 layer.self_attn.cache_seq_len = max_kv_len;
             } else {
                 layer.self_attn.kv_cache = None;
@@ -1311,6 +1313,9 @@ fn load_batched_kv_into_workspace(
     caches: &[&Option<(Tensor, Tensor)>],
     scatter_indices: &[Option<Tensor>],
 ) -> Result<()> {
+    workspace_k.zero_set()?;
+    workspace_v.zero_set()?;
+
     for (row_idx, (cache, indices)) in caches.iter().zip(scatter_indices.iter()).enumerate() {
         match (cache, indices) {
             (Some((k, v)), Some(indices)) => {
@@ -1389,8 +1394,12 @@ mod tests {
     #[test]
     fn load_batched_kv_into_workspace_right_aligns_rows() -> Result<()> {
         let device = Device::Cpu;
-        let workspace_k = Tensor::zeros((2, 1, 5, 1), DType::F32, &device)?;
-        let workspace_v = Tensor::zeros((2, 1, 5, 1), DType::F32, &device)?;
+        let workspace_k = Tensor::zeros((4, 1, 5, 1), DType::F32, &device)?;
+        let workspace_v = Tensor::zeros((4, 1, 5, 1), DType::F32, &device)?;
+        let active_k = workspace_k.narrow(0, 0, 2)?;
+        let active_v = workspace_v.narrow(0, 0, 2)?;
+        assert!(active_k.is_contiguous());
+        assert!(active_v.is_contiguous());
 
         let k0 = Tensor::from_vec(vec![1f32, 2., 3.], (1, 1, 3, 1), &device)?;
         let v0 = Tensor::from_vec(vec![11f32, 12., 13.], (1, 1, 3, 1), &device)?;
@@ -1403,17 +1412,17 @@ mod tests {
         assert!(indices[0].as_ref().unwrap().is_contiguous());
         assert!(indices[1].as_ref().unwrap().is_contiguous());
 
-        load_batched_kv_into_workspace(&workspace_k, &workspace_v, &caches, &indices)?;
+        load_batched_kv_into_workspace(&active_k, &active_v, &caches, &indices)?;
 
         assert_eq!(
-            workspace_k
+            active_k
                 .narrow(2, 0, 3)?
                 .reshape((2, 3))?
                 .to_vec2::<f32>()?,
             vec![vec![1.0, 2.0, 3.0], vec![0.0, 7.0, 8.0]]
         );
         assert_eq!(
-            workspace_v
+            active_v
                 .narrow(2, 0, 3)?
                 .reshape((2, 3))?
                 .to_vec2::<f32>()?,
