@@ -1,5 +1,6 @@
 use candle_core::Tensor;
 use candle_transformers::generation::LogitsProcessor;
+use crane_core::models::qwen3::paged_kv::SeqBlockTable;
 use tokio::sync::mpsc;
 
 /// Compute the total GPU memory (in bytes) held by a set of KV caches.
@@ -46,6 +47,8 @@ pub struct Sequence {
     /// Saved KV caches when this sequence is not the one loaded in the model.
     /// Each element is `(K, V)` for a layer, or `None` for fresh layers.
     pub kv_caches: Vec<Option<(Tensor, Tensor)>>,
+    /// Shadow paged-KV table for exact page accounting and metadata planning.
+    pub paged_kv_table: Option<SeqBlockTable>,
 
     // ── sampling ──
     pub logits_processor: LogitsProcessor,
@@ -156,6 +159,7 @@ mod tests {
             prompt_len: prompt.len(),
             prefill_cursor: 0,
             kv_caches: vec![],
+            paged_kv_table: None,
             logits_processor: LogitsProcessor::new(42, Some(0.8), Some(0.95)),
             temperature: Some(0.8),
             top_p: Some(0.95),

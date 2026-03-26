@@ -46,6 +46,7 @@ use std::time::Instant;
 
 use candle_core::{Device, Tensor};
 use crane_core::models::qwen3::decode_backend::DecodeBackendPlan;
+use crane_core::models::qwen3::paged_kv::{PagedAttentionMetadata, PagedKvPool, SeqBlockTable};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -240,6 +241,9 @@ pub struct InferenceEngine {
     /// Reusable batched-decode state kept resident in the model while the
     /// running batch remains unchanged.
     active_batch_decode: Option<ActiveBatchDecodeSession>,
+    /// Shadow paged-KV allocator used for exact page accounting and metadata
+    /// planning before the real paged attention backend is wired in.
+    paged_kv_pool: Option<PagedKvPool>,
 }
 
 impl InferenceEngine {
@@ -266,6 +270,13 @@ impl InferenceEngine {
                 effective_max
             );
         }
+        let decode_tokens_per_seq = decode_tokens_per_seq.max(1);
+        let paged_kv_pool = Self::build_shadow_paged_kv_pool(
+            model.as_ref(),
+            &memory_config,
+            effective_max,
+            decode_tokens_per_seq,
+        );
 
         let stats = Arc::new(EngineStats::new());
         let mut scheduler = Scheduler::new(effective_max);
@@ -285,7 +296,7 @@ impl InferenceEngine {
             active_seq_id: None,
             num_layers,
             stats: stats.clone(),
-            decode_tokens_per_seq: decode_tokens_per_seq.max(1),
+            decode_tokens_per_seq,
             prefill_chunk_size,
             start_time: Instant::now(),
             step_counter: 0,
@@ -295,11 +306,9 @@ impl InferenceEngine {
             tracked_kv_bytes: 0,
             eviction_cooldown: 0,
             active_batch_decode: None,
+            paged_kv_pool,
         };
-        let handle = EngineHandle {
-            request_tx,
-            stats,
-        };
+        let handle = EngineHandle { request_tx, stats };
         (engine, handle)
     }
 
@@ -404,16 +413,14 @@ impl InferenceEngine {
                         self.log_stats();
                     }
                 }
-                None => {
-                    match self.request_rx.blocking_recv() {
-                        Some(req) => self.accept_request(req),
-                        None => {
-                            info!("Engine channel closed, shutting down");
-                            self.log_stats();
-                            return;
-                        }
+                None => match self.request_rx.blocking_recv() {
+                    Some(req) => self.accept_request(req),
+                    None => {
+                        info!("Engine channel closed, shutting down");
+                        self.log_stats();
+                        return;
                     }
-                }
+                },
             }
         }
     }
@@ -438,7 +445,11 @@ impl InferenceEngine {
                 budget_info,
             )
         } else {
-            format!(" | kv_cache: {}{}", format_bytes_engine(self.tracked_kv_bytes), budget_info)
+            format!(
+                " | kv_cache: {}{}",
+                format_bytes_engine(self.tracked_kv_bytes),
+                budget_info
+            )
         };
         let plan_total = snap.total_decode_plan_cache_hits + snap.total_decode_plan_cache_misses;
         let plan_hit_rate = if plan_total > 0 {
@@ -568,11 +579,7 @@ impl InferenceEngine {
                 let now = Instant::now();
                 if now.duration_since(self.last_mem_warn).as_secs() >= 5 {
                     self.last_mem_warn = now;
-                    warn!(
-                        used_pages,
-                        page_budget,
-                        "Estimated KV page budget exceeded"
-                    );
+                    warn!(used_pages, page_budget, "Estimated KV page budget exceeded");
                 }
                 return true;
             }
@@ -620,7 +627,9 @@ impl InferenceEngine {
                 .running
                 .iter()
                 .filter_map(|id| {
-                    self.sequences.get(id).map(|seq| (id.clone(), seq.tokens.len()))
+                    self.sequences
+                        .get(id)
+                        .map(|seq| (id.clone(), seq.tokens.len()))
                 })
                 .max_by_key(|(_, len)| *len)
                 .map(|(id, _)| id);
@@ -655,6 +664,7 @@ impl InferenceEngine {
             if let Some(seq) = self.sequences.get_mut(&victim_id) {
                 seq.kv_caches = vec![None; self.num_layers];
                 seq.status = SequenceStatus::Waiting;
+                seq.prefill_cursor = 0;
                 // Reset tokens to just the prompt to allow re-prefill.
                 seq.tokens.truncate(seq.prompt_len);
             }
@@ -664,6 +674,7 @@ impl InferenceEngine {
             // Move from running back to waiting (back, not front — avoid
             // immediate re-prefill which would cause thrashing).
             self.scheduler.running.retain(|id| id != &victim_id);
+            self.release_sequence_paged_kv(&victim_id);
             self.scheduler.waiting.push_back(victim_id);
         }
 
@@ -684,8 +695,14 @@ impl InferenceEngine {
     }
 
     fn batch_seq_lens(&self, batch: &[String]) -> Vec<usize> {
-        batch.iter()
-            .map(|id| self.sequences.get(id).map(|seq| seq.start_pos()).unwrap_or(0))
+        batch
+            .iter()
+            .map(|id| {
+                self.sequences
+                    .get(id)
+                    .map(|seq| seq.start_pos())
+                    .unwrap_or(0)
+            })
             .collect()
     }
 
@@ -713,7 +730,9 @@ impl InferenceEngine {
         };
 
         let has_page_headroom = match (self.current_estimated_kv_pages(), self.kv_page_budget()) {
-            (Some(used), Some(budget)) if budget > 0 => used.saturating_mul(4) <= budget.saturating_mul(3),
+            (Some(used), Some(budget)) if budget > 0 => {
+                used.saturating_mul(4) <= budget.saturating_mul(3)
+            }
             _ => true,
         };
 
@@ -804,9 +823,153 @@ impl InferenceEngine {
         Some(
             self.sequences
                 .values()
-                .map(|seq| cfg.pages_for_tokens(seq.start_pos()))
+                .map(|seq| {
+                    seq.paged_kv_table
+                        .as_ref()
+                        .map(|table| table.block_count())
+                        .unwrap_or_else(|| cfg.pages_for_tokens(seq.start_pos()))
+                })
                 .sum(),
         )
+    }
+
+    fn build_shadow_paged_kv_pool(
+        model: &dyn ModelBackend,
+        memory_config: &MemoryConfig,
+        max_running: usize,
+        decode_tokens_per_seq: usize,
+    ) -> Option<PagedKvPool> {
+        let cfg = model.paged_kv_config()?;
+        let decode_headroom_pages =
+            max_running.saturating_mul(cfg.pages_for_tokens(decode_tokens_per_seq));
+        let capacity_pages = if memory_config.gpu_memory_limit_bytes > 0 {
+            let budget = memory_config
+                .gpu_memory_limit_bytes
+                .saturating_sub(memory_config.baseline_gpu_bytes)
+                / KV_GPU_OVERHEAD_FACTOR;
+            let page_bytes = cfg.total_page_size_bytes();
+            if page_bytes == 0 {
+                return None;
+            }
+            (budget / page_bytes) as usize
+        } else if memory_config.max_seq_len > 0 {
+            max_running.saturating_mul(cfg.pages_for_tokens(memory_config.max_seq_len))
+        } else {
+            return None;
+        };
+        Some(PagedKvPool::new(
+            cfg,
+            capacity_pages.saturating_add(decode_headroom_pages),
+        ))
+    }
+
+    fn decode_page_reserve_pages(&self) -> Option<usize> {
+        let cfg = self.model.paged_kv_config()?;
+        Some(
+            self.scheduler
+                .running
+                .len()
+                .saturating_mul(cfg.pages_for_tokens(self.decode_tokens_per_seq)),
+        )
+    }
+
+    fn can_admit_prefill_by_page_budget(&self, seq_id: &str) -> bool {
+        let page_budget = match self.kv_page_budget() {
+            Some(budget) => budget,
+            None => return true,
+        };
+        let seq = match self.sequences.get(seq_id) {
+            Some(seq) => seq,
+            None => return false,
+        };
+        let cfg = match self.model.paged_kv_config() {
+            Some(cfg) => cfg,
+            None => return true,
+        };
+        let next_chunk_len = if self.prefill_chunk_size == usize::MAX {
+            seq.next_input_ids().len()
+        } else {
+            seq.next_prefill_chunk(self.prefill_chunk_size).len()
+        };
+        let target_tokens = seq.start_pos().saturating_add(next_chunk_len);
+        let current_pages = seq
+            .paged_kv_table
+            .as_ref()
+            .map(|table| table.block_count())
+            .unwrap_or(0);
+        let additional_pages = cfg
+            .pages_for_tokens(target_tokens)
+            .saturating_sub(current_pages);
+        let used_pages = self.current_estimated_kv_pages().unwrap_or(0);
+        let decode_reserve = self.decode_page_reserve_pages().unwrap_or(0);
+        used_pages
+            .saturating_add(additional_pages)
+            .saturating_add(decode_reserve)
+            <= page_budget
+    }
+
+    fn sync_sequence_paged_kv(&mut self, seq_id: &str, target_tokens: usize) -> Result<(), String> {
+        let pool = match self.paged_kv_pool.as_mut() {
+            Some(pool) => pool,
+            None => return Ok(()),
+        };
+        let seq = self
+            .sequences
+            .get_mut(seq_id)
+            .ok_or_else(|| format!("unknown sequence {seq_id}"))?;
+
+        if target_tokens == 0 {
+            if let Some(mut table) = seq.paged_kv_table.take() {
+                pool.free_seq_table(&mut table);
+            }
+            return Ok(());
+        }
+
+        let page_size = pool.config().page_size;
+        let mut table = seq
+            .paged_kv_table
+            .take()
+            .unwrap_or_else(|| SeqBlockTable::new(page_size));
+
+        if target_tokens < table.token_count() {
+            pool.free_seq_table(&mut table);
+            table = pool
+                .alloc_seq_table(target_tokens)
+                .map_err(|e| e.to_string())?;
+        } else {
+            let delta = target_tokens.saturating_sub(table.token_count());
+            if delta > 0 {
+                pool.append_seq_tokens(&mut table, delta)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+
+        seq.paged_kv_table = Some(table);
+        Ok(())
+    }
+
+    fn release_sequence_paged_kv(&mut self, seq_id: &str) {
+        let pool = match self.paged_kv_pool.as_mut() {
+            Some(pool) => pool,
+            None => return,
+        };
+        if let Some(seq) = self.sequences.get_mut(seq_id) {
+            if let Some(mut table) = seq.paged_kv_table.take() {
+                pool.free_seq_table(&mut table);
+            }
+        }
+    }
+
+    fn batch_paged_attention_metadata(&self, batch: &[String]) -> Option<PagedAttentionMetadata> {
+        let page_size = self.model.paged_kv_config()?.page_size;
+        let mut tables = Vec::with_capacity(batch.len());
+        for seq_id in batch {
+            let seq = self.sequences.get(seq_id)?;
+            tables.push(seq.paged_kv_table.as_ref()?.clone());
+        }
+        Some(PagedAttentionMetadata::from_block_tables(
+            &tables, page_size,
+        ))
     }
 
     /// Effective max_tokens for a request, taking server-level max_seq_len into account.
@@ -840,12 +1003,10 @@ impl InferenceEngine {
                 max_seq_len = self.memory_config.max_seq_len,
                 "Prompt exceeds max_seq_len, rejecting request",
             );
-            let _ = req.response_tx.send(EngineResponse::Error(
-                format!(
-                    "Prompt length ({}) exceeds server max_seq_len ({})",
-                    prompt_len, self.memory_config.max_seq_len,
-                ),
-            ));
+            let _ = req.response_tx.send(EngineResponse::Error(format!(
+                "Prompt length ({}) exceeds server max_seq_len ({})",
+                prompt_len, self.memory_config.max_seq_len,
+            )));
             self.stats.failed_requests.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -878,6 +1039,7 @@ impl InferenceEngine {
             prompt_len,
             prefill_cursor: 0,
             kv_caches: vec![None; self.num_layers],
+            paged_kv_table: None,
             logits_processor: candle_transformers::generation::LogitsProcessor::new(
                 sampling::rand_seed(),
                 req.temperature,
@@ -913,7 +1075,9 @@ impl InferenceEngine {
 
         for id in cancelled {
             warn!(id = %id, "Client disconnected, cancelling sequence");
-            self.stats.cancelled_requests.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .cancelled_requests
+                .fetch_add(1, Ordering::Relaxed);
             self.cleanup_sequence(&id);
         }
     }
@@ -925,8 +1089,29 @@ impl InferenceEngine {
     fn execute_step(&mut self, output: SchedulerOutput) {
         if output.is_prefill {
             debug_assert_eq!(output.batch.len(), 1);
-            let seq_id = &output.batch[0];
-            self.step_prefill(seq_id.clone());
+            let seq_id = output.batch[0].clone();
+            if !self.can_admit_prefill_by_page_budget(&seq_id) {
+                self.stats
+                    .total_page_budget_denials
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    id = %seq_id,
+                    running = self.scheduler.running.len(),
+                    waiting = self.scheduler.waiting.len(),
+                    "Deferring prefill due to paged-KV page budget",
+                );
+                self.scheduler.requeue_waiting_front(seq_id);
+                if !self.scheduler.running.is_empty() {
+                    let decode_batch: Vec<String> =
+                        self.scheduler.running.iter().cloned().collect();
+                    self.execute_step(SchedulerOutput {
+                        batch: decode_batch,
+                        is_prefill: false,
+                    });
+                }
+                return;
+            }
+            self.step_prefill(seq_id);
         } else if self.model.supports_batch_decode() && output.batch.len() > 1 {
             // True batched decode only when there are multiple sequences.
             // For a single sequence the sequential path is far cheaper: it
@@ -988,6 +1173,14 @@ impl InferenceEngine {
         {
             let seq = self.sequences.get_mut(&seq_id).unwrap();
             seq.advance_prefill_cursor(chunk_len);
+        }
+        let cached_tokens = self
+            .sequences
+            .get(&seq_id)
+            .map(|seq| seq.start_pos())
+            .unwrap_or(0);
+        if let Err(e) = self.sync_sequence_paged_kv(&seq_id, cached_tokens) {
+            warn!(id = %seq_id, error = %e, "Shadow paged-KV tracking failed after prefill");
         }
 
         if self
@@ -1089,7 +1282,9 @@ impl InferenceEngine {
             .collect();
         for id in &cancelled {
             warn!(id = %id, "Client disconnected before decode batch");
-            self.stats.cancelled_requests.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .cancelled_requests
+                .fetch_add(1, Ordering::Relaxed);
             self.cleanup_sequence(id);
         }
         let batch: Vec<String> = batch
@@ -1160,10 +1355,16 @@ impl InferenceEngine {
         }
 
         let plan_start = Instant::now();
-        let mut plan = match self
-            .model
-            .plan_batch_decode(&kv_lens, self.decode_tokens_per_seq)
-        {
+        let paged_metadata = self.batch_paged_attention_metadata(&batch);
+        let plan_result = match paged_metadata.as_ref() {
+            Some(metadata) => self
+                .model
+                .plan_batch_decode_with_metadata(metadata, self.decode_tokens_per_seq),
+            None => self
+                .model
+                .plan_batch_decode(&kv_lens, self.decode_tokens_per_seq),
+        };
+        let plan = match plan_result {
             Ok(p) => p,
             Err(e) => {
                 error!("Batch decode plan failed: {e}");
@@ -1199,24 +1400,24 @@ impl InferenceEngine {
         // Pre-build attention mask.
         let max_total_width = original_max_kv + self.decode_tokens_per_seq;
         let mask_start = Instant::now();
-        let full_mask = match self.model.build_batch_decode_mask(
-            &kv_lens,
-            original_max_kv,
-            max_total_width,
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                error!("Mask build failed: {e}");
-                self.active_batch_decode = Some(ActiveBatchDecodeSession {
-                    batch: batch.clone(),
-                    batch_width: original_max_kv,
-                    plan: plan.clone(),
-                    backend_name: self.model.decode_backend_name(),
-                });
-                self.flush_active_batch_decode_session();
-                return;
-            }
-        };
+        let full_mask =
+            match self
+                .model
+                .build_batch_decode_mask(&kv_lens, original_max_kv, max_total_width)
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    error!("Mask build failed: {e}");
+                    self.active_batch_decode = Some(ActiveBatchDecodeSession {
+                        batch: batch.clone(),
+                        batch_width: original_max_kv,
+                        plan: plan.clone(),
+                        backend_name: self.model.decode_backend_name(),
+                    });
+                    self.flush_active_batch_decode_session();
+                    return;
+                }
+            };
         let mask_us = mask_start.elapsed().as_micros() as u64;
         self.stats
             .total_batch_decode_mask_time_us
@@ -1247,26 +1448,30 @@ impl InferenceEngine {
             let tokens: Vec<u32> = (0..batch.len())
                 .map(|i| {
                     if alive[i] {
-                        *self.sequences.get(&batch[i]).unwrap().tokens.last().unwrap()
+                        *self
+                            .sequences
+                            .get(&batch[i])
+                            .unwrap()
+                            .tokens
+                            .last()
+                            .unwrap()
                     } else {
                         last_tokens[i]
                     }
                 })
                 .collect();
 
-            let input_ids = match crane_core::fused_ops::copy_from_slice_u32(
-                &tokens,
-                self.model.device(),
-            )
-            .and_then(|t| t.reshape((batch_size, 1)))
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    error!("Decode input_ids upload failed: {e}");
-                    self.model.clear_kv_cache();
-                    return;
-                }
-            };
+            let input_ids =
+                match crane_core::fused_ops::copy_from_slice_u32(&tokens, self.model.device())
+                    .and_then(|t| t.reshape((batch_size, 1)))
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!("Decode input_ids upload failed: {e}");
+                        self.model.clear_kv_cache();
+                        return;
+                    }
+                };
 
             let mask_width = original_max_kv + round + 1;
             let mask_for_round = match &full_mask {
@@ -1365,10 +1570,24 @@ impl InferenceEngine {
                 if let Some(seq) = self.sequences.get_mut(seq_id) {
                     seq.tokens.push(next_token);
                 }
+                let cached_tokens = self
+                    .sequences
+                    .get(seq_id)
+                    .map(|seq| seq.start_pos())
+                    .unwrap_or(0);
+                if let Err(e) = self.sync_sequence_paged_kv(seq_id, cached_tokens) {
+                    warn!(
+                        id = %seq_id,
+                        error = %e,
+                        "Shadow paged-KV tracking failed during batched decode"
+                    );
+                }
                 last_tokens[i] = next_token;
 
                 total_tokens_this_step += 1;
-                self.stats.total_decode_steps.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .total_decode_steps
+                    .fetch_add(1, Ordering::Relaxed);
 
                 self.send_token(seq_id, next_token);
 
@@ -1419,7 +1638,9 @@ impl InferenceEngine {
             self.finish_sequence(id);
         }
         for id in &pending_cancel {
-            self.stats.cancelled_requests.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .cancelled_requests
+                .fetch_add(1, Ordering::Relaxed);
             self.cleanup_sequence(id);
         }
 
@@ -1514,6 +1735,18 @@ impl InferenceEngine {
                 if let Some(seq) = self.sequences.get_mut(seq_id) {
                     seq.tokens.push(next_token);
                 }
+                let cached_tokens = self
+                    .sequences
+                    .get(seq_id)
+                    .map(|seq| seq.start_pos())
+                    .unwrap_or(0);
+                if let Err(e) = self.sync_sequence_paged_kv(seq_id, cached_tokens) {
+                    warn!(
+                        id = %seq_id,
+                        error = %e,
+                        "Shadow paged-KV tracking failed during sequential decode"
+                    );
+                }
 
                 total_tokens += 1;
                 self.stats
@@ -1522,11 +1755,7 @@ impl InferenceEngine {
 
                 self.send_token(seq_id, next_token);
 
-                if self
-                    .sequences
-                    .get(seq_id)
-                    .map_or(true, |s| s.should_stop())
-                {
+                if self.sequences.get(seq_id).map_or(true, |s| s.should_stop()) {
                     self.finish_sequence(seq_id);
                     break;
                 }
@@ -1746,6 +1975,7 @@ impl InferenceEngine {
         };
         self.tracked_kv_bytes = self.tracked_kv_bytes.saturating_sub(freed);
 
+        self.release_sequence_paged_kv(seq_id);
         self.sequences.remove(seq_id);
         self.token_streams.remove(seq_id);
         self.scheduler.remove(seq_id);
@@ -1760,5 +1990,182 @@ impl InferenceEngine {
         self.recount_kv_bytes();
         self.maybe_relax_eviction_cap();
         debug!(id = %seq_id, "Sequence cleaned up");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::backend::ModelBackend;
+    use candle_core::{DType, Device, Tensor};
+    use crane_core::models::qwen3::paged_kv::{KvCacheLayout, PagedKvConfig};
+    use tokenizers::{models::bpe::BPE, Tokenizer};
+    use tokio::sync::mpsc;
+
+    struct MockPagedBackend {
+        device: Device,
+        tokenizer: Tokenizer,
+        cfg: PagedKvConfig,
+    }
+
+    impl MockPagedBackend {
+        fn new(device: Device) -> Self {
+            Self {
+                device,
+                tokenizer: Tokenizer::new(BPE::default()),
+                cfg: PagedKvConfig {
+                    page_size: 16,
+                    num_layers: 1,
+                    num_kv_heads: 1,
+                    head_dim: 1,
+                    dtype: DType::F32,
+                    layout: KvCacheLayout::Nhd,
+                },
+            }
+        }
+    }
+
+    impl ModelBackend for MockPagedBackend {
+        fn forward_step(
+            &mut self,
+            _input_ids: &[u32],
+            _start_pos: usize,
+        ) -> anyhow::Result<Tensor> {
+            anyhow::bail!("unused in tests")
+        }
+
+        fn clear_kv_cache(&mut self) {}
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn device(&self) -> &Device {
+            &self.device
+        }
+
+        fn dtype(&self) -> DType {
+            DType::F32
+        }
+
+        fn tokenizer(&self) -> &Tokenizer {
+            &self.tokenizer
+        }
+
+        fn eos_token_id(&self) -> Vec<u32> {
+            vec![]
+        }
+
+        fn warmup(&mut self) {}
+
+        fn supports_kv_swap(&self) -> bool {
+            true
+        }
+
+        fn paged_kv_config(&self) -> Option<PagedKvConfig> {
+            Some(self.cfg.clone())
+        }
+    }
+
+    fn make_sequence(id: &str, prompt_len: usize) -> Sequence {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Sequence {
+            id: id.to_string(),
+            status: SequenceStatus::Waiting,
+            tokens: vec![1; prompt_len],
+            prompt_len,
+            prefill_cursor: 0,
+            kv_caches: vec![None],
+            paged_kv_table: None,
+            logits_processor: candle_transformers::generation::LogitsProcessor::new(
+                42,
+                Some(0.0),
+                Some(0.9),
+            ),
+            temperature: Some(0.0),
+            top_p: Some(0.9),
+            top_k: Some(20),
+            max_tokens: 128,
+            eos_token_id: vec![],
+            repetition_penalty: 1.0,
+            repeat_last_n: 64,
+            response_tx: tx,
+        }
+    }
+
+    #[test]
+    fn shadow_paged_kv_pool_uses_max_seq_len_and_decode_headroom() {
+        let device = Device::Cpu;
+        let backend = Box::new(MockPagedBackend::new(device));
+        let memory = MemoryConfig {
+            max_seq_len: 128,
+            gpu_memory_limit_bytes: 0,
+            baseline_gpu_bytes: 0,
+        };
+        let (engine, _handle) = InferenceEngine::new(backend, 4, 16, 0, memory);
+
+        let pool = engine.paged_kv_pool.as_ref().expect("shadow pool");
+        assert_eq!(pool.allocator().capacity_pages(), 36);
+    }
+
+    #[test]
+    fn prefill_admission_respects_page_budget_and_decode_reserve() {
+        let device = Device::Cpu;
+        let backend = Box::new(MockPagedBackend::new(device));
+        let page_bytes = backend.cfg.total_page_size_bytes();
+        let memory = MemoryConfig {
+            max_seq_len: 0,
+            gpu_memory_limit_bytes: page_bytes * KV_GPU_OVERHEAD_FACTOR * 2,
+            baseline_gpu_bytes: 0,
+        };
+        let (mut engine, _handle) = InferenceEngine::new(backend, 4, 16, 0, memory);
+
+        let mut running = make_sequence("running", 16);
+        running.status = SequenceStatus::Running;
+        running.tokens.push(2);
+        engine.sequences.insert(running.id.clone(), running);
+        engine.scheduler.running.push_back("running".to_string());
+        engine.sync_sequence_paged_kv("running", 16).unwrap();
+
+        let waiting = make_sequence("waiting", 16);
+        engine.sequences.insert(waiting.id.clone(), waiting);
+        engine.scheduler.waiting.push_back("waiting".to_string());
+
+        assert!(!engine.can_admit_prefill_by_page_budget("waiting"));
+    }
+
+    #[test]
+    fn batch_metadata_uses_exact_block_tables_from_shadow_pool() {
+        let device = Device::Cpu;
+        let backend = Box::new(MockPagedBackend::new(device));
+        let memory = MemoryConfig {
+            max_seq_len: 128,
+            gpu_memory_limit_bytes: 0,
+            baseline_gpu_bytes: 0,
+        };
+        let (mut engine, _handle) = InferenceEngine::new(backend, 4, 16, 0, memory);
+
+        let mut seq_a = make_sequence("a", 17);
+        seq_a.status = SequenceStatus::Running;
+        let mut seq_b = make_sequence("b", 5);
+        seq_b.status = SequenceStatus::Running;
+        engine.sequences.insert(seq_a.id.clone(), seq_a);
+        engine.sequences.insert(seq_b.id.clone(), seq_b);
+
+        engine.sync_sequence_paged_kv("a", 17).unwrap();
+        engine.sync_sequence_paged_kv("b", 5).unwrap();
+
+        let batch = vec!["a".to_string(), "b".to_string()];
+        let metadata = engine
+            .batch_paged_attention_metadata(&batch)
+            .expect("metadata");
+
+        assert_eq!(metadata.seq_lens, vec![17, 5]);
+        assert_eq!(metadata.max_kv_pages_per_seq, 2);
+        assert_eq!(metadata.total_kv_pages, 3);
+        assert_eq!(metadata.abi.paged_kv_indptr, vec![0, 2, 3]);
+        assert_eq!(metadata.abi.paged_kv_indices, vec![0, 1, 2]);
+        assert_eq!(metadata.abi.paged_kv_last_page_len, vec![1, 5]);
+        assert_eq!(metadata.abi.block_tables, vec![vec![0, 1], vec![2]]);
     }
 }

@@ -57,11 +57,7 @@ impl Model {
         let format = match format {
             ModelFormat::Auto => {
                 let p = std::path::Path::new(model_path);
-                if p.is_file()
-                    && p.extension()
-                        .map(|e| e == "gguf")
-                        .unwrap_or(false)
-                {
+                if p.is_file() && p.extension().map(|e| e == "gguf").unwrap_or(false) {
                     ModelFormat::Gguf
                 } else {
                     ModelFormat::Safetensors
@@ -245,10 +241,7 @@ impl Model {
         self.inner.paged_kv_config(self.kv_page_size)
     }
 
-    pub fn build_paged_attention_metadata(
-        &self,
-        seq_lens: &[usize],
-    ) -> PagedAttentionMetadata {
+    pub fn build_paged_attention_metadata(&self, seq_lens: &[usize]) -> PagedAttentionMetadata {
         self.inner
             .build_paged_attention_metadata(seq_lens, self.kv_page_size)
     }
@@ -260,6 +253,14 @@ impl Model {
     ) -> candle_core::Result<DecodeBackendPlan> {
         let metadata = self.build_paged_attention_metadata(seq_lens);
         self.decode_backend.plan(&metadata, decode_tokens_per_seq)
+    }
+
+    pub fn plan_batch_decode_with_metadata(
+        &mut self,
+        metadata: &PagedAttentionMetadata,
+        decode_tokens_per_seq: usize,
+    ) -> candle_core::Result<DecodeBackendPlan> {
+        self.decode_backend.plan(metadata, decode_tokens_per_seq)
     }
 
     pub fn run_planned_batch_decode(
@@ -295,15 +296,13 @@ impl Model {
         seq_lens: &[usize],
         batch_width: usize,
     ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
-        self.inner.extract_batch_kv_by_lengths(seq_lens, batch_width)
+        self.inner
+            .extract_batch_kv_by_lengths(seq_lens, batch_width)
     }
 
     pub fn warmup(&mut self) {
-        if let Err(e) = self.generate(
-            &[45, 546, 456],
-            &GenerationConfig::with_max_tokens(5),
-            None,
-        ) {
+        if let Err(e) = self.generate(&[45, 546, 456], &GenerationConfig::with_max_tokens(5), None)
+        {
             eprintln!("warmup failed (non-fatal): {e}");
         }
         self.clear_kv_cache();

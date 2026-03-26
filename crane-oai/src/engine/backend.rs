@@ -76,7 +76,6 @@ pub trait ModelBackend: Send + 'static {
         0
     }
 
-
     // ── Batch decode (GPU-efficient concurrent serving) ───────
 
     /// Whether this backend supports batched decoding.
@@ -151,6 +150,14 @@ pub trait ModelBackend: Send + 'static {
         Ok(None)
     }
 
+    fn plan_batch_decode_with_metadata(
+        &mut self,
+        metadata: &PagedAttentionMetadata,
+        decode_tokens_per_seq: usize,
+    ) -> candle_core::Result<Option<DecodeBackendPlan>> {
+        self.plan_batch_decode(&metadata.seq_lens, decode_tokens_per_seq)
+    }
+
     /// Execute a batch-decode step using a previously built plan.
     fn run_planned_batch_decode(
         &mut self,
@@ -190,8 +197,9 @@ impl HunyuanBackend {
         dtype: &DType,
         format: crane_core::models::hunyuan_dense::ModelFormat,
     ) -> Result<Self> {
-        let model =
-            crane_core::models::hunyuan_dense::Model::new_with_format(model_path, device, dtype, format)?;
+        let model = crane_core::models::hunyuan_dense::Model::new_with_format(
+            model_path, device, dtype, format,
+        )?;
         Ok(Self { model })
     }
 }
@@ -270,8 +278,12 @@ impl ModelBackend for HunyuanBackend {
         attention_mask: Option<&Tensor>,
         batch_kv_info: Option<(&[usize], usize)>,
     ) -> candle_core::Result<Tensor> {
-        self.model
-            .step_batch_decode_with_input_ids(input_ids, positions, attention_mask, batch_kv_info)
+        self.model.step_batch_decode_with_input_ids(
+            input_ids,
+            positions,
+            attention_mask,
+            batch_kv_info,
+        )
     }
 
     fn extract_batch_kv(
@@ -298,7 +310,6 @@ impl ModelBackend for HunyuanBackend {
             self.dtype(),
         )
     }
-
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -413,9 +424,16 @@ impl ModelBackend for Qwen3Backend {
         // Also include <|endoftext|> (151643) as a fallback.
         let tok = &self.model.tokenizer.tokenizer;
         let mut ids = Vec::new();
-        if let Some(id) = tok.token_to_id("<|im_end|>") { ids.push(id); }
-        if let Some(id) = tok.token_to_id("<|endoftext|>") { ids.push(id); }
-        if ids.is_empty() { ids.push(151645); ids.push(151643); }
+        if let Some(id) = tok.token_to_id("<|im_end|>") {
+            ids.push(id);
+        }
+        if let Some(id) = tok.token_to_id("<|endoftext|>") {
+            ids.push(id);
+        }
+        if ids.is_empty() {
+            ids.push(151645);
+            ids.push(151643);
+        }
         ids
     }
 
@@ -462,8 +480,12 @@ impl ModelBackend for Qwen3Backend {
         attention_mask: Option<&Tensor>,
         batch_kv_info: Option<(&[usize], usize)>,
     ) -> candle_core::Result<Tensor> {
-        self.model
-            .step_batch_decode_with_input_ids(input_ids, positions, attention_mask, batch_kv_info)
+        self.model.step_batch_decode_with_input_ids(
+            input_ids,
+            positions,
+            attention_mask,
+            batch_kv_info,
+        )
     }
 
     fn extract_batch_kv(
@@ -499,10 +521,7 @@ impl ModelBackend for Qwen3Backend {
         Some(self.model.paged_kv_config())
     }
 
-    fn build_paged_attention_metadata(
-        &self,
-        seq_lens: &[usize],
-    ) -> Option<PagedAttentionMetadata> {
+    fn build_paged_attention_metadata(&self, seq_lens: &[usize]) -> Option<PagedAttentionMetadata> {
         Some(self.model.build_paged_attention_metadata(seq_lens))
     }
 
@@ -513,6 +532,16 @@ impl ModelBackend for Qwen3Backend {
     ) -> candle_core::Result<Option<DecodeBackendPlan>> {
         self.model
             .plan_batch_decode(seq_lens, decode_tokens_per_seq)
+            .map(Some)
+    }
+
+    fn plan_batch_decode_with_metadata(
+        &mut self,
+        metadata: &PagedAttentionMetadata,
+        decode_tokens_per_seq: usize,
+    ) -> candle_core::Result<Option<DecodeBackendPlan>> {
+        self.model
+            .plan_batch_decode_with_metadata(metadata, decode_tokens_per_seq)
             .map(Some)
     }
 

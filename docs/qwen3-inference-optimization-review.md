@@ -723,27 +723,30 @@ Crane 已经有：
 
 - `paged KV / block table`：
   - 已落地第一版抽象与 allocator/metadata 测试骨架，代码位于 `crane-core/src/models/qwen3/paged_kv.rs`
+  - `crane-oai` 已补上 shadow `PagedKvPool + SeqBlockTable`，prefill / decode 后都会同步精确 page 使用量
   - 目前先锁 ABI 与 page/bucket 语义，真实 page-store 与 page-write kernel 仍待远端 CUDA 验证
 - `backend-native metadata ABI`：
   - 已固定 `paged_kv_indptr / paged_kv_indices / paged_kv_last_page_len / block_tables`
 - `plan / run / workspace` 风格 decode backend：
   - 已在 Rust 层建好 `Qwen3DecodeBackend` 与 `DecodeBackendPlan`
   - engine 已切换到 `plan_batch_decode + run_planned_batch_decode` 生命周期
+  - Qwen3 backend 已支持 `plan_batch_decode_with_metadata(...)`，可直接消费 block-table 驱动的 metadata
 - `去掉每轮 extract→pad→stack→extract`：
   - 已通过 active batch session 复用大幅减少主循环中的 setup/extract 频率
   - 当前仍是过渡实现，batch 变化或 session flush 时仍会回到旧式 batched KV 提取
-  - 同时，Qwen3 tensor-KV `setup_batch_decode` 已改成可复用 batched KV workspace，避免每次 batch rebuild 都生成大块临时 pad/stack tensor；这一步主要解决长压测时的 `setup_ms` 上升和显存池持续抬高问题
+  - 但上一轮 tensor workspace / scatter 路线已回滚到 `15a88b7` 对应状态，因为远端压测显示它并没有真正解决 sustained load 下的 `setup_ms` / flush 抖动
 - `短 prompt admission`：
   - 针对 `prompt <= 2k` 的实际服务场景，scheduler 已加入 decode-burst admission
   - waiting queue 增长、prefill 完成时，会优先保住几轮 decode，再补新 prefill；但 `running batch shrink` 不再延迟 admission，因为当前 tensor-KV 引擎在完成/取消后已经 flush active session，继续停留在 3-lane decode 没有 reuse 收益
   - 当 waiting backlog 很高且 `running < max_running` 时，burst 会自动关闭，优先扩 batch；如果此前被 eviction 降过 cap，`effective_max_running` 也会在持续 headroom 下逐步恢复
+  - 同时已加入 page-budget-aware prefill admission，会为 running decode 预留页预算；预算不足时优先继续 drain decode，而不是盲目把 waiting 请求推进 prefill
 - `decode bucket + graph 基础设施`：
   - bucket key、plan cache hit 统计和 metadata 统计已具备
   - CUDA Graph 仍未正式接入，需要远端服务器继续 capture 验证
 - 当前默认仍以吞吐优先：
   - `prefill_chunk_size` 默认回到 `0`
   - 在真正 paged KV / decode backend 落地前，chunked prefill 需要显式开启，否则会频繁打断 tensor batch decode session
-  - 远端验证时应重点观察 batched decode 日志里 `reuse_session=true` 是否开始连续出现，以及 decode/prefill 是否不再每轮交替
+  - 远端验证时，重点不再是继续微调 tensor workspace，而是观察 page-budget denial、`current_estimated_kv_pages`、decode plan hit 与 waiting/running 的稳定性
 
 ---
 

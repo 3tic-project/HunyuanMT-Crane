@@ -309,10 +309,9 @@ python3 scripts/benchmark_qwen3_serving.py \
 
 - Qwen3 prefill / decode 已在 engine 层显式分家，并支持 `prefill_chunk_size` 驱动的 chunked prefill。
 - batch decode 热路径已引入 active session 复用，避免每个 scheduling round 都做 `extract -> pad/stack -> decode -> extract`。
-- `crane-core/src/models/qwen3/modeling.rs` 的 tensor-KV `setup_batch_decode` 已从“每层 `pad + cat + contiguous + extra_room copy`”改成“可复用 batched KV workspace + 右对齐 scatter 写入”：
-  - workspace 按 batch=`8`、width=`256 token` 阶梯扩容
-  - batch 变化时优先复用已有大 buffer，避免长时间压测下 `setup_ms` 与 CUDA allocator 占用持续爬升
-  - 这仍然是 paged KV 前的过渡方案，但已经能明显减少短 prompt serving 场景里的结构性浪费
+- `crane-core/src/models/qwen3/modeling.rs` 上一轮 tensor-KV workspace / scatter 过渡实验已回滚到 `15a88b7` 对应状态：
+  - 远端压测表明，这条路线在 sustained load 下仍会把瓶颈留在 `setup_batch_decode + flush/extract`
+  - 因此不再继续扩大这条 tensor 搬运路径，而是把后续实现集中到 paged-KV runtime / metadata / backend ABI
 - scheduler 已进一步加入短 prompt 吞吐优先的 decode-burst admission 策略，当前主要覆盖 `新请求入队 / prefill 完成` 两类事件；当前 tensor-KV 路径下，这比“slot 一空就立刻 prefill”更符合 Qwen3 1.7B serving 的真实瓶颈。对 `batch shrink`，当前实现会直接补位，因为 active batch session 已被引擎 flush，延迟 prefill 只会制造低吞吐的 3-lane decode。
 - 当 waiting backlog 很高时，burst 会被自动关闭，优先扩 batch，而不是为了局部 `reuse_session=true` 牺牲整体吞吐与排队长度。
 - sampling 时间已进入 engine 细粒度统计；现有 GPU fast path 继续保留 `gpu_argmax / topk / gumbel-max / repetition penalty`。
@@ -438,8 +437,13 @@ paged KV 一旦基本跑通，就建议尽快做一个小范围 spike：
   - `paged_kv_indices`
   - `paged_kv_last_page_len`
   - `block_tables`
-- engine 已接入 page-budget admission 的估算与统计，但底层 KV 存储仍是过渡态，还没有完全切到真实 paged page-store。
-- 当前实现的目标是先把 metadata、allocator 语义和服务生命周期钉住，为后续远端 CUDA page-write kernel 留稳定接口。
+- `crane-oai` 已接入 shadow paged-KV runtime：
+  - 每个 sequence 维护 `SeqBlockTable`
+  - prefill / decode 后都会同步 token->page 映射，统计不再只靠 `seq_len` 粗估
+  - prefill admission 会显式预留 decode headroom，按 page budget 决定是否先延后 prefill
+- batch decode planning 已优先走 `PagedAttentionMetadata::from_block_tables(...)`，Qwen3 backend 会直接消费这份 metadata 做 `plan_batch_decode_with_metadata(...)`。
+- 当前底层 KV 存储仍是过渡态，还没有完全切到真实 paged page-store / page-write kernel。
+- 当前实现的目标是先把 allocator、metadata、服务生命周期和 admission control 钉住，为后续远端 CUDA page-write / paged attention backend 留稳定接口。
 
 ---
 
@@ -524,6 +528,7 @@ paged KV 一旦基本跑通，就建议尽快做一个小范围 spike：
 
 - 已新增 `crane-core/src/models/qwen3/decode_backend.rs`，定义 `Qwen3DecodeBackend` 与 `DecodeBackendPlan`。
 - `crane-oai` 的 batch decode 已切到 `plan -> run` 风格接口，decode plan cache hit、H2D metadata bytes 均可统计。
+- Qwen3 backend 现已支持直接接收 block-table 驱动的 metadata plan，不必再退回“只按 `seq_lens` 重新推导 page 结构”。
 - 当前默认 backend 仍是 `TensorDecodeBackend`，它的职责是先把高性能 decode backend 的 ABI、bucket 语义、engine 生命周期跑通。
 - FlashInfer / 自定义 CUDA backend / CUDA Graph 仍需在远端服务器继续接线与 profiling；现阶段代码已为后续 backend 替换留出接口。
 

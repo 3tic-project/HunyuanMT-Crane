@@ -131,7 +131,9 @@ impl RotaryEmbedding {
         // positions × inv_freq: [max_pos, dim/2]
         let positions: Vec<f32> = (0..max_pos).map(|i| i as f32).collect();
         let positions = Tensor::new(positions.as_slice(), device)?;
-        let freqs = positions.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?; // [max_pos, dim/2]
+        let freqs = positions
+            .unsqueeze(1)?
+            .matmul(&inv_freq.unsqueeze(0)?)?; // [max_pos, dim/2]
 
         // cos/sin tables: [max_pos, dim/2] — candle_nn::rotary_emb::rope() handles
         // the half-dim duplication internally, so we store the raw half-dim tables.
@@ -151,14 +153,6 @@ impl RotaryEmbedding {
         let sin = self.sin_table.narrow(0, 0, seq_len)?;
         Ok((cos, sin))
     }
-}
-
-const BATCH_KV_BATCH_ALIGN: usize = 8;
-const BATCH_KV_WIDTH_ALIGN: usize = 256;
-
-struct BatchedKvWorkspace {
-    k: Tensor,
-    v: Tensor,
 }
 
 // ── Attention ───────────────────────────────────────────────────────────
@@ -182,8 +176,6 @@ struct Attention {
     kv_cache: Option<(Tensor, Tensor)>,
     /// Number of valid (filled) positions in the KV cache buffer.
     cache_seq_len: usize,
-    /// Reusable batched-decode scratch buffer to avoid per-batch reallocation.
-    batch_kv_workspace: Option<BatchedKvWorkspace>,
 }
 
 impl Attention {
@@ -219,11 +211,8 @@ impl Attention {
         // replaces three.  `narrow` splits are zero-copy views.
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
-        let qkv_proj = if let (
-            LinearLayer::Standard(ref q),
-            LinearLayer::Standard(ref k),
-            LinearLayer::Standard(ref v),
-        ) = (&q_proj, &k_proj, &v_proj)
+        let qkv_proj = if let (LinearLayer::Standard(ref q), LinearLayer::Standard(ref k), LinearLayer::Standard(ref v)) =
+            (&q_proj, &k_proj, &v_proj)
         {
             let qkv_w = Tensor::cat(&[q.weight(), k.weight(), v.weight()], 0)?;
             let qkv_b = match (q.bias(), k.bias(), v.bias()) {
@@ -267,7 +256,6 @@ impl Attention {
             kv_dim,
             kv_cache: None,
             cache_seq_len: 0,
-            batch_kv_workspace: None,
         })
     }
 
@@ -289,8 +277,14 @@ impl Attention {
 
         let (q_norm, k_norm) = if config.use_qk_norm {
             (
-                Some(gg.rms_norm(&format!("{prefix}.attn_q_norm.weight"), config.rms_norm_eps)?),
-                Some(gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), config.rms_norm_eps)?),
+                Some(gg.rms_norm(
+                    &format!("{prefix}.attn_q_norm.weight"),
+                    config.rms_norm_eps,
+                )?),
+                Some(gg.rms_norm(
+                    &format!("{prefix}.attn_k_norm.weight"),
+                    config.rms_norm_eps,
+                )?),
             )
         } else {
             (None, None)
@@ -311,7 +305,6 @@ impl Attention {
             kv_dim: num_kv_heads * head_dim,
             kv_cache: None,
             cache_seq_len: 0,
-            batch_kv_workspace: None,
         })
     }
 
@@ -352,8 +345,10 @@ impl Attention {
                     let total = full_k.dim(2)?;
                     let room = 256; // fixed small room — avoids 2x over-allocation
                     let (b, h, _, d) = full_k.dims4()?;
-                    let new_buf_k = Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
-                    let new_buf_v = Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
+                    let new_buf_k =
+                        Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
+                    let new_buf_v =
+                        Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
                     new_buf_k.slice_set(&full_k, 2, 0)?;
                     new_buf_v.slice_set(&full_v, 2, 0)?;
                     self.kv_cache = Some((new_buf_k, new_buf_v));
@@ -444,7 +439,8 @@ impl Attention {
             let scale = 1.0 / (self.head_dim as f64).sqrt();
 
             // Q: [B, H, 1, D] → [B, kv_heads, n_rep, D], pre-scaled
-            let q_g = (q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))? * scale)?;
+            let q_g =
+                (q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))? * scale)?;
 
             // K^T: [B, kv_heads, D, S] — just a view (0 copies here;
             //       matmul will flatten+contiguous in one pass).
@@ -500,11 +496,10 @@ impl Attention {
         let attn_output = attn_weights.matmul(&v)?;
 
         // [B, H, S, D] → [B, S, H*D]
-        let attn_output =
-            attn_output
-                .transpose(1, 2)?
-                .contiguous()?
-                .reshape((b_sz, seq_len, ()))?;
+        let attn_output = attn_output
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b_sz, seq_len, ()))?;
 
         self.o_proj.forward(&attn_output)
     }
@@ -520,16 +515,9 @@ impl Attention {
 /// Gate+up projection: either a merged [2*I, H] weight (Standard) or separate quantized projections.
 enum MlpGateUp {
     /// Merged gate+up weight — one gemv instead of two. Standard (BF16/F16/F32) only.
-    Merged {
-        gate_up_proj: Linear,
-        intermediate_size: usize,
-    },
+    Merged { gate_up_proj: Linear, intermediate_size: usize },
     /// Separate quantized gate and up projections (GGUF).
-    Separate {
-        gate_proj: LinearLayer,
-        up_proj: LinearLayer,
-        intermediate_size: usize,
-    },
+    Separate { gate_proj: LinearLayer, up_proj: LinearLayer, intermediate_size: usize },
 }
 
 struct Mlp {
@@ -566,11 +554,7 @@ impl Mlp {
         Ok(Self { gate_up, down_proj })
     }
 
-    fn new_from_gguf<R: Read + Seek>(
-        gg: &mut Gguf<R>,
-        layer_idx: usize,
-        intermediate_size: usize,
-    ) -> Result<Self> {
+    fn new_from_gguf<R: Read + Seek>(gg: &mut Gguf<R>, layer_idx: usize, intermediate_size: usize) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
         let gate_proj = gg.linear(&format!("{prefix}.ffn_gate.weight"))?;
         let up_proj = gg.linear(&format!("{prefix}.ffn_up.weight"))?;
@@ -587,10 +571,7 @@ impl Mlp {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match &self.gate_up {
-            MlpGateUp::Merged {
-                gate_up_proj,
-                intermediate_size,
-            } => {
+            MlpGateUp::Merged { gate_up_proj, intermediate_size } => {
                 let gu = gate_up_proj.forward(x)?; // [B, S, 2*intermediate_size]
 
                 // Use fused CUDA kernel when available: eliminates narrow + silu + mul
@@ -612,9 +593,7 @@ impl Mlp {
                 let gate = candle_nn::Activation::Silu.forward(&gate)?;
                 self.down_proj.forward(&(gate * up)?)
             }
-            MlpGateUp::Separate {
-                gate_proj, up_proj, ..
-            } => {
+            MlpGateUp::Separate { gate_proj, up_proj, .. } => {
                 let gate = gate_proj.forward(x)?;
                 let gate = candle_nn::Activation::Silu.forward(&gate)?;
                 let up = up_proj.forward(x)?;
@@ -684,9 +663,9 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
-        let hidden_states = self
-            .self_attn
-            .forward(&hidden_states, cos, sin, attention_mask)?;
+        let hidden_states =
+            self.self_attn
+                .forward(&hidden_states, cos, sin, attention_mask)?;
         let hidden_states = (residual + hidden_states)?;
 
         let residual = &hidden_states;
@@ -781,7 +760,8 @@ impl Qwen3Model {
 
         let num_attention_heads =
             md_get(&format!("{arch}.attention.head_count"))?.to_u32()? as usize;
-        let num_kv_heads = md_get(&format!("{arch}.attention.head_count_kv"))?.to_u32()? as usize;
+        let num_kv_heads =
+            md_get(&format!("{arch}.attention.head_count_kv"))?.to_u32()? as usize;
         let head_dim = gg
             .metadata()
             .get(&format!("{arch}.attention.key_length"))
@@ -789,7 +769,8 @@ impl Qwen3Model {
             .unwrap_or(128) as usize;
         let num_hidden_layers = md_get(&format!("{arch}.block_count"))?.to_u32()? as usize;
         let hidden_size = md_get(&format!("{arch}.embedding_length"))?.to_u32()? as usize;
-        let intermediate_size = md_get(&format!("{arch}.feed_forward_length"))?.to_u32()? as usize;
+        let intermediate_size =
+            md_get(&format!("{arch}.feed_forward_length"))?.to_u32()? as usize;
         let max_position_embeddings = gg
             .metadata()
             .get(&format!("{arch}.context_length"))
@@ -906,7 +887,8 @@ impl Qwen3Model {
 
         let mut hidden_states = hidden_states;
         for layer in self.layers.iter_mut() {
-            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+            hidden_states =
+                layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -937,8 +919,10 @@ impl Qwen3Model {
                     .kv_cache
                     .as_ref()
                     .map(|(k, v)| {
-                        let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
-                        let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
+                        let k_bytes =
+                            k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
+                        let v_bytes =
+                            v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
                         k_bytes + v_bytes
                     })
                     .unwrap_or(0)
@@ -946,17 +930,26 @@ impl Qwen3Model {
             .sum()
     }
 
-    /// Extract per-layer KV caches as contiguous tensors covering only the
-    /// valid prefix. This avoids restoring non-contiguous narrow views back
-    /// into `self_attn.kv_cache`, which would later make `slice_set` fail
-    /// after a KV swap.
+    /// Extract per-layer KV caches (valid portion only, zero-copy narrow views).
+    ///
+    /// The returned views still reference the pre-allocated buffer.  Callers
+    /// that need to free the buffer (e.g. batch-decode extract) should use
+    /// `Tensor::contiguous()` on their side, or clear `seq.kv_caches` after
+    /// consuming the views.
     pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
         self.layers
             .iter()
             .map(|l| {
                 l.self_attn.kv_cache.as_ref().map(|(k, v)| {
                     let len = l.self_attn.cache_seq_len;
-                    materialize_kv_cache(k, v, len).unwrap_or_else(|_| (k.clone(), v.clone()))
+                    if len > 0 && len < k.dim(2).unwrap_or(0) {
+                        (
+                            k.narrow(2, 0, len).unwrap_or_else(|_| k.clone()),
+                            v.narrow(2, 0, len).unwrap_or_else(|_| v.clone()),
+                        )
+                    } else {
+                        (k.clone(), v.clone())
+                    }
                 })
             })
             .collect()
@@ -965,10 +958,6 @@ impl Qwen3Model {
     /// Restore per-layer KV caches.
     pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
         for (layer, cache) in self.layers.iter_mut().zip(caches.into_iter()) {
-            let cache = cache.map(|(k, v)| {
-                let valid_len = k.dim(2).unwrap_or(0).min(v.dim(2).unwrap_or(0));
-                materialize_kv_cache(&k, &v, valid_len).unwrap_or((k, v))
-            });
             let seq_len = cache
                 .as_ref()
                 .map(|(k, _)| k.dim(2).unwrap_or(0))
@@ -1003,33 +992,35 @@ impl Qwen3Model {
             })
             .collect();
         let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0);
-        let total_width = max_kv_len + extra_room;
-        let batch_scatter_indices =
-            build_batch_scatter_indices(&kv_lens, max_kv_len, kv_heads, head_dim, device)?;
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let layer_caches: Vec<&Option<(Tensor, Tensor)>> =
                 seq_kv_caches.iter().map(|seq| &seq[layer_idx]).collect();
 
-            if total_width > 0 {
-                let (workspace_k, workspace_v) = ensure_batched_kv_workspace(
-                    &mut layer.self_attn.batch_kv_workspace,
-                    layer_caches.len(),
-                    kv_heads,
-                    total_width,
-                    head_dim,
-                    self.dtype,
-                    device,
-                )?;
-                let active_k = workspace_k.narrow(0, 0, layer_caches.len())?;
-                let active_v = workspace_v.narrow(0, 0, layer_caches.len())?;
-                load_batched_kv_into_workspace(
-                    &active_k,
-                    &active_v,
-                    &layer_caches,
-                    &batch_scatter_indices,
-                )?;
-                layer.self_attn.kv_cache = Some((active_k, active_v));
+            let batched_kv = pad_and_stack_kv_caches(
+                &layer_caches,
+                max_kv_len,
+                kv_heads,
+                head_dim,
+                device,
+                self.dtype,
+            )?;
+
+            if let Some((k, v)) = batched_kv {
+                let k = k.contiguous()?;
+                let v = v.contiguous()?;
+                if extra_room > 0 {
+                    let (b, h, s, d) = k.dims4()?;
+                    let buf_k =
+                        Tensor::zeros((b, h, s + extra_room, d), k.dtype(), k.device())?;
+                    let buf_v =
+                        Tensor::zeros((b, h, s + extra_room, d), v.dtype(), v.device())?;
+                    buf_k.slice_set(&k, 2, 0)?;
+                    buf_v.slice_set(&v, 2, 0)?;
+                    layer.self_attn.kv_cache = Some((buf_k, buf_v));
+                } else {
+                    layer.self_attn.kv_cache = Some((k, v));
+                }
                 layer.self_attn.cache_seq_len = max_kv_len;
             } else {
                 layer.self_attn.kv_cache = None;
@@ -1052,8 +1043,7 @@ impl Qwen3Model {
 
         let max_pos = positions.iter().copied().max().unwrap_or(0) + 1;
         let device = input_ids.device();
-        let (full_cos, full_sin) = self.rotary_emb.forward(max_pos)?;
-        let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+        let (full_cos, full_sin) = self.rotary_emb.forward(max_pos)?;        let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         let pos_tensor = Tensor::new(pos_ids.as_slice(), device)?;
         let cos = full_cos
             .index_select(&pos_tensor, 0)?
@@ -1066,7 +1056,8 @@ impl Qwen3Model {
 
         let mut hidden_states = hidden_states;
         for layer in self.layers.iter_mut() {
-            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
+            hidden_states =
+                layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
@@ -1205,230 +1196,64 @@ pub fn build_batch_decode_mask(
     Ok(Some(mask.unsqueeze(1)?.unsqueeze(1)?))
 }
 
-fn materialize_kv_cache(k: &Tensor, v: &Tensor, valid_len: usize) -> Result<(Tensor, Tensor)> {
-    let k_len = k.dim(2)?;
-    let v_len = v.dim(2)?;
-    let valid_len = valid_len.min(k_len).min(v_len);
-
-    let k = if valid_len < k_len {
-        k.narrow(2, 0, valid_len)?.contiguous()?
-    } else if k.is_contiguous() {
-        k.clone()
-    } else {
-        k.contiguous()?
-    };
-
-    let v = if valid_len < v_len {
-        v.narrow(2, 0, valid_len)?.contiguous()?
-    } else if v.is_contiguous() {
-        v.clone()
-    } else {
-        v.contiguous()?
-    };
-
-    Ok((k, v))
-}
-
-fn round_up_capacity(value: usize, align: usize) -> usize {
-    if value == 0 {
-        0
-    } else {
-        value.div_ceil(align) * align
-    }
-}
-
-fn ensure_batched_kv_workspace(
-    workspace: &mut Option<BatchedKvWorkspace>,
-    batch_size: usize,
-    kv_heads: usize,
-    total_width: usize,
-    head_dim: usize,
-    dtype: DType,
-    device: &Device,
-) -> Result<(Tensor, Tensor)> {
-    let batch_capacity = round_up_capacity(batch_size, BATCH_KV_BATCH_ALIGN).max(batch_size);
-    let width_capacity = round_up_capacity(total_width, BATCH_KV_WIDTH_ALIGN).max(total_width);
-
-    let should_reallocate = workspace.as_ref().map_or(true, |ws| {
-        let dims = ws.k.dims();
-        dims.len() != 4
-            || dims[0] < batch_capacity
-            || dims[1] != kv_heads
-            || dims[2] < width_capacity
-            || dims[3] != head_dim
-            || ws.k.dtype() != dtype
-            || ws.v.dtype() != dtype
-            || ws.k.device().location() != device.location()
-            || ws.v.device().location() != device.location()
-    });
-
-    if should_reallocate {
-        let k = Tensor::zeros(
-            (batch_capacity, kv_heads, width_capacity, head_dim),
-            dtype,
-            device,
-        )?;
-        let v = Tensor::zeros(
-            (batch_capacity, kv_heads, width_capacity, head_dim),
-            dtype,
-            device,
-        )?;
-        *workspace = Some(BatchedKvWorkspace {
-            k: k.clone(),
-            v: v.clone(),
-        });
-        Ok((k, v))
-    } else {
-        let ws = workspace.as_ref().unwrap();
-        Ok((ws.k.clone(), ws.v.clone()))
-    }
-}
-
-fn build_batch_scatter_indices(
-    kv_lens: &[usize],
+/// Pad per-sequence KV caches to `max_len` and stack (right-aligned).
+fn pad_and_stack_kv_caches(
+    caches: &[&Option<(Tensor, Tensor)>],
     max_len: usize,
     kv_heads: usize,
     head_dim: usize,
     device: &Device,
-) -> Result<Vec<Option<Tensor>>> {
-    kv_lens
+    dtype: DType,
+) -> Result<Option<(Tensor, Tensor)>> {
+    if max_len == 0 {
+        return Ok(None);
+    }
+
+    let n = caches.len();
+    let mut padded_ks = Vec::with_capacity(n);
+    let mut padded_vs = Vec::with_capacity(n);
+
+    let max_pad_needed = caches
         .iter()
-        .map(|&kv_len| {
-            if kv_len == 0 {
-                return Ok(None);
-            }
-            let offset = max_len - kv_len;
-            let indices = Tensor::arange(offset as u32, (offset + kv_len) as u32, device)?
-                .reshape((1, 1, kv_len, 1))?
-                .expand((1, kv_heads, kv_len, head_dim))?
-                .contiguous()?;
-            Ok(Some(indices))
+        .map(|c| match c {
+            Some((k, _)) => max_len.saturating_sub(k.dim(2).unwrap_or(0)),
+            None => max_len,
         })
-        .collect()
-}
+        .max()
+        .unwrap_or(0);
+    let zero_pad = if max_pad_needed > 0 {
+        Some(Tensor::zeros(
+            (1, kv_heads, max_pad_needed, head_dim),
+            dtype,
+            device,
+        )?)
+    } else {
+        None
+    };
 
-fn load_batched_kv_into_workspace(
-    workspace_k: &Tensor,
-    workspace_v: &Tensor,
-    caches: &[&Option<(Tensor, Tensor)>],
-    scatter_indices: &[Option<Tensor>],
-) -> Result<()> {
-    workspace_k.zero_set()?;
-    workspace_v.zero_set()?;
-
-    for (row_idx, (cache, indices)) in caches.iter().zip(scatter_indices.iter()).enumerate() {
-        match (cache, indices) {
-            (Some((k, v)), Some(indices)) => {
-                let k = if k.is_contiguous() {
-                    k.clone()
+    for cache in caches {
+        match cache {
+            Some((k, v)) => {
+                let cur_len = k.dim(2)?;
+                let pad_len = max_len - cur_len;
+                if pad_len > 0 {
+                    let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
+                    padded_ks.push(Tensor::cat(&[&pad, k.as_ref()], 2)?);
+                    padded_vs.push(Tensor::cat(&[&pad, v.as_ref()], 2)?);
                 } else {
-                    k.contiguous()?
-                };
-                let v = if v.is_contiguous() {
-                    v.clone()
-                } else {
-                    v.contiguous()?
-                };
-                let row_k = workspace_k.narrow(0, row_idx, 1)?;
-                let row_v = workspace_v.narrow(0, row_idx, 1)?;
-                row_k.scatter_set(indices, &k, 2)?;
-                row_v.scatter_set(indices, &v, 2)?;
+                    padded_ks.push(k.clone());
+                    padded_vs.push(v.clone());
+                }
             }
-            (None, None) => {}
-            _ => candle_core::bail!("batched KV cache/index mismatch"),
+            None => {
+                let zeros = Tensor::zeros((1, kv_heads, max_len, head_dim), dtype, device)?;
+                padded_ks.push(zeros.clone());
+                padded_vs.push(zeros);
+            }
         }
     }
-    Ok(())
-}
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        build_batch_scatter_indices, ensure_batched_kv_workspace, load_batched_kv_into_workspace,
-        materialize_kv_cache,
-    };
-    use candle_core::{DType, Device, Result, Tensor};
-
-    #[test]
-    fn materialize_kv_cache_makes_narrow_views_contiguous() -> Result<()> {
-        let device = Device::Cpu;
-        let total = 2 * 3 * 8 * 4;
-        let data = (0..total).map(|v| v as f32).collect::<Vec<_>>();
-        let k = Tensor::from_vec(data.clone(), (2, 3, 8, 4), &device)?;
-        let v = Tensor::from_vec(data, (2, 3, 8, 4), &device)?;
-
-        let k_view = k.narrow(2, 0, 6)?;
-        let v_view = v.narrow(2, 0, 6)?;
-        assert!(!k_view.is_contiguous());
-        assert!(!v_view.is_contiguous());
-
-        let (k_mat, v_mat) = materialize_kv_cache(&k_view, &v_view, 6)?;
-        assert!(k_mat.is_contiguous());
-        assert!(v_mat.is_contiguous());
-        assert_eq!(k_mat.dims4()?, (2, 3, 6, 4));
-        assert_eq!(v_mat.dims4()?, (2, 3, 6, 4));
-        Ok(())
-    }
-
-    #[test]
-    fn batched_kv_workspace_rounds_capacity() -> Result<()> {
-        let device = Device::Cpu;
-        let mut workspace = None;
-
-        let (k, v) =
-            ensure_batched_kv_workspace(&mut workspace, 3, 2, 130, 4, DType::F32, &device)?;
-        assert_eq!(k.dims4()?, (8, 2, 256, 4));
-        assert_eq!(v.dims4()?, (8, 2, 256, 4));
-
-        let (k, _) =
-            ensure_batched_kv_workspace(&mut workspace, 2, 2, 120, 4, DType::F32, &device)?;
-        assert_eq!(k.dims4()?, (8, 2, 256, 4));
-
-        let (k, _) =
-            ensure_batched_kv_workspace(&mut workspace, 9, 2, 300, 4, DType::F32, &device)?;
-        assert_eq!(k.dims4()?, (16, 2, 512, 4));
-
-        Ok(())
-    }
-
-    #[test]
-    fn load_batched_kv_into_workspace_right_aligns_rows() -> Result<()> {
-        let device = Device::Cpu;
-        let workspace_k = Tensor::zeros((4, 1, 5, 1), DType::F32, &device)?;
-        let workspace_v = Tensor::zeros((4, 1, 5, 1), DType::F32, &device)?;
-        let active_k = workspace_k.narrow(0, 0, 2)?;
-        let active_v = workspace_v.narrow(0, 0, 2)?;
-        assert!(active_k.is_contiguous());
-        assert!(active_v.is_contiguous());
-
-        let k0 = Tensor::from_vec(vec![1f32, 2., 3.], (1, 1, 3, 1), &device)?;
-        let v0 = Tensor::from_vec(vec![11f32, 12., 13.], (1, 1, 3, 1), &device)?;
-        let k1 = Tensor::from_vec(vec![7f32, 8.], (1, 1, 2, 1), &device)?;
-        let v1 = Tensor::from_vec(vec![17f32, 18.], (1, 1, 2, 1), &device)?;
-        let cache0 = Some((k0, v0));
-        let cache1 = Some((k1, v1));
-        let caches = vec![&cache0, &cache1];
-        let indices = build_batch_scatter_indices(&[3, 2], 3, 1, 1, &device)?;
-        assert!(indices[0].as_ref().unwrap().is_contiguous());
-        assert!(indices[1].as_ref().unwrap().is_contiguous());
-
-        load_batched_kv_into_workspace(&active_k, &active_v, &caches, &indices)?;
-
-        assert_eq!(
-            active_k
-                .narrow(2, 0, 3)?
-                .reshape((2, 3))?
-                .to_vec2::<f32>()?,
-            vec![vec![1.0, 2.0, 3.0], vec![0.0, 7.0, 8.0]]
-        );
-        assert_eq!(
-            active_v
-                .narrow(2, 0, 3)?
-                .reshape((2, 3))?
-                .to_vec2::<f32>()?,
-            vec![vec![11.0, 12.0, 13.0], vec![0.0, 17.0, 18.0]]
-        );
-
-        Ok(())
-    }
+    let stacked_k = Tensor::cat(&padded_ks, 0)?.contiguous()?;
+    let stacked_v = Tensor::cat(&padded_vs, 0)?.contiguous()?;
+    Ok(Some((stacked_k, stacked_v)))
 }
